@@ -80,19 +80,19 @@ class MCPAgent(Feature):
         Returns a success message with the container name and available tools.
         """
         if self.manager is None:
-            return "❌ MCP tools are not available (Docker not accessible)"
-        
+            return "MCP tools are not available (Docker not accessible)"
+
         try:
             container_name = await self.manager.start_tool_container(image_name, command=args)
             tools = await self.manager.connect_to_tool(container_name)
             tool_names = [t.name for t in tools]
-            return f"✅ Loaded {image_name} as {container_name}. Tools: {', '.join(tool_names)}"
+            return f"Loaded {image_name} as {container_name}. Tools: {', '.join(tool_names)}"
         except (TimeoutError, RuntimeError, ValueError) as e:
             logger.error(f"Failed to load tool {image_name}: {e}")
-            return f"❌ Failed to load MCP tool: {str(e)}"
+            return f"Failed to load MCP tool: {str(e)}"
         except Exception as e:
             logger.error(f"Unexpected error loading tool {image_name}: {e}", exc_info=True)
-            return f"❌ Failed to load MCP tool: {str(e)}"
+            return f"Failed to load MCP tool: {str(e)}"
 
     @tool(
         name="mcp_list_servers",
@@ -105,12 +105,12 @@ class MCPAgent(Feature):
         Lists all currently loaded MCP tools.
         """
         if self.manager is None:
-            return "❌ MCP tools are not available (Docker not accessible)"
-        
+            return "MCP tools are not available (Docker not accessible)"
+
         tools = self.manager.get_all_tools()
         if not tools:
             return "No MCP tools loaded."
-        
+
         response = "Available MCP Tools:\n"
         for t in tools:
             response += f"- [{t['container']}] {t['name']}: {t['description']}\n"
@@ -127,17 +127,17 @@ class MCPAgent(Feature):
         Unloads (stops) an MCP tool.
         """
         if self.manager is None:
-            return "❌ MCP tools are not available (Docker not accessible)"
-        
+            return "MCP tools are not available (Docker not accessible)"
+
         try:
             await self.manager.stop_tool(container_name)
-            return f"✅ Unloaded {container_name}"
+            return f"Unloaded {container_name}"
         except ValueError as e:
             logger.error(f"Tool not found: {container_name}")
-            return f"❌ Failed to unload tool: {str(e)}"
+            return f"Failed to unload tool: {str(e)}"
         except Exception as e:
             logger.error(f"Failed to unload tool {container_name}: {e}", exc_info=True)
-            return f"❌ Failed to unload tool: {str(e)}"
+            return f"Failed to unload tool: {str(e)}"
 
     @tool(
         name="mcp_call_tool",
@@ -150,17 +150,17 @@ class MCPAgent(Feature):
         Calls a specific tool on a loaded container.
         """
         if self.manager is None:
-            return "❌ MCP tools are not available (Docker not accessible)"
+            return "MCP tools are not available (Docker not accessible)"
 
         try:
             result = await self.manager.call_tool(container_name, tool_name, args)
             return f"Result:\n{result}"
         except ValueError as e:
             logger.error(f"Tool not found or invalid arguments: {e}")
-            return f"❌ Tool execution failed: {str(e)}"
+            return f"Tool execution failed: {str(e)}"
         except Exception as e:
             logger.error(f"Tool execution failed: {e}", exc_info=True)
-            return f"❌ Tool execution failed: {str(e)}"
+            return f"Tool execution failed: {str(e)}"
 
     @tool(
         name="mcp_search",
@@ -186,13 +186,13 @@ class MCPAgent(Feature):
 
         lines = [f"**MCP servers matching '{query}':**\n"]
         for server in matches:
-            type_marker = "🔧" if server.is_builtin else "🐳"
+            type_marker = "builtin" if server.is_builtin else "docker"
             private_marker = " [private]" if server.private else ""
             tools_preview = ", ".join(server.tools[:3])
             if len(server.tools) > 3:
                 tools_preview += f" (+{len(server.tools) - 3} more)"
 
-            lines.append(f"{type_marker} **{server.name}**{private_marker}")
+            lines.append(f"[{type_marker}] **{server.name}**{private_marker}")
             lines.append(f"   {server.description}")
             lines.append(f"   Tools: {tools_preview}")
             if not server.is_builtin:
@@ -237,7 +237,6 @@ class MCPAgent(Feature):
         server = registry.get(server_name)
 
         if not server:
-            # Try to find similar servers
             similar = registry.search(server_name)
             if similar:
                 suggestions = ", ".join(s.name for s in similar[:3])
@@ -261,7 +260,7 @@ class MCPAgent(Feature):
         Start the Docker MCP Gateway with specified servers.
 
         The gateway provides unified access to 311+ MCP servers from Docker's catalog
-        with automatic stdio→SSE conversion.
+        with automatic stdio->SSE conversion.
 
         Args:
             servers: Comma-separated list of server names (e.g., "fetch,sqlite")
@@ -271,30 +270,26 @@ class MCPAgent(Feature):
         """
         if not check_docker_mcp_available():
             return (
-                "❌ Docker MCP Toolkit not installed.\n\n"
+                "Docker MCP Toolkit not installed.\n\n"
                 "Please install Docker Desktop 29+ with MCP Toolkit enabled.\n"
                 "See: https://docs.docker.com/desktop/extensions/mcp/"
             )
 
         try:
-            # Lazy import
             from .manager import MCPGatewayManager
             from .gateway import DockerMCPGatewayError, DockerMCPNotInstalledError
 
-            # Stop existing gateway if running
             if self.gateway_manager and self.gateway_manager.is_connected:
                 await self.gateway_manager.stop()
 
-            # Parse server list
             server_list = [s.strip() for s in servers.split(",")]
 
-            # Start new gateway
             self.gateway_manager = MCPGatewayManager()
             tools = await self.gateway_manager.start(server_list)
 
             tool_names = [t.name for t in tools]
             return (
-                f"✅ Gateway started with {len(tool_names)} tools\n\n"
+                f"Gateway started with {len(tool_names)} tools\n\n"
                 f"**Enabled servers:** {', '.join(server_list)}\n"
                 f"**Tools:** {', '.join(tool_names[:10])}"
                 + (f" (+{len(tool_names) - 10} more)" if len(tool_names) > 10 else "")
@@ -303,13 +298,13 @@ class MCPAgent(Feature):
 
         except (DockerMCPGatewayError, DockerMCPNotInstalledError) as e:
             logger.error(f"Gateway error: {e}")
-            return f"❌ Failed to start gateway: {str(e)}"
+            return f"Failed to start gateway: {str(e)}"
         except asyncio.TimeoutError as e:
             logger.error(f"Timeout starting gateway: {e}")
-            return f"❌ Failed to start gateway: Connection timeout"
+            return "Failed to start gateway: Connection timeout"
         except Exception as e:
             logger.error(f"Unexpected error starting gateway: {e}", exc_info=True)
-            return f"❌ Failed to start gateway: {str(e)}"
+            return f"Failed to start gateway: {str(e)}"
 
     @tool(
         name="mcp_gateway_stop",
@@ -318,25 +313,20 @@ class MCPAgent(Feature):
         command_prefix="!mcp-gateway-stop"
     )
     async def gateway_stop(self) -> str:
-        """
-        Stop the Docker MCP Gateway.
-
-        Returns:
-            Status message.
-        """
+        """Stop the Docker MCP Gateway."""
         if self.gateway_manager is None or not self.gateway_manager.is_connected:
-            return "ℹ️ Gateway is not running."
+            return "Gateway is not running."
 
         try:
             await self.gateway_manager.stop()
             self.gateway_manager = None
-            return "✅ Gateway stopped."
+            return "Gateway stopped."
         except asyncio.CancelledError:
             logger.info("Gateway stop cancelled")
-            return "⚠️ Gateway stop cancelled"
+            return "Gateway stop cancelled"
         except Exception as e:
             logger.error(f"Failed to stop gateway: {e}", exc_info=True)
-            return f"❌ Failed to stop gateway: {str(e)}"
+            return f"Failed to stop gateway: {str(e)}"
 
     @tool(
         name="mcp_gateway_call",
@@ -351,17 +341,13 @@ class MCPAgent(Feature):
         Args:
             tool_name: Name of the tool to call
             arguments: Tool arguments as JSON object
-
-        Returns:
-            Tool result.
         """
         if self.gateway_manager is None or not self.gateway_manager.is_connected:
-            return "❌ Gateway not running. Use `!mcp-gateway-start` first."
+            return "Gateway not running. Use `!mcp-gateway-start` first."
 
         try:
             result = await self.gateway_manager.call_tool(tool_name, arguments or {})
 
-            # Format result
             if hasattr(result, 'content') and result.content:
                 text = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
                 return f"**{tool_name}** result:\n\n{text}"
@@ -369,10 +355,10 @@ class MCPAgent(Feature):
 
         except (ValueError, RuntimeError) as e:
             logger.error(f"Gateway tool call failed: {e}")
-            return f"❌ Tool call failed: {str(e)}"
+            return f"Tool call failed: {str(e)}"
         except Exception as e:
             logger.error(f"Gateway tool call failed: {e}", exc_info=True)
-            return f"❌ Tool call failed: {str(e)}"
+            return f"Tool call failed: {str(e)}"
 
     @tool(
         name="mcp_gateway_tools",
@@ -381,14 +367,9 @@ class MCPAgent(Feature):
         command_prefix="!mcp-gateway-tools"
     )
     async def gateway_tools(self) -> str:
-        """
-        List all tools available through the gateway.
-
-        Returns:
-            List of available tools.
-        """
+        """List all tools available through the gateway."""
         if self.gateway_manager is None or not self.gateway_manager.is_connected:
-            return "❌ Gateway not running. Use `!mcp-gateway-start` first."
+            return "Gateway not running. Use `!mcp-gateway-start` first."
 
         tools = self.gateway_manager.get_all_tools()
         if not tools:
@@ -411,33 +392,28 @@ class MCPAgent(Feature):
         """
         Enable an additional server in the gateway.
 
-        Note: This requires restarting the gateway connection.
-
         Args:
             server_name: Name of the server to enable
-
-        Returns:
-            Status message with updated tool list.
         """
         if self.gateway_manager is None or not self.gateway_manager.is_connected:
-            return "❌ Gateway not running. Use `!mcp-gateway-start` first."
+            return "Gateway not running. Use `!mcp-gateway-start` first."
 
         try:
             tools = await self.gateway_manager.enable_server(server_name)
             tool_names = [t.name for t in tools]
             return (
-                f"✅ Enabled {server_name}\n\n"
+                f"Enabled {server_name}\n\n"
                 f"**Total tools:** {len(tool_names)}"
             )
         except (ValueError, RuntimeError) as e:
             logger.error(f"Failed to enable server: {e}")
-            return f"❌ Failed to enable {server_name}: {str(e)}"
+            return f"Failed to enable {server_name}: {str(e)}"
         except asyncio.TimeoutError as e:
             logger.error(f"Timeout enabling server: {e}")
-            return f"❌ Failed to enable {server_name}: Connection timeout"
+            return f"Failed to enable {server_name}: Connection timeout"
         except Exception as e:
             logger.error(f"Unexpected error enabling server: {e}", exc_info=True)
-            return f"❌ Failed to enable {server_name}: {str(e)}"
+            return f"Failed to enable {server_name}: {str(e)}"
 
     @tool(
         name="mcp_docker_catalog",
@@ -451,24 +427,19 @@ class MCPAgent(Feature):
 
         Args:
             query: Optional search term (leave empty to see summary)
-
-        Returns:
-            Matching servers or catalog summary.
         """
         if not check_docker_mcp_available():
             return (
-                "❌ Docker MCP Toolkit not installed.\n\n"
+                "Docker MCP Toolkit not installed.\n\n"
                 "Please install Docker Desktop 29+ with MCP Toolkit enabled."
             )
 
         if not query:
-            # Return summary
             summary = format_docker_catalog_summary()
             enabled = await list_enabled_docker_servers()
             enabled_str = ", ".join(enabled) if enabled else "none"
             return f"{summary}\n\n**Currently enabled:** {enabled_str}"
 
-        # Search catalog
         results = await search_docker_catalog(query)
         if not results:
             return f"No servers found matching '{query}'."
@@ -485,10 +456,7 @@ class MCPAgent(Feature):
         return "\n".join(lines)
 
     async def shutdown(self):
-        """
-        Stops all active tools, gateway, and closes the Docker client.
-        """
-        # Stop gateway if running
+        """Stops all active tools, gateway, and closes the Docker client."""
         if self.gateway_manager and self.gateway_manager.is_connected:
             try:
                 await self.gateway_manager.stop()
@@ -498,7 +466,6 @@ class MCPAgent(Feature):
                 logger.warning(f"Error stopping gateway: {e}", exc_info=True)
             self.gateway_manager = None
 
-        # Stop container-based tools
         if self.manager is None:
             return
 
@@ -506,5 +473,4 @@ class MCPAgent(Feature):
         for container in active_containers:
             await self.manager.stop_tool(container)
 
-        # Close Docker client to release threads
         self.manager.close()

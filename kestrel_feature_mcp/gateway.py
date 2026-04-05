@@ -5,7 +5,7 @@ This module manages the Docker MCP Gateway process, which provides
 a unified SSE endpoint for accessing any MCP server from Docker's
 311+ server catalog.
 
-The gateway handles stdio→SSE conversion automatically, so we can
+The gateway handles stdio->SSE conversion automatically, so we can
 use any MCP server regardless of its native transport.
 
 Usage:
@@ -23,7 +23,7 @@ import subprocess
 import time
 from typing import List, Optional, Set
 
-from kestrel_sdk.config.constants import (
+from .constants import (
     SSH_COMMAND_TIMEOUT_SHORT,
     SSH_COMMAND_TIMEOUT_DEFAULT,
     HTTP_TIMEOUT_SHORT,
@@ -51,7 +51,7 @@ class DockerMCPGateway:
     Manages the Docker MCP Gateway process.
 
     The Docker MCP Gateway is a unified SSE endpoint that can expose
-    any MCP server from Docker's catalog. It handles the stdio→SSE
+    any MCP server from Docker's catalog. It handles the stdio->SSE
     conversion automatically.
 
     Attributes:
@@ -82,12 +82,7 @@ class DockerMCPGateway:
 
     @staticmethod
     def check_docker_mcp_available() -> bool:
-        """
-        Check if Docker MCP Toolkit is installed and available.
-
-        Returns:
-            True if docker mcp command is available
-        """
+        """Check if Docker MCP Toolkit is installed and available."""
         try:
             result = subprocess.run(
                 ["docker", "mcp", "--help"],
@@ -100,12 +95,7 @@ class DockerMCPGateway:
 
     @staticmethod
     def get_docker_mcp_version() -> Optional[str]:
-        """
-        Get the Docker MCP Toolkit version.
-
-        Returns:
-            Version string or None if not available
-        """
+        """Get the Docker MCP Toolkit version."""
         try:
             result = subprocess.run(
                 ["docker", "mcp", "version"],
@@ -120,15 +110,7 @@ class DockerMCPGateway:
             return None
 
     async def _enable_server(self, server_name: str) -> bool:
-        """
-        Enable a server in Docker MCP.
-
-        Args:
-            server_name: Name of the server to enable
-
-        Returns:
-            True if server was enabled successfully
-        """
+        """Enable a server in Docker MCP."""
         try:
             result = await asyncio.to_thread(
                 subprocess.run,
@@ -149,15 +131,7 @@ class DockerMCPGateway:
             return False
 
     async def _disable_server(self, server_name: str) -> bool:
-        """
-        Disable a server in Docker MCP.
-
-        Args:
-            server_name: Name of the server to disable
-
-        Returns:
-            True if server was disabled successfully
-        """
+        """Disable a server in Docker MCP."""
         try:
             result = await asyncio.to_thread(
                 subprocess.run,
@@ -178,21 +152,7 @@ class DockerMCPGateway:
             return False
 
     def _parse_auth_token(self, line: str) -> Optional[str]:
-        """
-        Parse the auth token from gateway output.
-
-        The gateway outputs a line like:
-        > Use Bearer token: Authorization: Bearer <token>
-
-        Args:
-            line: Output line from gateway
-
-        Returns:
-            The bearer token if found, None otherwise
-        """
-        # Pattern: "Authorization: Bearer <token>" where token is alphanumeric
-        # The line format is: "> Use Bearer token: Authorization: Bearer <token>"
-        # We need to match the LAST "Bearer" followed by an alphanumeric token (not "token:")
+        """Parse the auth token from gateway output."""
         match = re.search(r'Authorization:\s*Bearer\s+([a-zA-Z0-9]+)', line)
         if match:
             return match.group(1)
@@ -218,10 +178,8 @@ class DockerMCPGateway:
                 "Please install Docker Desktop 29+ with MCP Toolkit enabled."
             )
 
-        # Stop any existing gateway
         await self.stop()
 
-        # Enable requested servers
         for server in servers:
             await self._enable_server(server)
 
@@ -230,7 +188,6 @@ class DockerMCPGateway:
                 f"Failed to enable any servers from: {servers}"
             )
 
-        # Build gateway command
         servers_arg = ",".join(self.enabled_servers)
         cmd = [
             "docker", "mcp", "gateway", "run",
@@ -241,16 +198,14 @@ class DockerMCPGateway:
 
         logger.info(f"Starting Docker MCP Gateway: {' '.join(cmd)}")
 
-        # Start gateway process
         self.process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1  # Line buffered
+            bufsize=1
         )
 
-        # Wait for gateway to be ready and capture auth token
         start_time = time.monotonic()
         self._output_lines = []
 
@@ -263,7 +218,6 @@ class DockerMCPGateway:
                     f"Output:\n{''.join(self._output_lines[-20:])}"
                 )
 
-            # Check if process died
             if self.process.poll() is not None:
                 remaining = self.process.stdout.read()
                 if remaining:
@@ -273,9 +227,7 @@ class DockerMCPGateway:
                     f"Output:\n{''.join(self._output_lines)}"
                 )
 
-            # Read available output (non-blocking would be better, but this works)
             try:
-                # Read one line with a short timeout
                 line = await asyncio.wait_for(
                     asyncio.to_thread(self.process.stdout.readline),
                     timeout=GATEWAY_STARTUP_POLL_INTERVAL
@@ -284,26 +236,21 @@ class DockerMCPGateway:
                     self._output_lines.append(line)
                     logger.debug(f"Gateway: {line.rstrip()}")
 
-                    # Check for auth token
                     token = self._parse_auth_token(line)
                     if token:
                         self.auth_token = token
                         self._start_time = time.monotonic()
                         logger.info(f"Gateway ready at http://localhost:{self.port}/sse")
 
-                        # Start timeout task if configured
                         if self.session_timeout:
                             self._start_timeout_task()
 
                         return token
 
-                    # Check for "Start sse server" message (gateway is ready)
                     if "Start sse server" in line or "Gateway URL:" in line:
-                        # Keep reading for token
                         continue
 
             except asyncio.TimeoutError:
-                # No output yet, continue waiting
                 continue
 
     def _start_timeout_task(self):
@@ -317,7 +264,7 @@ class DockerMCPGateway:
                     )
                     await self.stop()
             except asyncio.CancelledError:
-                pass  # Normal cancellation when stop() is called
+                pass
 
         self._timeout_task = asyncio.create_task(timeout_handler())
         logger.debug(f"Session timeout set: {self.session_timeout}s")
@@ -332,7 +279,7 @@ class DockerMCPGateway:
         """Reset the session timeout (call on activity to keep alive)."""
         if self.session_timeout and self.is_running:
             self._cancel_timeout_task()
-            self._start_time = time.monotonic()  # Reset start time
+            self._start_time = time.monotonic()
             self._start_timeout_task()
             logger.debug("Session timeout reset")
 
@@ -347,7 +294,6 @@ class DockerMCPGateway:
 
     async def stop(self):
         """Stop the gateway process."""
-        # Cancel timeout task first
         self._cancel_timeout_task()
 
         if self.process:
@@ -372,45 +318,20 @@ class DockerMCPGateway:
                 logger.info("Gateway stopped")
 
     async def restart(self, servers: List[str] = None) -> str:
-        """
-        Restart the gateway with optionally different servers.
-
-        Args:
-            servers: List of servers, or None to use current servers
-
-        Returns:
-            New auth token
-        """
+        """Restart the gateway with optionally different servers."""
         if servers is None:
             servers = list(self.enabled_servers)
-
         await self.stop()
         return await self.start(servers)
 
     async def add_server(self, server_name: str) -> str:
-        """
-        Add a server to the gateway (requires restart).
-
-        Args:
-            server_name: Name of server to add
-
-        Returns:
-            New auth token after restart
-        """
+        """Add a server to the gateway (requires restart)."""
         servers = list(self.enabled_servers)
         servers.append(server_name)
         return await self.restart(servers)
 
     async def remove_server(self, server_name: str) -> str:
-        """
-        Remove a server from the gateway (requires restart).
-
-        Args:
-            server_name: Name of server to remove
-
-        Returns:
-            New auth token after restart
-        """
+        """Remove a server from the gateway (requires restart)."""
         servers = list(self.enabled_servers)
         if server_name in servers:
             servers.remove(server_name)
@@ -431,12 +352,7 @@ class DockerMCPGateway:
 
 
 async def list_available_servers() -> List[str]:
-    """
-    List all available servers from Docker MCP catalog.
-
-    Returns:
-        List of server names
-    """
+    """List all available servers from Docker MCP catalog."""
     try:
         result = await asyncio.to_thread(
             subprocess.run,
@@ -448,11 +364,8 @@ async def list_available_servers() -> List[str]:
         if result.returncode != 0:
             return []
 
-        # Parse server names from output
-        # Format is "  **ServerName**" on its own line
         servers = []
         for line in result.stdout.split('\n'):
-            # Look for bold server names
             match = re.search(r'\*\*([a-zA-Z0-9_-]+)\*\*', line)
             if match:
                 servers.append(match.group(1))
@@ -463,12 +376,7 @@ async def list_available_servers() -> List[str]:
 
 
 async def list_enabled_servers() -> List[str]:
-    """
-    List currently enabled servers in Docker MCP.
-
-    Returns:
-        List of enabled server names
-    """
+    """List currently enabled servers in Docker MCP."""
     try:
         result = await asyncio.to_thread(
             subprocess.run,
@@ -480,8 +388,6 @@ async def list_enabled_servers() -> List[str]:
         if result.returncode != 0:
             return []
 
-        # Parse enabled servers from table output
-        # Format: NAME  OAUTH  SECRETS  CONFIG  DESCRIPTION
         servers = []
         in_table = False
         for line in result.stdout.split('\n'):
@@ -489,7 +395,6 @@ async def list_enabled_servers() -> List[str]:
                 in_table = True
                 continue
             if in_table and line.strip() and not line.startswith('-'):
-                # First column is the server name
                 parts = line.split()
                 if parts:
                     servers.append(parts[0])

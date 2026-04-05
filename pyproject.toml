@@ -1,17 +1,24 @@
 [project]
 name = "kestrel-feature-mcp"
 version = "0.1.0"
-description = "Kestrel MCP agent feature"
+description = "Model Context Protocol (MCP) server management for Kestrel Sovereign agents"
 requires-python = ">=3.11"
 dependencies = [
-    "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
-    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git",
-    "mcp>=1.26.0",
+    "kestrel-sovereign",
     "docker>=7.1.0",
+    "mcp>=1.26.0",
+    "aiohttp>=3.13.3",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.1.0",
+    "pytest-timeout>=2.3.1",
 ]
 
 [project.entry-points."kestrel_sovereign.features"]
-MCPAgent = "kestrel_feature_mcp:MCPAgent"
+MCPAgent = "kestrel_feature_mcp.feature:MCPAgent"
 
 [build-system]
 requires = ["hatchling"]
@@ -22,3 +29,7 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["kestrel_feature_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
