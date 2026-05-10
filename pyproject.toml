@@ -2,9 +2,11 @@
 name = "kestrel-feature-mcp"
 version = "0.1.0"
 description = "Model Context Protocol (MCP) server management for Kestrel Sovereign agents"
-requires-python = ">=3.11"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11,<3.14"
 dependencies = [
-    "kestrel-sovereign-sdk>=0.1,<1",
+    "kestrel-sovereign-sdk>=0.10,<1",
     "docker>=7.1.0",
     "mcp>=1.26.0",
     "aiohttp>=3.13.3",
@@ -33,3 +35,7 @@ packages = ["kestrel_feature_mcp"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "docker: tests that require Docker",
+    "docker_mcp: tests that require Docker MCP Toolkit",
+]
