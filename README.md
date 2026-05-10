@@ -5,7 +5,7 @@ Model Context Protocol (MCP) server management and tool bridging for Kestrel Sov
 ## Installation
 
 ```bash
-uv pip install git+https://github.com/KestrelSovereignAI/kestrel-feature-mcp.git
+uv pip install kestrel-feature-mcp
 ```
 
 ## Dependencies

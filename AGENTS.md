@@ -5,7 +5,7 @@ See [README.md](README.md) for package overview.
 ## Package Structure
 
 ```
-packages/kestrel-feature-mcp/
+kestrel-feature-mcp/
 ├── pyproject.toml
 ├── README.md
 ├── kestrel_feature_mcp/
