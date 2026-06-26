@@ -151,3 +151,20 @@ class TestIsErrorSurfacesAsFailed:
         result = await _make_feature(gateway=gw).gateway_call("fetch", {})
         assert result.status is ToolResultStatus.OK
         assert "hello" in result.confirmation
+
+    @pytest.mark.asyncio
+    async def test_multi_block_content_is_preserved(self):
+        """All content blocks must survive — not just the first."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        multi = SimpleNamespace(
+            content=[SimpleNamespace(text="block-one"), SimpleNamespace(text="block-two")],
+            isError=False,
+        )
+        gw = MagicMock()
+        gw.is_connected = True
+        gw.call_tool = AsyncMock(return_value=multi)
+        result = await _make_feature(gateway=gw).gateway_call("fetch", {})
+        assert result.status is ToolResultStatus.OK
+        assert "block-one" in result.confirmation
+        assert "block-two" in result.confirmation

@@ -46,8 +46,15 @@ def _extract_mcp_result(result) -> tuple[str, bool]:
     not be recorded as a successful dispatch).
     """
     if hasattr(result, "content") and result.content:
-        first = result.content[0]
-        text = first.text if hasattr(first, "text") else str(first)
+        # An MCP result may carry multiple content blocks (several text chunks,
+        # or mixed text/resource items). Preserve all of them — dropping the
+        # tail would silently truncate valid tool output before the agent or
+        # the audit log sees it.
+        parts = [
+            block.text if hasattr(block, "text") else str(block)
+            for block in result.content
+        ]
+        text = "\n".join(parts)
     else:
         text = str(result)
     return text, bool(getattr(result, "isError", False))
