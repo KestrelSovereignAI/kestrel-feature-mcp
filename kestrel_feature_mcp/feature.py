@@ -20,6 +20,7 @@ from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+from .dynamic_tools import build_wrappers, extract_mcp_result as _extract_mcp_result
 from .registry import (
     get_registry,
     MCPRegistry,
@@ -36,28 +37,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Dynamic-tool registry owner keys (see ToolRegistryMixin.register_dynamic_tools).
+# Gateway-mounted tools share one owner (the gateway aggregates many servers and
+# does not attribute tools per-server); each legacy container is its own owner.
+_GATEWAY_OWNER = "mcp:gateway"
 
-def _extract_mcp_result(result) -> tuple[str, bool]:
-    """Pull display text + error flag from an MCP ``CallToolResult``.
 
-    MCP signals tool-level failures by returning a normal result with
-    ``isError=True`` rather than raising, so the caller must branch on the
-    flag to keep the ToolResult status envelope honest (a failed MCP tool must
-    not be recorded as a successful dispatch).
-    """
-    if hasattr(result, "content") and result.content:
-        # An MCP result may carry multiple content blocks (several text chunks,
-        # or mixed text/resource items). Preserve all of them — dropping the
-        # tail would silently truncate valid tool output before the agent or
-        # the audit log sees it.
-        parts = [
-            block.text if hasattr(block, "text") else str(block)
-            for block in result.content
-        ]
-        text = "\n".join(parts)
-    else:
-        text = str(result)
-    return text, bool(getattr(result, "isError", False))
+def _container_owner(container_name: str) -> str:
+    return f"mcp:container:{container_name}"
+
 
 class MCPAgent(Feature):
     """
@@ -92,6 +80,58 @@ class MCPAgent(Feature):
             self.manager = None
             self.gateway_manager = None
 
+    # =========================================================================
+    # Dynamic tool mounting — make a server's tools first-class LLM tools
+    # =========================================================================
+
+    def _host_supports_dynamic_tools(self) -> bool:
+        """Whether the host exposes the dynamic-tool registry (#1979 PR2).
+
+        Older hosts lack it; we degrade gracefully to dispatcher-only (the
+        ``mcp_gateway_call`` / ``mcp_call_tool`` indirection) rather than fail.
+        """
+        agent = getattr(self, "agent", None)
+        return (
+            agent is not None
+            and hasattr(agent, "register_dynamic_tools")
+            and hasattr(agent, "unregister_dynamic_tools")
+        )
+
+    def _mount_tools(self, owner: str, handle_prefix: str, tool_dicts, caller) -> int:
+        """Mount a set of MCP tools into the host registry under ``owner``.
+
+        Idempotent refresh: any previously-mounted tools for ``owner`` are
+        dropped first, then the current set is registered. Returns the number
+        of tools mounted (0 when the host has no dynamic registry).
+        """
+        if not self._host_supports_dynamic_tools():
+            return 0
+        self.agent.unregister_dynamic_tools(owner)
+        wrappers = build_wrappers(handle_prefix, tool_dicts, caller)
+        return self.agent.register_dynamic_tools(owner, wrappers)
+
+    def _unmount_tools(self, owner: str) -> int:
+        """Remove all tools mounted under ``owner`` (inverse of _mount_tools)."""
+        if not self._host_supports_dynamic_tools():
+            return 0
+        return self.agent.unregister_dynamic_tools(owner)
+
+    def _mount_gateway_tools(self) -> int:
+        """(Re)mount the connected gateway's full tool set under the gateway owner.
+
+        Used after start/enable — the gateway aggregates servers and reports a
+        flat tool list, so we refresh the whole owner each time. The caller
+        reads ``self.gateway_manager`` at call time so it always targets the
+        current connection.
+        """
+        if self.gateway_manager is None or not self.gateway_manager.is_connected:
+            return 0
+        tool_dicts = self.gateway_manager.get_all_tools()
+        return self._mount_tools(
+            _GATEWAY_OWNER, "gateway", tool_dicts,
+            lambda name, arguments: self.gateway_manager.call_tool(name, arguments),
+        )
+
     @tool(
         name="mcp_load_server",
         description="Load an MCP server from a Docker image.",
@@ -110,9 +150,30 @@ class MCPAgent(Feature):
             container_name = await self.manager.start_tool_container(image_name, command=args)
             tools = await self.manager.connect_to_tool(container_name)
             tool_names = [t.name for t in tools]
+            # Mount the container's tools as first-class LLM tools. The caller
+            # closure binds the container; the host registry routes the call
+            # back through manager.call_tool with the tool's real MCP name.
+            tool_dicts = [
+                t for t in self.manager.get_all_tools()
+                if t.get("container") == container_name
+            ]
+            owner = _container_owner(container_name)
+            mounted = self._mount_tools(
+                owner, container_name, tool_dicts,
+                lambda name, arguments, c=container_name: self.manager.call_tool(c, name, arguments),
+            )
+            mount_note = (
+                f" Mounted {mounted} as callable tools."
+                if mounted else
+                " (Call them via mcp_call_tool — host has no dynamic registry.)"
+            )
             return ToolResult.ok(
-                f"Loaded {image_name} as {container_name}. Tools: {', '.join(tool_names)}",
-                data={"container": container_name, "image": image_name, "tools": tool_names},
+                f"Loaded {image_name} as {container_name}. Tools: {', '.join(tool_names)}."
+                + mount_note,
+                data={
+                    "container": container_name, "image": image_name,
+                    "tools": tool_names, "mounted": mounted,
+                },
             )
         except (TimeoutError, RuntimeError, ValueError) as e:
             logger.error(f"Failed to load tool {image_name}: {e}")
@@ -158,6 +219,7 @@ class MCPAgent(Feature):
 
         try:
             await self.manager.stop_tool(container_name)
+            self._unmount_tools(_container_owner(container_name))
             return ToolResult.ok(f"Unloaded {container_name}", data={"container": container_name})
         except ValueError as e:
             logger.error(f"Tool not found: {container_name}")
@@ -333,6 +395,7 @@ class MCPAgent(Feature):
 
             if self.gateway_manager and self.gateway_manager.is_connected:
                 await self.gateway_manager.stop()
+                self._unmount_tools(_GATEWAY_OWNER)
 
             server_list = [s.strip() for s in servers.split(",")]
 
@@ -340,13 +403,19 @@ class MCPAgent(Feature):
             tools = await self.gateway_manager.start(server_list)
 
             tool_names = [t.name for t in tools]
+            mounted = self._mount_gateway_tools()
+            mount_note = (
+                f"\n\n**Mounted {mounted} tools** — call them directly."
+                if mounted else
+                "\n\nUse `!mcp-gateway-call <tool> <args>` to call tools."
+            )
             return ToolResult.ok(
                 f"Gateway started with {len(tool_names)} tools\n\n"
                 f"**Enabled servers:** {', '.join(server_list)}\n"
                 f"**Tools:** {', '.join(tool_names[:10])}"
                 + (f" (+{len(tool_names) - 10} more)" if len(tool_names) > 10 else "")
-                + "\n\nUse `!mcp-gateway-call <tool> <args>` to call tools.",
-                data={"servers": server_list, "tools": tool_names},
+                + mount_note,
+                data={"servers": server_list, "tools": tool_names, "mounted": mounted},
             )
 
         except (DockerMCPGatewayError, DockerMCPNotInstalledError) as e:
@@ -373,6 +442,7 @@ class MCPAgent(Feature):
         try:
             await self.gateway_manager.stop()
             self.gateway_manager = None
+            self._unmount_tools(_GATEWAY_OWNER)
             return ToolResult.ok("Gateway stopped.")
         except asyncio.CancelledError:
             logger.info("Gateway stop cancelled")
@@ -462,10 +532,12 @@ class MCPAgent(Feature):
         try:
             tools = await self.gateway_manager.enable_server(server_name)
             tool_names = [t.name for t in tools]
+            mounted = self._mount_gateway_tools()
             return ToolResult.ok(
                 f"Enabled {server_name}\n\n"
-                f"**Total tools:** {len(tool_names)}",
-                data={"server": server_name, "tools": tool_names},
+                f"**Total tools:** {len(tool_names)}"
+                + (f" ({mounted} mounted as callable tools)" if mounted else ""),
+                data={"server": server_name, "tools": tool_names, "mounted": mounted},
             )
         except (ValueError, RuntimeError) as e:
             logger.error(f"Failed to enable server: {e}")
@@ -536,6 +608,7 @@ class MCPAgent(Feature):
             except Exception as e:
                 logger.warning(f"Error stopping gateway: {e}", exc_info=True)
             self.gateway_manager = None
+        self._unmount_tools(_GATEWAY_OWNER)
 
         if self.manager is None:
             return
@@ -543,5 +616,6 @@ class MCPAgent(Feature):
         active_containers = list(self.manager.active_tools.keys())
         for container in active_containers:
             await self.manager.stop_tool(container)
+            self._unmount_tools(_container_owner(container))
 
         self.manager.close()
