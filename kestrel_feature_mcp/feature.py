@@ -36,6 +36,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _extract_mcp_result(result) -> tuple[str, bool]:
+    """Pull display text + error flag from an MCP ``CallToolResult``.
+
+    MCP signals tool-level failures by returning a normal result with
+    ``isError=True`` rather than raising, so the caller must branch on the
+    flag to keep the ToolResult status envelope honest (a failed MCP tool must
+    not be recorded as a successful dispatch).
+    """
+    if hasattr(result, "content") and result.content:
+        first = result.content[0]
+        text = first.text if hasattr(first, "text") else str(first)
+    else:
+        text = str(result)
+    return text, bool(getattr(result, "isError", False))
+
 class MCPAgent(Feature):
     """
     A Feature Agent that manages Model Context Protocol (MCP) tools.
@@ -158,8 +174,14 @@ class MCPAgent(Feature):
 
         try:
             result = await self.manager.call_tool(container_name, tool_name, args)
+            text, is_error = _extract_mcp_result(result)
+            if is_error:
+                return ToolResult.failed(
+                    f"Tool '{tool_name}' reported an error:\n{text}",
+                    data={"container": container_name, "tool": tool_name},
+                )
             return ToolResult.ok(
-                f"Result:\n{result}",
+                f"Result:\n{text}",
                 data={"container": container_name, "tool": tool_name},
             )
         except ValueError as e:
@@ -371,11 +393,12 @@ class MCPAgent(Feature):
 
         try:
             result = await self.gateway_manager.call_tool(tool_name, arguments or {})
-
-            if hasattr(result, 'content') and result.content:
-                text = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
-            else:
-                text = str(result)
+            text, is_error = _extract_mcp_result(result)
+            if is_error:
+                return ToolResult.failed(
+                    f"**{tool_name}** reported an error:\n\n{text}",
+                    data={"tool": tool_name},
+                )
             return ToolResult.ok(
                 f"**{tool_name}** result:\n\n{text}",
                 data={"tool": tool_name},

@@ -9,6 +9,8 @@ catalog, and the Docker-gated tools are exercised with manager=None.
 
 from __future__ import annotations
 
+import inspect
+from typing import get_type_hints
 from unittest.mock import MagicMock
 
 import pytest
@@ -27,12 +29,19 @@ def _make_feature(*, manager=None, gateway=None) -> MCPAgent:
 
 # ---------------------------------------------------------------------------
 # Contract: every @tool method annotates -> ToolResult
+#
+# Self-contained (no host-app import): mirrors the host's
+# result_contract.find_violations so a backslide to a non-ToolResult return
+# fails here too, but the package's tests stay runnable standalone.
 # ---------------------------------------------------------------------------
 def test_all_tools_return_tool_result_annotation():
-    """Pins the migration so a backslide to str fails registration."""
-    from kestrel_sovereign.tools.result_contract import find_violations
-
-    violations = find_violations(MCPAgent)
+    violations = []
+    for name, method in inspect.getmembers(MCPAgent, predicate=inspect.isfunction):
+        if not hasattr(method, "_tool_schema"):
+            continue
+        return_ann = get_type_hints(method).get("return", inspect.Parameter.empty)
+        if return_ann is not ToolResult:
+            violations.append(f"MCPAgent.{name}: return annotation is {return_ann!r}, expected ToolResult")
     assert violations == [], violations
 
 
@@ -97,3 +106,48 @@ class TestDockerUnavailableFails:
         # Stopping an already-stopped gateway is idempotent, not an error.
         result = await _make_feature(gateway=None).gateway_stop()
         assert result.status is ToolResultStatus.OK
+
+
+# ---------------------------------------------------------------------------
+# MCP tool-level failures (CallToolResult.isError=True) must surface as ERROR,
+# not OK — MCP signals these without raising.
+# ---------------------------------------------------------------------------
+class TestIsErrorSurfacesAsFailed:
+    @staticmethod
+    def _error_result():
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            content=[SimpleNamespace(text="tool blew up")],
+            isError=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_call_tool_iserror_is_failed(self):
+        from unittest.mock import AsyncMock
+        manager = MagicMock()
+        manager.call_tool = AsyncMock(return_value=self._error_result())
+        result = await _make_feature(manager=manager).call_tool("c", "t", {})
+        assert result.status is ToolResultStatus.ERROR
+        assert "tool blew up" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_gateway_call_iserror_is_failed(self):
+        from unittest.mock import AsyncMock
+        gw = MagicMock()
+        gw.is_connected = True
+        gw.call_tool = AsyncMock(return_value=self._error_result())
+        result = await _make_feature(gateway=gw).gateway_call("fetch", {})
+        assert result.status is ToolResultStatus.ERROR
+        assert "tool blew up" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_gateway_call_success_is_ok(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        ok_result = SimpleNamespace(content=[SimpleNamespace(text="hello")], isError=False)
+        gw = MagicMock()
+        gw.is_connected = True
+        gw.call_tool = AsyncMock(return_value=ok_result)
+        result = await _make_feature(gateway=gw).gateway_call("fetch", {})
+        assert result.status is ToolResultStatus.OK
+        assert "hello" in result.confirmation
