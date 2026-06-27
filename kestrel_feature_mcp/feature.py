@@ -149,6 +149,32 @@ class MCPAgent(Feature):
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to clear persisted MCP server '%s': %s", name, e)
 
+    async def _reconcile_gateway_persistence(self, server_list) -> None:
+        """Make persisted gateway servers reflect EXACTLY ``server_list``.
+
+        ``gateway_start`` replaces the running gateway, so it is authoritative
+        for the gateway's server set: forget any previously-persisted gateway
+        server no longer in the list (else a restart would restore servers the
+        current gateway dropped), then persist the new set. ``gateway_enable``
+        stays additive.
+        """
+        if not self._supports_enablement_persistence():
+            return
+        desired = set(server_list)
+        try:
+            prior = await self.agent.get_enablement_deltas("mcp_server")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not read prior MCP servers for reconcile: %s", e)
+            prior = []
+        prior_gateway = {
+            d["name"] for d in prior
+            if (d.get("metadata") or {}).get("mode") == "gateway"
+        }
+        for stale in prior_gateway - desired:
+            await self._forget_server(stale)
+        for srv in server_list:
+            await self._persist_server(srv, "enabled", metadata={"mode": "gateway"})
+
     def _mount_gateway_tools(self) -> int:
         """(Re)mount the connected gateway's full tool set under the gateway owner.
 
@@ -444,9 +470,9 @@ class MCPAgent(Feature):
 
             tool_names = [t.name for t in tools]
             mounted = self._mount_gateway_tools()
-            # Persist each enabled server so the gateway auto-restarts on reboot.
-            for srv in server_list:
-                await self._persist_server(srv, "enabled", metadata={"mode": "gateway"})
+            # gateway_start is authoritative for the gateway's server set, so the
+            # persisted set is made to match exactly (stale servers forgotten).
+            await self._reconcile_gateway_persistence(server_list)
             mount_note = (
                 f"\n\n**Mounted {mounted} tools** — call them directly."
                 if mounted else

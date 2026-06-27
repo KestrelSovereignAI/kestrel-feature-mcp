@@ -59,6 +59,25 @@ class TestPersistHelpers:
         await feat._forget_server("fetch")
 
 
+class TestGatewayAuthoritativePersistence:
+    @pytest.mark.asyncio
+    async def test_reconcile_forgets_replaced_servers(self):
+        # Prior gateway had fetch+old; new gateway_start is just [time] -> persist
+        # 'time', forget fetch+old (so a restart restores only the current set).
+        host = _host()
+        host.get_enablement_deltas = AsyncMock(return_value=[
+            {"name": "fetch", "state": "enabled", "metadata": {"mode": "gateway"}},
+            {"name": "old", "state": "enabled", "metadata": {"mode": "gateway"}},
+            {"name": "keepc", "state": "enabled", "metadata": {"mode": "container"}},
+        ])
+        feat = _feature(host)
+        await feat._reconcile_gateway_persistence(["time"])
+        forgot = {c.args[1] for c in host.clear_feature_enablement.await_args_list}
+        assert forgot == {"fetch", "old"}  # container 'keepc' untouched
+        persisted = {c.args[1] for c in host.persist_feature_enablement.await_args_list}
+        assert persisted == {"time"}
+
+
 class TestRestoreOnStartup:
     @pytest.mark.asyncio
     async def test_restore_gateway_servers(self, monkeypatch):
