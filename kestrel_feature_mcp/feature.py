@@ -116,6 +116,84 @@ class MCPAgent(Feature):
             return 0
         return self.agent.unregister_dynamic_tools(owner)
 
+    # --- enablement persistence (survives restart via the host DB) ----------
+
+    def _supports_enablement_persistence(self) -> bool:
+        """Whether the host exposes the per-agent enablement-delta store.
+
+        Provided by the feature_enablement foundation. Older hosts lack it, so
+        enable/disable still works for the session but won't survive a restart.
+        """
+        agent = getattr(self, "agent", None)
+        return agent is not None and hasattr(agent, "persist_feature_enablement")
+
+    async def _persist_server(self, name: str, state: str, *, metadata=None) -> None:
+        """Record an MCP server's enablement (kind='mcp_server') so a restart
+        can auto-restore it. Best-effort: never fail the tool call on a
+        persistence error."""
+        if not self._supports_enablement_persistence():
+            return
+        try:
+            await self.agent.persist_feature_enablement(
+                "mcp_server", name, state, actor="agent", metadata=metadata,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to persist MCP server '%s' (%s): %s", name, state, e)
+
+    async def _forget_server(self, name: str) -> None:
+        """Drop an MCP server's persisted enablement (explicit removal)."""
+        if not self._supports_enablement_persistence():
+            return
+        try:
+            await self.agent.clear_feature_enablement("mcp_server", name)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to clear persisted MCP server '%s': %s", name, e)
+
+    async def _forget_all_gateway_servers(self) -> None:
+        """Clear every persisted gateway-mode server (explicit gateway disable).
+
+        ``gateway_stop`` is the off switch — symmetric with container unload — so
+        it must clear persistence; otherwise a stop followed by restart would
+        re-start the gateway and "off" would be impossible. Container deltas are
+        left untouched.
+        """
+        if not self._supports_enablement_persistence():
+            return
+        try:
+            prior = await self.agent.get_enablement_deltas("mcp_server")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not read MCP servers to clear on stop: %s", e)
+            return
+        for d in prior:
+            if (d.get("metadata") or {}).get("mode") == "gateway":
+                await self._forget_server(d["name"])
+
+    async def _reconcile_gateway_persistence(self, server_list) -> None:
+        """Make persisted gateway servers reflect EXACTLY ``server_list``.
+
+        ``gateway_start`` replaces the running gateway, so it is authoritative
+        for the gateway's server set: forget any previously-persisted gateway
+        server no longer in the list (else a restart would restore servers the
+        current gateway dropped), then persist the new set. ``gateway_enable``
+        stays additive.
+        """
+        if not self._supports_enablement_persistence():
+            return
+        desired = set(server_list)
+        try:
+            prior = await self.agent.get_enablement_deltas("mcp_server")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not read prior MCP servers for reconcile: %s", e)
+            prior = []
+        prior_gateway = {
+            d["name"] for d in prior
+            if (d.get("metadata") or {}).get("mode") == "gateway"
+        }
+        for stale in prior_gateway - desired:
+            await self._forget_server(stale)
+        for srv in server_list:
+            await self._persist_server(srv, "enabled", metadata={"mode": "gateway"})
+
     def _mount_gateway_tools(self) -> int:
         """(Re)mount the connected gateway's full tool set under the gateway owner.
 
@@ -161,6 +239,11 @@ class MCPAgent(Feature):
             mounted = self._mount_tools(
                 owner, container_name, tool_dicts,
                 lambda name, arguments, c=container_name: self.manager.call_tool(c, name, arguments),
+            )
+            # Persist so this container is auto-restored on restart.
+            await self._persist_server(
+                container_name, "enabled",
+                metadata={"mode": "container", "image": image_name, "args": args},
             )
             mount_note = (
                 f" Mounted {mounted} as callable tools."
@@ -220,6 +303,8 @@ class MCPAgent(Feature):
         try:
             await self.manager.stop_tool(container_name)
             self._unmount_tools(_container_owner(container_name))
+            # Explicit removal — forget it so it isn't auto-restored on restart.
+            await self._forget_server(container_name)
             return ToolResult.ok(f"Unloaded {container_name}", data={"container": container_name})
         except ValueError as e:
             logger.error(f"Tool not found: {container_name}")
@@ -404,6 +489,13 @@ class MCPAgent(Feature):
 
             tool_names = [t.name for t in tools]
             mounted = self._mount_gateway_tools()
+            # Persist the gateway's ACTUAL enabled set (a requested server can
+            # fail to enable while the gateway still starts with the subset), and
+            # make persistence match it exactly — stale servers forgotten.
+            actual = getattr(getattr(self.gateway_manager, "gateway", None),
+                             "enabled_servers", None)
+            authoritative = sorted(actual) if actual else server_list
+            await self._reconcile_gateway_persistence(authoritative)
             mount_note = (
                 f"\n\n**Mounted {mounted} tools** — call them directly."
                 if mounted else
@@ -436,6 +528,12 @@ class MCPAgent(Feature):
     )
     async def gateway_stop(self) -> ToolResult:
         """Stop the Docker MCP Gateway."""
+        # stop = explicit disable: clear persisted gateway servers FIRST and
+        # unconditionally, so auto-restore can be turned off even when the
+        # gateway isn't currently connected (Docker absent at restore, a crash,
+        # or deltas left from a prior run). Otherwise "off" would be impossible.
+        await self._forget_all_gateway_servers()
+
         if self.gateway_manager is None or not self.gateway_manager.is_connected:
             return ToolResult.ok("Gateway is not running.")
 
@@ -533,6 +631,7 @@ class MCPAgent(Feature):
             tools = await self.gateway_manager.enable_server(server_name)
             tool_names = [t.name for t in tools]
             mounted = self._mount_gateway_tools()
+            await self._persist_server(server_name, "enabled", metadata={"mode": "gateway"})
             return ToolResult.ok(
                 f"Enabled {server_name}\n\n"
                 f"**Total tools:** {len(tool_names)}"
@@ -597,6 +696,54 @@ class MCPAgent(Feature):
             "\n".join(lines),
             data={"query": query, "results": [s['name'] for s in results]},
         )
+
+    async def post_all_features_loaded(self, agent=None):
+        """Auto-restore MCP servers this agent previously enabled.
+
+        Reads the persisted ``mcp_server`` enablement deltas (foundation) and
+        re-starts the gateway / re-loads containers so an ``enable`` survives a
+        restart. Best-effort and fully guarded: a host without the enablement
+        store, or without Docker MCP, simply restores nothing — startup is never
+        blocked.
+        """
+        if not self._supports_enablement_persistence():
+            return
+        try:
+            deltas = await self.agent.get_enablement_deltas("mcp_server")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not read persisted MCP servers: %s", e)
+            return
+
+        enabled = [d for d in deltas if d.get("state") == "enabled"]
+        if not enabled:
+            return
+
+        def _mode(d):
+            return (d.get("metadata") or {}).get("mode")
+
+        gateway_servers = [d["name"] for d in enabled if _mode(d) == "gateway"]
+        containers = [d for d in enabled if _mode(d) == "container"]
+
+        if gateway_servers and check_docker_mcp_available():
+            try:
+                await self.gateway_start(",".join(gateway_servers))
+                logger.info(
+                    "Restored %d persisted MCP gateway server(s): %s",
+                    len(gateway_servers), gateway_servers,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Failed to restore MCP gateway servers %s: %s",
+                               gateway_servers, e)
+
+        for d in containers:
+            image = (d.get("metadata") or {}).get("image")
+            if not image:
+                continue
+            try:
+                await self.load_tool(image, (d.get("metadata") or {}).get("args"))
+                logger.info("Restored persisted MCP container from image %s", image)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Failed to restore MCP container %s: %s", image, e)
 
     async def shutdown(self):
         """Stops all active tools, gateway, and closes the Docker client."""
