@@ -528,6 +528,12 @@ class MCPAgent(Feature):
     )
     async def gateway_stop(self) -> ToolResult:
         """Stop the Docker MCP Gateway."""
+        # stop = explicit disable: clear persisted gateway servers FIRST and
+        # unconditionally, so auto-restore can be turned off even when the
+        # gateway isn't currently connected (Docker absent at restore, a crash,
+        # or deltas left from a prior run). Otherwise "off" would be impossible.
+        await self._forget_all_gateway_servers()
+
         if self.gateway_manager is None or not self.gateway_manager.is_connected:
             return ToolResult.ok("Gateway is not running.")
 
@@ -535,9 +541,6 @@ class MCPAgent(Feature):
             await self.gateway_manager.stop()
             self.gateway_manager = None
             self._unmount_tools(_GATEWAY_OWNER)
-            # stop = explicit disable: forget persisted gateway servers so the
-            # gateway does NOT auto-restart on the next boot.
-            await self._forget_all_gateway_servers()
             return ToolResult.ok("Gateway stopped.")
         except asyncio.CancelledError:
             logger.info("Gateway stop cancelled")

@@ -145,6 +145,19 @@ class TestGatewayStopDisables:
         forgot = {c.args[1] for c in host.clear_feature_enablement.await_args_list}
         assert forgot == {"fetch", "time"}  # container c1 left intact
 
+    @pytest.mark.asyncio
+    async def test_stop_clears_even_when_not_connected(self):
+        # The off switch must work when the gateway isn't currently connected
+        # (Docker absent, crash, or stale deltas) — else auto-restore is stuck on.
+        host = _host()
+        host.get_enablement_deltas = AsyncMock(return_value=[
+            {"name": "fetch", "state": "enabled", "metadata": {"mode": "gateway"}},
+        ])
+        feat = _feature(host, gateway=None)  # not connected
+        res = await feat.gateway_stop()
+        assert res.status.name == "OK" and "not running" in res.confirmation
+        host.clear_feature_enablement.assert_awaited_once_with("mcp_server", "fetch")
+
 
 class TestUnloadForgets:
     @pytest.mark.asyncio
