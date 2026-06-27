@@ -126,6 +126,26 @@ class TestRestoreOnStartup:
         await feat.post_all_features_loaded(feat.agent)
 
 
+class TestGatewayStopDisables:
+    @pytest.mark.asyncio
+    async def test_stop_clears_gateway_persistence(self):
+        # stop = explicit disable: forget gateway-mode servers, leave containers.
+        host = _host()
+        host.get_enablement_deltas = AsyncMock(return_value=[
+            {"name": "fetch", "state": "enabled", "metadata": {"mode": "gateway"}},
+            {"name": "time", "state": "enabled", "metadata": {"mode": "gateway"}},
+            {"name": "c1", "state": "enabled", "metadata": {"mode": "container"}},
+        ])
+        gw = MagicMock()
+        gw.is_connected = True
+        gw.stop = AsyncMock()
+        feat = _feature(host, gateway=gw)
+        res = await feat.gateway_stop()
+        assert res.status.name == "OK"
+        forgot = {c.args[1] for c in host.clear_feature_enablement.await_args_list}
+        assert forgot == {"fetch", "time"}  # container c1 left intact
+
+
 class TestUnloadForgets:
     @pytest.mark.asyncio
     async def test_unload_clears_persistence(self):

@@ -149,6 +149,25 @@ class MCPAgent(Feature):
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to clear persisted MCP server '%s': %s", name, e)
 
+    async def _forget_all_gateway_servers(self) -> None:
+        """Clear every persisted gateway-mode server (explicit gateway disable).
+
+        ``gateway_stop`` is the off switch — symmetric with container unload — so
+        it must clear persistence; otherwise a stop followed by restart would
+        re-start the gateway and "off" would be impossible. Container deltas are
+        left untouched.
+        """
+        if not self._supports_enablement_persistence():
+            return
+        try:
+            prior = await self.agent.get_enablement_deltas("mcp_server")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not read MCP servers to clear on stop: %s", e)
+            return
+        for d in prior:
+            if (d.get("metadata") or {}).get("mode") == "gateway":
+                await self._forget_server(d["name"])
+
     async def _reconcile_gateway_persistence(self, server_list) -> None:
         """Make persisted gateway servers reflect EXACTLY ``server_list``.
 
@@ -470,9 +489,13 @@ class MCPAgent(Feature):
 
             tool_names = [t.name for t in tools]
             mounted = self._mount_gateway_tools()
-            # gateway_start is authoritative for the gateway's server set, so the
-            # persisted set is made to match exactly (stale servers forgotten).
-            await self._reconcile_gateway_persistence(server_list)
+            # Persist the gateway's ACTUAL enabled set (a requested server can
+            # fail to enable while the gateway still starts with the subset), and
+            # make persistence match it exactly — stale servers forgotten.
+            actual = getattr(getattr(self.gateway_manager, "gateway", None),
+                             "enabled_servers", None)
+            authoritative = sorted(actual) if actual else server_list
+            await self._reconcile_gateway_persistence(authoritative)
             mount_note = (
                 f"\n\n**Mounted {mounted} tools** — call them directly."
                 if mounted else
@@ -512,6 +535,9 @@ class MCPAgent(Feature):
             await self.gateway_manager.stop()
             self.gateway_manager = None
             self._unmount_tools(_GATEWAY_OWNER)
+            # stop = explicit disable: forget persisted gateway servers so the
+            # gateway does NOT auto-restart on the next boot.
+            await self._forget_all_gateway_servers()
             return ToolResult.ok("Gateway stopped.")
         except asyncio.CancelledError:
             logger.info("Gateway stop cancelled")
