@@ -53,13 +53,18 @@ def _feature(host=None, *, manager=None, gateway=None) -> MCPAgent:
 # ---------------------------------------------------------------------------
 class TestWrapper:
     @pytest.mark.asyncio
-    async def test_execute_ok(self):
+    async def test_execute_returns_dict_envelope_ok(self):
+        # execute() must return the ToolResult dict envelope (to_dict()), NOT a
+        # raw ToolResult — that is the contract for objects in the host's
+        # _direct_tools, and the host infers a2a_tool_dispatches status from the
+        # dict's "status" key. (Regression: a raw ToolResult records as error
+        # because infer_tool_result_status reads the .failed classmethod.)
         caller = AsyncMock(return_value=_result("hello"))
         w = MCPToolWrapper(handle_name="mcp__fetch__fetch", real_name="fetch",
                            description="d", input_schema=None, caller=caller)
         res = await w.execute(url="x")
-        assert isinstance(res, ToolResult) and res.status is ToolResultStatus.OK
-        assert "hello" in res.confirmation
+        assert isinstance(res, dict) and res["status"] == "ok"
+        assert "hello" in res["confirmation"]
         caller.assert_awaited_once_with("fetch", {"url": "x"})
 
     @pytest.mark.asyncio
@@ -68,7 +73,7 @@ class TestWrapper:
         w = MCPToolWrapper(handle_name="h", real_name="fetch",
                            description="", input_schema=None, caller=caller)
         res = await w.execute()
-        assert res.status is ToolResultStatus.ERROR and "boom" in res.error
+        assert isinstance(res, dict) and res["status"] == "error" and "boom" in res["error"]
 
     @pytest.mark.asyncio
     async def test_execute_exception_is_failed(self):
@@ -76,7 +81,7 @@ class TestWrapper:
         w = MCPToolWrapper(handle_name="h", real_name="fetch",
                            description="", input_schema=None, caller=caller)
         res = await w.execute()
-        assert res.status is ToolResultStatus.ERROR and "transport down" in res.error
+        assert isinstance(res, dict) and res["status"] == "error" and "transport down" in res["error"]
 
     def test_schema_uses_input_schema_as_parameters(self):
         schema = {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}
@@ -133,7 +138,7 @@ class TestMounting:
         wrapper = host.registered[_GATEWAY_OWNER][0]
         # Executing the mounted wrapper proxies to the gateway's real tool name.
         res = await wrapper.execute(url="x")
-        assert res.status is ToolResultStatus.OK and "page" in res.confirmation
+        assert isinstance(res, dict) and res["status"] == "ok" and "page" in res["confirmation"]
         gw.call_tool.assert_awaited_once_with("fetch", {"url": "x"})
 
     @pytest.mark.asyncio

@@ -94,22 +94,32 @@ class MCPToolWrapper:
         self._caller = caller
         self.schema = _MCPToolSchema(handle_name, description, input_schema)
 
-    async def execute(self, **kwargs) -> ToolResult:
+    async def execute(self, **kwargs) -> Dict[str, Any]:
+        """Run the MCP tool and return the ToolResult **dict envelope**.
+
+        Objects mounted in the host's ``_direct_tools`` must return the same
+        serialized envelope the SDK ``AgentTool.execute`` produces
+        (``ToolResult.to_dict()``), not the raw ``ToolResult``: the dispatch
+        layer infers ``a2a_tool_dispatches`` status from the dict's ``status``
+        key. Returning the raw object makes ``infer_tool_result_status`` read
+        the ``ToolResult.failed`` *classmethod* (always truthy) and record every
+        call as an error. (Caught by the #1979 DB-grounded dogfood.)
+        """
         try:
             result = await self._caller(self._real_name, kwargs)
         except Exception as e:  # noqa: BLE001 - surface any transport failure
             logger.error(
                 "MCP tool '%s' execution failed: %s", self._real_name, e, exc_info=True
             )
-            return ToolResult.failed(f"MCP tool '{self._real_name}' failed: {e}")
+            return ToolResult.failed(f"MCP tool '{self._real_name}' failed: {e}").to_dict()
 
         text, is_error = extract_mcp_result(result)
         if is_error:
             return ToolResult.failed(
                 f"MCP tool '{self._real_name}' reported an error:\n{text}",
                 data={"mcp_tool": self._real_name},
-            )
-        return ToolResult.ok(text, data={"mcp_tool": self._real_name})
+            ).to_dict()
+        return ToolResult.ok(text, data={"mcp_tool": self._real_name}).to_dict()
 
 
 def build_wrappers(
