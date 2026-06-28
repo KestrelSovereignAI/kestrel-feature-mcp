@@ -159,11 +159,101 @@ class TestMounting:
         owner = _container_owner("mcp_fetch_123")
         host.registered[owner] = ["x"]
         manager = MagicMock()
-        manager.stop_tool = AsyncMock()
+        manager.stop_tool = AsyncMock(return_value=True)
         feat = _feature(host, manager=manager)
         res = await feat.unload_tool("mcp_fetch_123")
         assert res.status is ToolResultStatus.OK
         assert owner not in host.registered
+
+    @pytest.mark.asyncio
+    async def test_unload_not_loaded_is_honest_failure(self):
+        """#9 finding #4: unloading a container that was never loaded is a
+        no-op and must report failure, not a confident 'Unloaded'."""
+        host = _FakeHost()
+        manager = MagicMock()
+        manager.stop_tool = AsyncMock(return_value=False)
+        feat = _feature(host, manager=manager)
+        res = await feat.unload_tool("mcp-gateway-that-isnt-loaded")
+        assert res.status is ToolResultStatus.ERROR
+        assert "nothing to unload" in (res.error or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_enable_rejects_unknown_server(self, monkeypatch):
+        """#9 finding #2 (Critical): enabling a name absent from every
+        catalog must FAIL, not report a phantom success."""
+        gw = MagicMock()
+        gw.is_connected = True
+        gw.tools = {}
+        gw.enable_server = AsyncMock()
+        feat = _feature(gateway=gw)
+
+        async def _known():
+            return {"fetch", "sqlite"}
+        monkeypatch.setattr(feat, "_known_catalog_servers", _known)
+
+        res = await feat.gateway_enable("this-server-does-not-exist-xyz")
+        assert res.status is ToolResultStatus.ERROR
+        assert "unknown mcp server" in (res.error or "").lower()
+        gw.enable_server.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enable_no_new_tools_is_partial(self, monkeypatch):
+        """#9 finding #3: a real enable that contributes no NEW tools is a
+        no-op to the caller — report PARTIAL, not a confident 'Enabled'."""
+        gw = MagicMock()
+        gw.is_connected = True
+        gw.tools = {"fetch": object()}
+        gw.enable_server = AsyncMock(return_value=[SimpleNamespace(name="fetch")])
+        gw.get_all_tools = MagicMock(return_value=[])
+        feat = _feature(gateway=gw)
+
+        async def _known():
+            return {"fetch", "sqlite"}
+        monkeypatch.setattr(feat, "_known_catalog_servers", _known)
+
+        res = await feat.gateway_enable("sqlite")
+        assert res.status is ToolResultStatus.PARTIAL
+        assert res.data["new_tools"] == []
+
+    @pytest.mark.asyncio
+    async def test_enable_with_new_tools_is_ok(self, monkeypatch):
+        gw = MagicMock()
+        gw.is_connected = True
+        gw.tools = {"fetch": object()}
+        gw.enable_server = AsyncMock(return_value=[
+            SimpleNamespace(name="fetch"), SimpleNamespace(name="sqlite_query"),
+        ])
+        gw.get_all_tools = MagicMock(return_value=[])
+        feat = _feature(gateway=gw)
+
+        async def _known():
+            return {"fetch", "sqlite"}
+        monkeypatch.setattr(feat, "_known_catalog_servers", _known)
+
+        res = await feat.gateway_enable("sqlite")
+        assert res.status is ToolResultStatus.OK
+        assert res.data["new_tools"] == ["sqlite_query"]
+
+    @pytest.mark.asyncio
+    async def test_unverifiable_catalog_does_not_false_reject(self, monkeypatch):
+        """When no catalog is resolvable, validation must be SKIPPED (a
+        false rejection is its own honesty violation)."""
+        gw = MagicMock()
+        gw.is_connected = True
+        gw.tools = {}
+        gw.enable_server = AsyncMock(return_value=[SimpleNamespace(name="x")])
+        gw.get_all_tools = MagicMock(return_value=[])
+        feat = _feature(gateway=gw)
+
+        async def _known():
+            return None
+        monkeypatch.setattr(feat, "_known_catalog_servers", _known)
+
+        res = await feat.gateway_enable("some-unverifiable-server")
+        # Proceeds to enable (no FAILED on unknown name); honesty about
+        # the result is then governed by the new-tools delta.
+        gw.enable_server.assert_awaited_once()
+        assert res.status is not ToolResultStatus.ERROR
 
     def test_generated_handles_are_provider_valid(self):
         # The host sanitises, but the proposed handles should already be tame.

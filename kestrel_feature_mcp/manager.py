@@ -346,8 +346,13 @@ class MCPToolManager:
             logger.error(f"Failed to connect to tool {container_name}: {e}", exc_info=True)
             raise
 
-    async def stop_tool(self, container_name: str):
-        """Stops a tool, closes connection, and stops container."""
+    async def stop_tool(self, container_name: str) -> bool:
+        """Stops a tool, closes connection, and stops container.
+
+        Returns ``True`` if a loaded container by that name was actually
+        stopped, ``False`` if nothing was loaded under that name (a no-op).
+        Lets callers report an honest no-op instead of a phantom success
+        (#9, finding #4)."""
         if container_name in self.active_tools:
             tool_info = self.active_tools[container_name]
 
@@ -380,6 +385,10 @@ class MCPToolManager:
 
             del self.active_tools[container_name]
             logger.info(f"Stopped tool {container_name}")
+            return True
+
+        logger.info(f"stop_tool: no active container named {container_name}")
+        return False
 
     async def call_tool(self, container_name: str, tool_name: str, arguments: dict = None):
         """Calls a tool on a specific container."""
