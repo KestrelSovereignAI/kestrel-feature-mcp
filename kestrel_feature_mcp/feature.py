@@ -116,6 +116,70 @@ class MCPAgent(Feature):
             return 0
         return self.agent.unregister_dynamic_tools(owner)
 
+    # --- catalog validation (honesty: don't "enable" a name that can't exist) -
+
+    async def _known_catalog_servers(self) -> Optional[set]:
+        """Authoritative set of gateway-enableable server names, or ``None``
+        when that set is unverifiable.
+
+        The Docker MCP catalog (311+ servers) is the authoritative
+        namespace for gateway servers; the local curated registry is only
+        a small Kestrel-specific subset. Validation therefore GATES on the
+        Docker catalog: it is consulted only when the catalog actually
+        produced results. ``list_docker_catalog_servers()`` returns ``[]``
+        (not an error) when ``docker mcp catalog show`` times out, fails,
+        or Docker is absent — in that case the set is unverifiable and we
+        return ``None`` so callers SKIP validation. Crucially we do NOT
+        fall back to the small local registry to reject names: a valid
+        Docker server absent from that subset would be false-rejected,
+        blocking most of the catalog (codex review P2). When the Docker
+        catalog IS present, the local registry only *widens* the allowed
+        set (union), which can never cause a false rejection.
+
+        Callers MUST treat ``None`` as "unverifiable" and skip validation —
+        a false rejection is its own honesty violation. A non-empty set
+        means a requested name absent from it provably cannot be enabled,
+        so the lifecycle verb rejects it rather than reporting a phantom
+        success (#9).
+        """
+        docker_names: set = set()
+        try:
+            from .registry import list_docker_catalog_servers
+            catalog = await list_docker_catalog_servers()
+            docker_names = {s["name"] for s in catalog if s.get("name")}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Docker MCP catalog unavailable for validation: %s", exc)
+        if not docker_names:
+            # Unverifiable — never reject gateway names from the local
+            # subset alone.
+            return None
+        known = set(docker_names)
+        try:
+            known.update(entry.name for entry in get_registry().list_all())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Local MCP registry unavailable for validation: %s", exc)
+        return known
+
+    async def _reject_unknown_servers(
+        self, requested: List[str],
+    ) -> Optional[ToolResult]:
+        """Return a ``failed`` ToolResult naming any requested server that
+        is absent from every resolvable catalog, else ``None`` (proceed).
+
+        No-op when the catalog is unverifiable (see _known_catalog_servers)."""
+        known = await self._known_catalog_servers()
+        if known is None:
+            return None
+        unknown = [s for s in requested if s not in known]
+        if not unknown:
+            return None
+        return ToolResult.failed(
+            f"Unknown MCP server(s): {', '.join(unknown)}. "
+            "Not found in the Docker MCP catalog or the local registry, so "
+            "they cannot be enabled. Search with `!mcp-docker-catalog <query>`.",
+            data={"unknown_servers": unknown, "requested": requested},
+        )
+
     # --- enablement persistence (survives restart via the host DB) ----------
 
     def _supports_enablement_persistence(self) -> bool:
@@ -301,11 +365,30 @@ class MCPAgent(Feature):
             return ToolResult.failed("MCP tools are not available (Docker not accessible)")
 
         try:
-            await self.manager.stop_tool(container_name)
-            self._unmount_tools(_container_owner(container_name))
+            stopped = await self.manager.stop_tool(container_name)
+            unmounted = self._unmount_tools(_container_owner(container_name))
             # Explicit removal — forget it so it isn't auto-restored on restart.
             await self._forget_server(container_name)
-            return ToolResult.ok(f"Unloaded {container_name}", data={"container": container_name})
+            if not stopped:
+                # Nothing was loaded under that name — report the no-op
+                # honestly instead of a confident "Unloaded" (#9, finding #4).
+                # Persistence/mount cleanup still ran in case stale state
+                # lingered, so note whether that removed anything.
+                cleanup = (
+                    f" (cleared {unmounted} stale mounted tool(s))"
+                    if unmounted else ""
+                )
+                return ToolResult.failed(
+                    f"No MCP server named '{container_name}' is loaded; "
+                    f"nothing to unload{cleanup}.",
+                    data={"container": container_name, "stopped": False,
+                          "unmounted": unmounted},
+                )
+            return ToolResult.ok(
+                f"Unloaded {container_name}",
+                data={"container": container_name, "stopped": True,
+                      "unmounted": unmounted},
+            )
         except ValueError as e:
             logger.error(f"Tool not found: {container_name}")
             return ToolResult.failed(f"Failed to unload tool: {str(e)}")
@@ -478,36 +561,88 @@ class MCPAgent(Feature):
             from .manager import MCPGatewayManager
             from .gateway import DockerMCPGatewayError, DockerMCPNotInstalledError
 
+            server_list = [s.strip() for s in servers.split(",") if s.strip()]
+            if not server_list:
+                return ToolResult.failed(
+                    "No servers specified. Provide a comma-separated server "
+                    "list, e.g. `fetch,sqlite`."
+                )
+
+            # Honesty gate: never "enable" a name the catalog says can't
+            # exist (#9). Validate BEFORE tearing down the running gateway,
+            # so a bad request doesn't disrupt a working one.
+            rejection = await self._reject_unknown_servers(server_list)
+            if rejection is not None:
+                return rejection
+
             if self.gateway_manager and self.gateway_manager.is_connected:
                 await self.gateway_manager.stop()
                 self._unmount_tools(_GATEWAY_OWNER)
-
-            server_list = [s.strip() for s in servers.split(",")]
 
             self.gateway_manager = MCPGatewayManager()
             tools = await self.gateway_manager.start(server_list)
 
             tool_names = [t.name for t in tools]
             mounted = self._mount_gateway_tools()
-            # Persist the gateway's ACTUAL enabled set (a requested server can
-            # fail to enable while the gateway still starts with the subset), and
-            # make persistence match it exactly — stale servers forgotten.
-            actual = getattr(getattr(self.gateway_manager, "gateway", None),
-                             "enabled_servers", None)
-            authoritative = sorted(actual) if actual else server_list
-            await self._reconcile_gateway_persistence(authoritative)
+            # The gateway's ACTUAL enabled set is authoritative — a requested
+            # server can fail to enable while the gateway still starts with
+            # the subset. Persist that set (stale servers forgotten) AND
+            # report against it so we never claim a server is running that
+            # the gateway dropped.
+            actual_set = getattr(getattr(self.gateway_manager, "gateway", None),
+                                 "enabled_servers", None)
+            actual = sorted(actual_set) if actual_set else list(server_list)
+            await self._reconcile_gateway_persistence(actual)
+            not_enabled = [s for s in server_list if s not in set(actual)]
+
             mount_note = (
                 f"\n\n**Mounted {mounted} tools** — call them directly."
                 if mounted else
                 "\n\nUse `!mcp-gateway-call <tool> <args>` to call tools."
             )
-            return ToolResult.ok(
-                f"Gateway started with {len(tool_names)} tools\n\n"
-                f"**Enabled servers:** {', '.join(server_list)}\n"
+            tools_line = (
                 f"**Tools:** {', '.join(tool_names[:10])}"
                 + (f" (+{len(tool_names) - 10} more)" if len(tool_names) > 10 else "")
-                + mount_note,
-                data={"servers": server_list, "tools": tool_names, "mounted": mounted},
+                if tool_names else "**Tools:** none mounted"
+            )
+            data = {
+                "requested": server_list,
+                "enabled": actual,
+                "not_enabled": not_enabled,
+                "tools": tool_names,
+                "mounted": mounted,
+            }
+            # The gateway aggregates servers behind a flat tool list and does
+            # NOT attribute tools per server, so we can't prove which server
+            # produced which tool. Report only what IS verifiable — the
+            # gateway's enabled set and the real tool count — and flag a
+            # PARTIAL (not a blanket "ok") whenever the effect is short of
+            # the request: no tools at all, or a requested server the gateway
+            # didn't end up enabling. Callers inspect `Tools:` for coverage.
+            summary = (
+                f"**Requested:** {', '.join(server_list)}\n"
+                f"**Gateway enabled:** {', '.join(actual) or 'none'}\n"
+                f"{tools_line}" + mount_note
+            )
+            if not tool_names:
+                return ToolResult.partial(
+                    f"Gateway started but mounted 0 tools from "
+                    f"{len(server_list)} requested server(s). The servers may "
+                    f"need credentials or configuration.\n\n{summary}",
+                    "no tools mounted from the requested servers",
+                    data=data,
+                )
+            if not_enabled:
+                return ToolResult.partial(
+                    f"Gateway started with {len(tool_names)} tools, but "
+                    f"{len(not_enabled)} requested server(s) were not enabled: "
+                    f"{', '.join(not_enabled)}.\n\n{summary}",
+                    f"requested servers not enabled: {', '.join(not_enabled)}",
+                    data=data,
+                )
+            return ToolResult.ok(
+                f"Gateway started with {len(tool_names)} tools.\n\n{summary}",
+                data=data,
             )
 
         except (DockerMCPGatewayError, DockerMCPNotInstalledError) as e:
@@ -627,16 +762,47 @@ class MCPAgent(Feature):
         if self.gateway_manager is None or not self.gateway_manager.is_connected:
             return ToolResult.failed("Gateway not running. Use `!mcp-gateway-start` first.")
 
+        # Honesty gate: reject a name the catalog says can't exist (#9).
+        rejection = await self._reject_unknown_servers([server_name])
+        if rejection is not None:
+            return rejection
+
         try:
+            # Snapshot the tool inventory so we can prove this server
+            # actually contributed: enable_server reconnects and returns
+            # the gateway's FULL flat list (all servers), so the only
+            # honest per-server signal is the before/after delta.
+            before = set((self.gateway_manager.tools or {}).keys())
             tools = await self.gateway_manager.enable_server(server_name)
             tool_names = [t.name for t in tools]
+            new_tools = sorted(set(tool_names) - before)
             mounted = self._mount_gateway_tools()
             await self._persist_server(server_name, "enabled", metadata={"mode": "gateway"})
+            data = {
+                "server": server_name,
+                "tools": tool_names,
+                "new_tools": new_tools,
+                "mounted": mounted,
+            }
+            # A real enable that mounts no NEW tools is indistinguishable
+            # from a no-op to the caller unless we say so — surface it as
+            # PARTIAL instead of a confident "Enabled" (#9, finding #3).
+            if not new_tools:
+                return ToolResult.partial(
+                    f"Enabled {server_name}, but it added 0 new tools "
+                    f"(it may need credentials/configuration, or its tools "
+                    f"were already present). Gateway total: {len(tool_names)} "
+                    f"tools.",
+                    f"{server_name} contributed no new tools",
+                    data=data,
+                )
             return ToolResult.ok(
-                f"Enabled {server_name}\n\n"
-                f"**Total tools:** {len(tool_names)}"
+                f"Enabled {server_name} — added {len(new_tools)} tool(s): "
+                f"{', '.join(new_tools[:10])}"
+                + (f" (+{len(new_tools) - 10} more)" if len(new_tools) > 10 else "")
+                + f"\n\n**Gateway total:** {len(tool_names)} tools"
                 + (f" ({mounted} mounted as callable tools)" if mounted else ""),
-                data={"server": server_name, "tools": tool_names, "mounted": mounted},
+                data=data,
             )
         except (ValueError, RuntimeError) as e:
             logger.error(f"Failed to enable server: {e}")
