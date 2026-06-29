@@ -468,8 +468,9 @@ class MCPGatewayManager:
     - Bearer token authentication
     """
 
-    def __init__(self, port: int = 0, transport: str = DockerMCPGateway.DEFAULT_TRANSPORT):
-        self.gateway = DockerMCPGateway(port=port, transport=transport)
+    def __init__(self, port: int = 0, transport: str = DockerMCPGateway.DEFAULT_TRANSPORT,
+                 long_lived: bool = True):
+        self.gateway = DockerMCPGateway(port=port, transport=transport, long_lived=long_lived)
         self.session: Optional[ClientSession] = None
         self.tools: Dict[str, Any] = {}
         self._session_task: Optional[asyncio.Task] = None
