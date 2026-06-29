@@ -80,6 +80,7 @@ class DockerMCPGateway:
         port: int = 0,
         session_timeout: Optional[float] = None,
         transport: str = DEFAULT_TRANSPORT,
+        long_lived: bool = True,
     ):
         """
         Initialize the gateway manager.
@@ -93,8 +94,15 @@ class DockerMCPGateway:
                            Recommended: 300-900 for agent sessions.
             transport: Gateway transport — ``streaming`` (Streamable HTTP, the
                        current MCP standard, default) or ``sse`` (deprecated).
+            long_lived: Keep one container alive per server for the gateway's
+                       lifetime (default True). Without it the gateway runs a
+                       throwaway container per tool call, so stateful servers
+                       (e.g. sequentialthinking's thoughtHistory) lose their
+                       in-process state between calls. The containers are reaped
+                       when the gateway stops.
         """
         self.transport = transport
+        self.long_lived = long_lived
         # Remember whether a fixed port was requested; 0 means "pick a free one
         # at bind time" so concurrent gateways never collide on a fixed port.
         self._requested_port = port
@@ -267,6 +275,10 @@ class DockerMCPGateway:
             f"--port={self.port}",
             f"--servers={servers_arg}",
         ]
+        if self.long_lived:
+            # Keep server containers alive across calls so stateful servers
+            # retain in-process state (#12 follow-up); reaped on gateway stop.
+            cmd.append("--long-lived")
 
         env = dict(os.environ)
         if self._is_streaming:
