@@ -153,17 +153,21 @@ transport = "stdio"
 image = "mcp/time:latest"
 wrapper_image = "supercorp/supergateway:latest"
 description = "Time and timezone utilities"
-tools = ["get_current_time", "convert_timezone"]
+# Tool names verified against a live `tools/list` against mcp/time:latest.
+# These are display hints only; the gateway discovers the authoritative set.
+tools = ["get_current_time", "convert_time"]
 categories = ["utility"]
 port = 8000
 
-[servers.sequential-thinking]
+[servers.sequentialthinking]
 type = "docker"
 transport = "stdio"
-image = "mcp/sequential-thinking:latest"
+# Docker Hub repo is `mcp/sequentialthinking` (no hyphen); `mcp/sequential-thinking`
+# is a 404. The server exposes a single `sequentialthinking` tool.
+image = "mcp/sequentialthinking:latest"
 wrapper_image = "supercorp/supergateway:latest"
 description = "Step-by-step reasoning assistant"
-tools = ["create_thinking_session", "add_thought", "get_session"]
+tools = ["sequentialthinking"]
 categories = ["ai", "utility"]
 port = 8000
 

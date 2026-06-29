@@ -33,9 +33,11 @@ except ImportError:
 
 try:
     from mcp.client.sse import sse_client
+    from mcp.client.streamable_http import streamablehttp_client
     from mcp.client.session import ClientSession
 except ImportError:
     sse_client = None  # type: ignore[assignment]
+    streamablehttp_client = None  # type: ignore[assignment]
     ClientSession = None  # type: ignore[assignment,misc]
 
 from .constants import (
@@ -461,28 +463,43 @@ class MCPGatewayManager:
 
     This is the recommended way to access MCP servers as it provides:
     - Access to 311+ servers from Docker's catalog
-    - Automatic stdio->SSE conversion
+    - Automatic stdio->Streamable-HTTP conversion
     - Single unified connection point
     - Bearer token authentication
     """
 
-    def __init__(self, port: int = 9000):
-        self.gateway = DockerMCPGateway(port=port)
+    def __init__(self, port: int = 0, transport: str = DockerMCPGateway.DEFAULT_TRANSPORT):
+        self.gateway = DockerMCPGateway(port=port, transport=transport)
         self.session: Optional[ClientSession] = None
         self.tools: Dict[str, Any] = {}
         self._session_task: Optional[asyncio.Task] = None
 
     async def start(self, servers: List[str] = None):
-        """Start the gateway and connect via SSE."""
+        """Start the gateway and connect over its transport."""
         if servers is None:
             servers = ["fetch"]
 
         auth_token = await self.gateway.start(servers)
-        return await self._connect_sse(auth_token)
+        return await self._connect(auth_token)
 
-    async def _connect_sse(self, auth_token: str):
-        """Connect to the gateway via SSE with authentication."""
-        url = self.gateway.sse_url
+    def _open_transport(self, url: str, headers: Dict[str, str]):
+        """Open the MCP client transport for the gateway's active transport.
+
+        Returns an async-context-manager yielding ``(read, write[, ...])``.
+        Streamable HTTP yields a third element (a session-id callback) that we
+        don't need; sse yields a 2-tuple. The session_loop unpacks defensively.
+        """
+        if self.gateway._is_streaming:
+            if streamablehttp_client is None:
+                raise RuntimeError("mcp streamable-http client unavailable")
+            return streamablehttp_client(url, headers=headers)
+        if sse_client is None:
+            raise RuntimeError("mcp sse client unavailable")
+        return sse_client(url, headers=headers)
+
+    async def _connect(self, auth_token: str):
+        """Connect to the gateway over its transport with Bearer auth."""
+        url = self.gateway.endpoint_url
 
         logger.info(f"Connecting to gateway at {url}...")
 
@@ -490,13 +507,13 @@ class MCPGatewayManager:
 
         async def session_loop():
             try:
-                headers = {"Authorization": f"Bearer {auth_token}"}
-                async with aiohttp.ClientSession(headers=headers) as http_session:
-                    async with sse_client(url, headers=headers) as (read_stream, write_stream):
-                        async with ClientSession(read_stream, write_stream) as session:
-                            await session.initialize()
-                            session_future.set_result(session)
-                            await asyncio.Future()
+                headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+                async with self._open_transport(url, headers) as streams:
+                    read_stream, write_stream = streams[0], streams[1]
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+                        session_future.set_result(session)
+                        await asyncio.Future()
             except asyncio.CancelledError:
                 logger.info("Gateway session cancelled")
                 raise
@@ -576,7 +593,7 @@ class MCPGatewayManager:
 
         self.session = None
         self.tools = {}
-        return await self._connect_sse(auth_token)
+        return await self._connect(auth_token)
 
     async def disable_server(self, server_name: str):
         """Disable a server and reconnect."""
@@ -591,7 +608,7 @@ class MCPGatewayManager:
 
         self.session = None
         self.tools = {}
-        return await self._connect_sse(auth_token)
+        return await self._connect(auth_token)
 
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any] = None):
         """Call a tool through the gateway."""

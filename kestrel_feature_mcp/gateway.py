@@ -2,23 +2,29 @@
 Docker MCP Gateway Manager.
 
 This module manages the Docker MCP Gateway process, which provides
-a unified SSE endpoint for accessing any MCP server from Docker's
-311+ server catalog.
+a unified Streamable-HTTP endpoint for accessing any MCP server from
+Docker's 311+ server catalog.
 
-The gateway handles stdio->SSE conversion automatically, so we can
-use any MCP server regardless of its native transport.
+The gateway handles stdio->Streamable-HTTP conversion automatically, so we
+can use any MCP server regardless of its native transport. MCP deprecated the
+standalone HTTP+SSE transport (2025-03-26 spec) in favour of Streamable HTTP;
+``sse`` remains selectable only for legacy interop.
 
 Usage:
-    gateway = DockerMCPGateway(port=9000)
+    gateway = DockerMCPGateway()              # ephemeral port, streaming
     auth_token = await gateway.start(["fetch", "sqlite"])
-    # Connect via SSE at http://localhost:9000/sse with Bearer token
+    # Connect at gateway.endpoint_url (…/mcp) with the Bearer token
     await gateway.stop()
 """
 
 import asyncio
+import contextlib
 import logging
+import os
 import re
+import secrets
 import shutil
+import socket
 import subprocess
 import time
 from typing import List, Optional, Set
@@ -31,8 +37,11 @@ from .constants import (
 
 logger = logging.getLogger(__name__)
 
-# Gateway startup configuration
-GATEWAY_STARTUP_TIMEOUT = 30.0  # seconds
+# Gateway startup configuration.
+# The gateway pulls the server image on first use, so a cold start can take far
+# longer than a warm one — 30s timed out mid-pull for first-time servers (#12).
+# Allow generous headroom; a genuinely hung gateway still fails, just later.
+GATEWAY_STARTUP_TIMEOUT = 180.0  # seconds
 GATEWAY_STARTUP_POLL_INTERVAL = 0.5  # seconds
 
 
@@ -61,24 +70,73 @@ class DockerMCPGateway:
         enabled_servers: Set of currently enabled server names
     """
 
-    def __init__(self, port: int = 9000, session_timeout: Optional[float] = None):
+    #: MCP deprecated the standalone HTTP+SSE transport (2025-03-26 spec) in
+    #: favour of Streamable HTTP. We default to the gateway's ``streaming``
+    #: transport; ``sse`` remains selectable only for legacy interop (#12).
+    DEFAULT_TRANSPORT = "streaming"
+
+    def __init__(
+        self,
+        port: int = 0,
+        session_timeout: Optional[float] = None,
+        transport: str = DEFAULT_TRANSPORT,
+    ):
         """
         Initialize the gateway manager.
 
         Args:
-            port: TCP port for the SSE endpoint (default: 9000)
+            port: TCP port for the endpoint. ``0`` (default) selects a free
+                  ephemeral port at start() time, which eliminates the
+                  fixed-``:9000`` collision that blocked a second gateway (#12).
             session_timeout: Optional timeout in seconds after which gateway
                            auto-stops. None = no timeout (default).
                            Recommended: 300-900 for agent sessions.
+            transport: Gateway transport — ``streaming`` (Streamable HTTP, the
+                       current MCP standard, default) or ``sse`` (deprecated).
         """
+        self.transport = transport
+        # Remember whether a fixed port was requested; 0 means "pick a free one
+        # at bind time" so concurrent gateways never collide on a fixed port.
+        self._requested_port = port
         self.port = port
         self.session_timeout = session_timeout
         self.process: Optional[subprocess.Popen] = None
+        # Streamable HTTP authenticates via the MCP_GATEWAY_AUTH_TOKEN env var
+        # (the gateway prints no Bearer line), so we mint the token up-front and
+        # inject it. Legacy sse parses the token from stdout instead.
         self.auth_token: Optional[str] = None
         self.enabled_servers: Set[str] = set()
         self._output_lines: List[str] = []
         self._timeout_task: Optional[asyncio.Task] = None
         self._start_time: Optional[float] = None
+
+    @property
+    def _is_streaming(self) -> bool:
+        return self.transport != "sse"
+
+    @staticmethod
+    def _find_free_port() -> int:
+        """Reserve a free ephemeral TCP port (closed immediately; the gateway
+        re-binds it microseconds later — a benign, standard race)."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    async def _wait_port_listening(self, timeout: float = 10.0) -> bool:
+        """Poll until the gateway's TCP port accepts connections, so we never
+        hand back a token before the endpoint can actually be dialed."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                fut = asyncio.open_connection("127.0.0.1", self.port)
+                _, writer = await asyncio.wait_for(fut, timeout=1.0)
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+                return True
+            except (OSError, asyncio.TimeoutError):
+                await asyncio.sleep(0.2)
+        return False
 
     @staticmethod
     def check_docker_mcp_available() -> bool:
@@ -152,11 +210,21 @@ class DockerMCPGateway:
             return False
 
     def _parse_auth_token(self, line: str) -> Optional[str]:
-        """Parse the auth token from gateway output."""
+        """Parse the auth token from gateway output (legacy sse transport)."""
         match = re.search(r'Authorization:\s*Bearer\s+([a-zA-Z0-9]+)', line)
         if match:
             return match.group(1)
         return None
+
+    @staticmethod
+    def _is_ready_line(line: str) -> bool:
+        """Detect the streaming-transport readiness banner.
+
+        The gateway prints e.g. ``> Start streaming server on port 9477`` once
+        the Streamable HTTP endpoint is listening.
+        """
+        low = line.lower()
+        return "streaming server" in low or "start streamable" in low
 
     async def start(self, servers: List[str]) -> str:
         """
@@ -188,13 +256,24 @@ class DockerMCPGateway:
                 f"Failed to enable any servers from: {servers}"
             )
 
+        # Resolve the port at bind time: an explicit port is honoured, otherwise
+        # pick a fresh ephemeral one so two gateways never fight over :9000 (#12).
+        self.port = self._requested_port or self._find_free_port()
+
         servers_arg = ",".join(self.enabled_servers)
         cmd = [
             "docker", "mcp", "gateway", "run",
-            "--transport=sse",
+            f"--transport={self.transport}",
             f"--port={self.port}",
-            f"--servers={servers_arg}"
+            f"--servers={servers_arg}",
         ]
+
+        env = dict(os.environ)
+        if self._is_streaming:
+            # Streamable HTTP has no token line to parse — mint one and inject
+            # it; the client sends it back as a Bearer header.
+            self.auth_token = secrets.token_hex(24)
+            env["MCP_GATEWAY_AUTH_TOKEN"] = self.auth_token
 
         logger.info(f"Starting Docker MCP Gateway: {' '.join(cmd)}")
 
@@ -203,7 +282,8 @@ class DockerMCPGateway:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1
+            bufsize=1,
+            env=env,
         )
 
         start_time = time.monotonic()
@@ -232,23 +312,39 @@ class DockerMCPGateway:
                     asyncio.to_thread(self.process.stdout.readline),
                     timeout=GATEWAY_STARTUP_POLL_INTERVAL
                 )
-                if line:
-                    self._output_lines.append(line)
-                    logger.debug(f"Gateway: {line.rstrip()}")
+                if not line:
+                    continue
+                self._output_lines.append(line)
+                logger.debug(f"Gateway: {line.rstrip()}")
 
-                    token = self._parse_auth_token(line)
-                    if token:
-                        self.auth_token = token
+                if self._is_streaming:
+                    # e.g. "> Start streaming server on port 9477"
+                    if self._is_ready_line(line):
+                        if not await self._wait_port_listening():
+                            await self.stop()
+                            raise DockerMCPGatewayError(
+                                "Gateway reported ready but the streaming port "
+                                f"{self.port} never accepted connections."
+                            )
                         self._start_time = time.monotonic()
-                        logger.info(f"Gateway ready at http://localhost:{self.port}/sse")
-
+                        logger.info(
+                            f"Gateway ready at {self.endpoint_url}"
+                        )
                         if self.session_timeout:
                             self._start_timeout_task()
+                        return self.auth_token
+                    continue
 
-                        return token
-
-                    if "Start sse server" in line or "Gateway URL:" in line:
-                        continue
+                token = self._parse_auth_token(line)
+                if token:
+                    self.auth_token = token
+                    self._start_time = time.monotonic()
+                    logger.info(f"Gateway ready at {self.endpoint_url}")
+                    if self.session_timeout:
+                        self._start_timeout_task()
+                    return token
+                if "Start sse server" in line or "Gateway URL:" in line:
+                    continue
 
             except asyncio.TimeoutError:
                 continue
@@ -341,9 +437,18 @@ class DockerMCPGateway:
         return await self.restart(servers)
 
     @property
+    def endpoint_url(self) -> str:
+        """The MCP endpoint URL for the active transport.
+
+        Streamable HTTP serves at ``/mcp``; legacy sse serves at ``/sse``.
+        """
+        path = "sse" if not self._is_streaming else "mcp"
+        return f"http://localhost:{self.port}/{path}"
+
+    @property
     def sse_url(self) -> str:
-        """Get the SSE endpoint URL."""
-        return f"http://localhost:{self.port}/sse"
+        """Deprecated alias for :attr:`endpoint_url` (kept for callers/tests)."""
+        return self.endpoint_url
 
     @property
     def is_running(self) -> bool:
