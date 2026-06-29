@@ -291,14 +291,20 @@ class MCPAgent(Feature):
         try:
             container_name = await self.manager.start_tool_container(image_name, command=args)
             tools = await self.manager.connect_to_tool(container_name)
-            tool_names = [t.name for t in tools]
             # Mount the container's tools as first-class LLM tools. The caller
             # closure binds the container; the host registry routes the call
             # back through manager.call_tool with the tool's real MCP name.
             tool_dicts = [
-                t for t in self.manager.get_all_tools()
+                t for t in (self.manager.get_all_tools() or [])
                 if t.get("container") == container_name
             ]
+            # connect_to_tool returns the tool objects; be defensive if a path
+            # ever yields None/empty by falling back to the authoritative mounted
+            # set (get_all_tools) so load never false-fails on name extraction.
+            if tools:
+                tool_names = [t.name for t in tools]
+            else:
+                tool_names = [t.get("name") for t in tool_dicts if t.get("name")]
             owner = _container_owner(container_name)
             mounted = self._mount_tools(
                 owner, container_name, tool_dicts,

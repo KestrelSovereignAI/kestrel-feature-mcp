@@ -280,11 +280,42 @@ class MCPToolManager:
                 session_future.set_exception(e)
             raise
 
+    async def _drop_stale_session(self, container_name: str) -> None:
+        """Cancel and forget a cached SSE session WITHOUT stopping the container.
+
+        Used before a reconnect: the container has just been restarted for a
+        clean state, so its cached session task is bound to the dead process.
+        Unlike ``stop_tool`` this leaves the (restarted, running) container in
+        place — we only release the stale connection so a fresh one can bind.
+        """
+        info = self.active_tools.pop(container_name, None)
+        if not info:
+            return
+        task = info.get("task")
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"Error cancelling stale session task for {container_name}: {e}"
+                )
+
     async def connect_to_tool(self, container_name: str):
         """Connects to a running MCP tool container via SSE."""
         if container_name in self.active_tools:
-            logger.info(f"Already connected to {container_name}")
-            return
+            # The caller (load_tool) restarts an already-running container for a
+            # clean state BEFORE reconnecting, so the cached SSE session here is
+            # now stale (bound to the pre-restart process). Tear it down and
+            # reconnect fresh below — the old bare `return` (None) made load_tool
+            # crash on `[t.name for t in tools]`, and returning the cached tools
+            # would report success over a dead session whose call_tool fails.
+            logger.info(
+                f"Reconnecting to {container_name}: dropping stale session"
+            )
+            await self._drop_stale_session(container_name)
 
         try:
             container = self.docker_client.containers.get(container_name)
