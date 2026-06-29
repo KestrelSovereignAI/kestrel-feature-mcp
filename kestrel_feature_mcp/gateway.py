@@ -412,6 +412,11 @@ class DockerMCPGateway:
                 self.auth_token = None
                 self._start_time = None
                 logger.info("Gateway stopped")
+        # enabled_servers tracks what THIS gateway process is serving; a stopped
+        # gateway serves nothing. restart()/add_server()/remove_server() all
+        # snapshot the desired list before calling stop(), so clearing here is
+        # safe and keeps the set from accumulating stale servers across restarts.
+        self.enabled_servers.clear()
 
     async def restart(self, servers: List[str] = None) -> str:
         """Restart the gateway with optionally different servers."""
