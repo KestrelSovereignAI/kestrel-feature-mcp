@@ -26,7 +26,9 @@ import secrets
 import shutil
 import socket
 import subprocess
+import threading
 import time
+from collections import deque
 from typing import List, Optional, Set
 
 from .constants import (
@@ -43,6 +45,19 @@ logger = logging.getLogger(__name__)
 # Allow generous headroom; a genuinely hung gateway still fails, just later.
 GATEWAY_STARTUP_TIMEOUT = 180.0  # seconds
 GATEWAY_STARTUP_POLL_INTERVAL = 0.5  # seconds
+
+# Bounded retention of the gateway's stdout for error/debug context. The
+# background drainer keeps consuming the pipe for the process's whole life so
+# it never fills and wedges the long-lived gateway (F398); only the most recent
+# lines are kept in memory.
+GATEWAY_LOG_HISTORY = 500
+
+
+def _safe_put(q: "asyncio.Queue", item) -> None:
+    """Best-effort ``put_nowait`` used from the stdout drainer via
+    ``call_soon_threadsafe``; never raises back into the event loop."""
+    with contextlib.suppress(Exception):
+        q.put_nowait(item)
 
 
 class DockerMCPGatewayError(Exception):
@@ -114,9 +129,17 @@ class DockerMCPGateway:
         # inject it. Legacy sse parses the token from stdout instead.
         self.auth_token: Optional[str] = None
         self.enabled_servers: Set[str] = set()
-        self._output_lines: List[str] = []
         self._timeout_task: Optional[asyncio.Task] = None
         self._start_time: Optional[float] = None
+        # Single owner of the gateway's stdout for the process's whole life
+        # (F398). ``_stdout_thread`` does a blocking readline loop; every line
+        # lands in the bounded ``_stdout_history`` deque, and — only during
+        # startup — is also handed to the async startup loop via
+        # ``_startup_queue`` (gated by ``_feed_startup_queue``).
+        self._stdout_thread: Optional[threading.Thread] = None
+        self._stdout_history: "deque[str]" = deque(maxlen=GATEWAY_LOG_HISTORY)
+        self._startup_queue: Optional[asyncio.Queue] = None
+        self._feed_startup_queue: bool = False
 
     @property
     def _is_streaming(self) -> bool:
@@ -298,8 +321,24 @@ class DockerMCPGateway:
             env=env,
         )
 
+        # Hand stdout to a single lifelong drainer thread (F398). It keeps the
+        # pipe drained after startup so it never fills and wedges the long-lived
+        # gateway, and it removes the per-poll ``to_thread(readline)`` that was
+        # abandoned on every ``wait_for`` timeout (leaking threads / losing
+        # lines). The startup loop below consumes from the queue it feeds.
+        self._stdout_history.clear()
+        self._startup_queue = asyncio.Queue()
+        self._feed_startup_queue = True
+        loop = asyncio.get_running_loop()
+        self._stdout_thread = threading.Thread(
+            target=self._drain_stdout,
+            args=(self.process, loop, self._startup_queue),
+            name="mcp-gateway-stdout-drain",
+            daemon=True,
+        )
+        self._stdout_thread.start()
+
         start_time = time.monotonic()
-        self._output_lines = []
 
         while True:
             elapsed = time.monotonic() - start_time
@@ -307,59 +346,106 @@ class DockerMCPGateway:
                 await self.stop()
                 raise DockerMCPGatewayError(
                     f"Gateway startup timeout after {GATEWAY_STARTUP_TIMEOUT}s. "
-                    f"Output:\n{''.join(self._output_lines[-20:])}"
-                )
-
-            if self.process.poll() is not None:
-                remaining = self.process.stdout.read()
-                if remaining:
-                    self._output_lines.append(remaining)
-                raise DockerMCPGatewayError(
-                    f"Gateway process exited with code {self.process.returncode}. "
-                    f"Output:\n{''.join(self._output_lines)}"
+                    f"Output:\n{self._recent_output(20)}"
                 )
 
             try:
                 line = await asyncio.wait_for(
-                    asyncio.to_thread(self.process.stdout.readline),
+                    self._startup_queue.get(),
                     timeout=GATEWAY_STARTUP_POLL_INTERVAL
                 )
-                if not line:
-                    continue
-                self._output_lines.append(line)
-                logger.debug(f"Gateway: {line.rstrip()}")
+            except asyncio.TimeoutError:
+                # No output this interval — surface a premature exit promptly
+                # rather than waiting out the whole startup timeout.
+                if self.process.poll() is not None:
+                    raise DockerMCPGatewayError(
+                        f"Gateway process exited with code "
+                        f"{self.process.returncode}. "
+                        f"Output:\n{self._recent_output()}"
+                    )
+                continue
 
-                if self._is_streaming:
-                    # e.g. "> Start streaming server on port 9477"
-                    if self._is_ready_line(line):
-                        if not await self._wait_port_listening():
-                            await self.stop()
-                            raise DockerMCPGatewayError(
-                                "Gateway reported ready but the streaming port "
-                                f"{self.port} never accepted connections."
-                            )
-                        self._start_time = time.monotonic()
-                        logger.info(
-                            f"Gateway ready at {self.endpoint_url}"
+            if line is None:
+                # EOF sentinel: the drainer saw stdout close (process ended).
+                raise DockerMCPGatewayError(
+                    f"Gateway process exited with code {self.process.returncode}. "
+                    f"Output:\n{self._recent_output()}"
+                )
+
+            logger.debug(f"Gateway: {line.rstrip()}")
+
+            if self._is_streaming:
+                # e.g. "> Start streaming server on port 9477"
+                if self._is_ready_line(line):
+                    # Stop feeding the startup queue NOW, before the (up to
+                    # 10s) port wait — otherwise the drainer keeps enqueuing
+                    # into the unbounded queue during that window and nothing
+                    # drains it after startup (codex P2). The bounded history
+                    # deque keeps absorbing lines for error context.
+                    self._feed_startup_queue = False
+                    if not await self._wait_port_listening():
+                        await self.stop()
+                        raise DockerMCPGatewayError(
+                            "Gateway reported ready but the streaming port "
+                            f"{self.port} never accepted connections."
                         )
-                        if self.session_timeout:
-                            self._start_timeout_task()
-                        return self.auth_token
-                    continue
-
-                token = self._parse_auth_token(line)
-                if token:
-                    self.auth_token = token
                     self._start_time = time.monotonic()
-                    logger.info(f"Gateway ready at {self.endpoint_url}")
+                    logger.info(
+                        f"Gateway ready at {self.endpoint_url}"
+                    )
                     if self.session_timeout:
                         self._start_timeout_task()
-                    return token
-                if "Start sse server" in line or "Gateway URL:" in line:
-                    continue
-
-            except asyncio.TimeoutError:
+                    return self.auth_token
                 continue
+
+            token = self._parse_auth_token(line)
+            if token:
+                self._feed_startup_queue = False
+                self.auth_token = token
+                self._start_time = time.monotonic()
+                logger.info(f"Gateway ready at {self.endpoint_url}")
+                if self.session_timeout:
+                    self._start_timeout_task()
+                return token
+            if "Start sse server" in line or "Gateway URL:" in line:
+                continue
+
+    def _drain_stdout(self, proc, loop, startup_queue) -> None:
+        """Single lifelong owner of the gateway's stdout (F398).
+
+        Runs in a daemon thread doing a blocking readline loop. Every line is
+        appended to the bounded ``_stdout_history`` deque; while
+        ``_feed_startup_queue`` is set, each line is also delivered to the
+        async startup loop via ``startup_queue``. After startup the pipe keeps
+        being drained (into the bounded deque only) so it can never fill and
+        wedge the long-lived gateway. On EOF a ``None`` sentinel is delivered so
+        the startup loop can detect a premature process exit.
+        """
+        def _deliver(item):
+            with contextlib.suppress(RuntimeError):
+                # RuntimeError if the loop is already closed during teardown.
+                loop.call_soon_threadsafe(_safe_put, startup_queue, item)
+
+        try:
+            stdout = proc.stdout
+            while stdout is not None:
+                line = stdout.readline()
+                if not line:  # '' at EOF (process exited / pipe closed)
+                    break
+                self._stdout_history.append(line)
+                if self._feed_startup_queue:
+                    _deliver(line)
+        except Exception as exc:  # noqa: BLE001 - drain thread has no caller
+            logger.debug(f"Gateway stdout drain ended: {exc}")
+        finally:
+            _deliver(None)
+
+    def _recent_output(self, limit: Optional[int] = None) -> str:
+        """Join the most recent drained stdout lines for error context."""
+        lines = list(self._stdout_history)
+        if limit is not None:
+            lines = lines[-limit:]
+        return ''.join(lines)
 
     def _start_timeout_task(self):
         """Start a background task that stops the gateway after timeout."""
@@ -420,6 +506,14 @@ class DockerMCPGateway:
             except Exception as e:
                 logger.warning(f"Error stopping gateway: {e}")
             finally:
+                # The process is dead, so stdout is at EOF and the drainer's
+                # readline loop has ended (F398) — join it so no orphan thread
+                # outlives the gateway.
+                self._feed_startup_queue = False
+                if self._stdout_thread is not None:
+                    await asyncio.to_thread(self._stdout_thread.join, 2.0)
+                    self._stdout_thread = None
+                self._startup_queue = None
                 self.process = None
                 self.auth_token = None
                 self._start_time = None
