@@ -75,7 +75,7 @@ async def build_test_image(docker_available):
 @pytest_asyncio.fixture
 async def mcp_manager(docker_available):
     """MCPToolManager instance with cleanup."""
-    manager = MCPToolManager()
+    manager = await MCPToolManager.create()
     yield manager
 
     # Cleanup all active tools
@@ -87,7 +87,7 @@ async def mcp_manager(docker_available):
             logger.warning(f"Cleanup failed for {container}: {e}")
 
     # Close Docker client
-    manager.close()
+    await manager.aclose()
 
 
 class TestSSEServerLifecycle:
@@ -318,7 +318,7 @@ class TestContainerCleanup:
         import docker
         client = docker.from_env()
 
-        manager = MCPToolManager()
+        manager = await MCPToolManager.create()
         container_name = "test-cleanup-verify"
 
         try:
@@ -335,7 +335,7 @@ class TestContainerCleanup:
         finally:
             # Cleanup
             await manager.stop_tool(container_name)
-            manager.close()
+            await manager.aclose()
 
             # Verify removed
             try:

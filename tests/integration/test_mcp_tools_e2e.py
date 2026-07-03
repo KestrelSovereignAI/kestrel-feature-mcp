@@ -62,7 +62,7 @@ async def build_test_image(check_docker):
 @pytest_asyncio.fixture
 async def mcp_manager(check_docker):
     """MCPToolManager instance for testing."""
-    manager = MCPToolManager()
+    manager = await MCPToolManager.create()
     yield manager
     # Cleanup all active tools
     active_containers = list(manager.active_tools.keys())

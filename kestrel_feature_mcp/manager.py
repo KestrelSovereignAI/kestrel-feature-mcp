@@ -56,22 +56,46 @@ HEALTHCHECK_MAX_DELAY = 4.0      # Maximum delay between retries
 HEALTHCHECK_TIMEOUT = 30.0       # Total timeout for container to become ready
 HEALTHCHECK_BACKOFF_FACTOR = 2.0 # Exponential backoff multiplier
 
+# Explicit socket-read timeout for the Docker client (F397). ``asyncio.wait_for``
+# alone only abandons the AWAIT — the worker thread stays blocked in the C-level
+# socket read, so a hung daemon would leak executor threads until the pool is
+# exhausted. A client-level timeout bounds each blocking read so the thread is
+# actually reclaimed. Applies to every docker-py call; it is a per-read (not
+# total) timeout, so a healthy streaming pull that keeps delivering bytes is
+# unaffected. (docker-py defaults this to 60s implicitly; we set it explicitly
+# and a little higher rather than rely on an undocumented default.)
+DOCKER_CLIENT_TIMEOUT = 120
+
+# Upper async bound on a single image pull, layered on top of the client-level
+# read timeout: a total ceiling for the pull's await even if the daemon keeps
+# trickling bytes forever (F397).
+IMAGE_PULL_TIMEOUT = 600.0
+
 class MCPToolManager:
     """
     Manages MCP tools running in Docker containers.
     Handles container lifecycle and SSE connections.
     """
 
-    def __init__(self):
+    def __init__(self, docker_client=None):
         if docker is None:
             raise ImportError(
                 "docker package is required for MCPToolManager. "
                 "Install it with: pip install kestrel-feature-mcp"
             )
+        self.active_tools: Dict[str, Dict[str, Any]] = {}
+        if docker_client is not None:
+            # Pre-built client (async ``create`` path, or a test double).
+            self.docker_client = docker_client
+            return
+        # Back-compat/legacy synchronous construction. ``docker.from_env()``
+        # and ``ping()`` are BLOCKING socket ops — running them here on the
+        # event loop stalls every agent on the host (F397). Async callers must
+        # use :meth:`create` instead; this branch remains only for direct
+        # instantiation off the loop (and for tests that patch ``docker``).
         try:
-            self.docker_client = docker.from_env()
+            self.docker_client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
             self.docker_client.ping()
-            self.active_tools: Dict[str, Dict[str, Any]] = {}
             logger.info("MCPToolManager initialized with Docker connection")
         except docker.errors.DockerException as e:
             logger.warning(f"Docker connection failed: {e}")
@@ -79,6 +103,38 @@ class MCPToolManager:
         except Exception as e:
             logger.error(f"Unexpected error initializing Docker: {e}", exc_info=True)
             raise RuntimeError(f"Docker not available for MCP tools: {e}")
+
+    @classmethod
+    async def create(cls) -> "MCPToolManager":
+        """Build the manager with its Docker client connected OFF the loop.
+
+        ``docker.from_env()`` and ``ping()`` block on the Docker daemon socket;
+        doing them in ``__init__`` on the event loop freezes every agent on a
+        multi-agent host until they return (F397). This factory runs them in a
+        worker thread. Async callers (e.g. the feature's ``initialize``) must
+        use this rather than ``MCPToolManager()``.
+        """
+        if docker is None:
+            raise ImportError(
+                "docker package is required for MCPToolManager. "
+                "Install it with: pip install kestrel-feature-mcp"
+            )
+
+        def _connect():
+            client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
+            client.ping()
+            return client
+
+        try:
+            client = await asyncio.to_thread(_connect)
+        except docker.errors.DockerException as e:
+            logger.warning(f"Docker connection failed: {e}")
+            raise RuntimeError(f"Docker not available for MCP tools: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error initializing Docker: {e}", exc_info=True)
+            raise RuntimeError(f"Docker not available for MCP tools: {e}")
+        logger.info("MCPToolManager initialized with Docker connection")
+        return cls(docker_client=client)
 
     async def _wait_for_container_ready(
         self,
@@ -101,11 +157,14 @@ class MCPToolManager:
                 )
 
             try:
-                container = self.docker_client.containers.get(container_name)
-                container.reload()
+                container = await asyncio.to_thread(
+                    self.docker_client.containers.get, container_name
+                )
+                await asyncio.to_thread(container.reload)
 
                 if container.status == 'exited':
-                    logs = container.logs(tail=50).decode('utf-8', errors='replace')
+                    logs_raw = await asyncio.to_thread(container.logs, tail=50)
+                    logs = logs_raw.decode('utf-8', errors='replace')
                     raise RuntimeError(
                         f"Container {container_name} exited unexpectedly. Logs:\n{logs}"
                     )
@@ -191,17 +250,19 @@ class MCPToolManager:
 
         try:
             try:
-                container = self.docker_client.containers.get(container_name)
+                container = await asyncio.to_thread(
+                    self.docker_client.containers.get, container_name
+                )
                 if container.status == 'running':
                     logger.info(f"Container {container_name} exists and running. Restarting for clean state...")
-                    container.restart()
+                    await asyncio.to_thread(container.restart)
                     await self._wait_for_container_ready(container_name, port=8000)
-                    container.reload()
+                    await asyncio.to_thread(container.reload)
                     return container_name
                 else:
                     logger.info(f"Container {container_name} exists but not running (status={container.status}). Removing and recreating...")
                     try:
-                        container.remove(force=True)
+                        await asyncio.to_thread(container.remove, force=True)
                     except docker.errors.APIError as e:
                         logger.warning(f"Error removing stale container: {e}")
                     except Exception as e:
@@ -210,34 +271,52 @@ class MCPToolManager:
                 pass
 
             try:
-                self.docker_client.images.get(image_name)
+                await asyncio.to_thread(self.docker_client.images.get, image_name)
             except NotFound:
                 logger.info(f"Pulling image {image_name}...")
-                self.docker_client.images.pull(image_name)
+                # Bound the pull: a large image or a hung daemon socket must not
+                # tie up a worker thread indefinitely (F397).
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self.docker_client.images.pull, image_name
+                        ),
+                        timeout=IMAGE_PULL_TIMEOUT,
+                    )
+                except asyncio.TimeoutError as e:
+                    raise RuntimeError(
+                        f"Timed out pulling image {image_name} after "
+                        f"{IMAGE_PULL_TIMEOUT}s"
+                    ) from e
 
             env = environment or {}
             env.setdefault("PORT", "8000")
 
             logger.info(f"Starting container {container_name} from {image_name}...")
-            container = self.docker_client.containers.run(
-                image_name,
-                command=command,
-                name=container_name,
-                detach=True,
-                ports={'8000/tcp': None},
-                environment=env,
-                volumes=volumes or {}
+            container = await asyncio.to_thread(
+                lambda: self.docker_client.containers.run(
+                    image_name,
+                    command=command,
+                    name=container_name,
+                    detach=True,
+                    ports={'8000/tcp': None},
+                    environment=env,
+                    volumes=volumes or {}
+                )
             )
 
             await self._wait_for_container_ready(container_name, port=8000)
-            container.reload()
+            await asyncio.to_thread(container.reload)
             return container_name
 
         except TimeoutError as e:
             logger.error(f"Container {container_name} startup timeout: {e}")
             try:
-                container = self.docker_client.containers.get(container_name)
-                logs = container.logs(tail=50).decode('utf-8', errors='replace')
+                container = await asyncio.to_thread(
+                    self.docker_client.containers.get, container_name
+                )
+                logs_raw = await asyncio.to_thread(container.logs, tail=50)
+                logs = logs_raw.decode('utf-8', errors='replace')
                 logger.error(f"Container logs:\n{logs}")
             except docker.errors.DockerException as log_err:
                 logger.debug(f"Could not retrieve container logs (Docker error): {log_err}")
@@ -320,8 +399,10 @@ class MCPToolManager:
             await self._drop_stale_session(container_name)
 
         try:
-            container = self.docker_client.containers.get(container_name)
-            container.reload()
+            container = await asyncio.to_thread(
+                self.docker_client.containers.get, container_name
+            )
+            await asyncio.to_thread(container.reload)
             ports = container.ports
             logger.info(f"Container {container_name} ports after reload: {ports}")
 
@@ -401,11 +482,13 @@ class MCPToolManager:
 
             container = tool_info["container"]
             try:
-                container.stop()
-                container.remove(force=True)
+                await asyncio.to_thread(container.stop)
+                await asyncio.to_thread(container.remove, force=True)
                 for _ in range(MCP_MAX_CONNECTION_ATTEMPTS):
                     try:
-                        self.docker_client.containers.get(container_name)
+                        await asyncio.to_thread(
+                            self.docker_client.containers.get, container_name
+                        )
                         await asyncio.sleep(MCP_CONNECTION_RETRY_DELAY)
                     except NotFound:
                         break
@@ -446,7 +529,12 @@ class MCPToolManager:
         return all_tools
 
     def close(self):
-        """Close the Docker client to release threads."""
+        """Close the Docker client to release threads (synchronous).
+
+        Kept synchronous for back-compat with existing direct callers. Event-
+        loop callers should prefer :meth:`aclose`, which runs the (blocking)
+        client close off the loop (F397).
+        """
         if self.docker_client:
             try:
                 self.docker_client.close()
@@ -455,6 +543,10 @@ class MCPToolManager:
             except Exception as e:
                 logger.warning(f"Error closing Docker client: {e}", exc_info=True)
             self.docker_client = None
+
+    async def aclose(self):
+        """Close the Docker client OFF the event loop (F397)."""
+        await asyncio.to_thread(self.close)
 
 
 class MCPGatewayManager:

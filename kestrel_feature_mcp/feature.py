@@ -65,7 +65,10 @@ class MCPAgent(Feature):
         try:
             # Lazy import to avoid loading MCP/anyio at module import time
             from .manager import MCPToolManager, MCPGatewayManager
-            self.manager = MCPToolManager()
+            # Connect the Docker client off the event loop (F397) — the sync
+            # from_env()/ping() in the constructor would stall every agent on
+            # the host until the daemon socket responds.
+            self.manager = await MCPToolManager.create()
             self.gateway_manager: Optional["MCPGatewayManager"] = None
             logger.info("MCPAgent initialized.")
         except RuntimeError as e:
@@ -1163,4 +1166,4 @@ class MCPAgent(Feature):
             await self.manager.stop_tool(container)
             self._unmount_tools(_container_owner(container))
 
-        self.manager.close()
+        await self.manager.aclose()

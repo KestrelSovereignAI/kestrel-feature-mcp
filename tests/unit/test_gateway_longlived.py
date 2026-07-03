@@ -29,9 +29,12 @@ def test_start_cmd_includes_long_lived_when_enabled(monkeypatch):
             captured["cmd"] = cmd
             self.returncode = None
             self.stdout = self
+            self._lines = iter(["> Start streaming server on port 12345\n"])
 
         def readline(self):
-            return "> Start streaming server on port 12345\n"
+            # Emit the ready line once, then '' (EOF) so the F398 stdout
+            # drainer terminates instead of hot-looping on a repeating line.
+            return next(self._lines, "")
 
         def poll(self):
             return None
