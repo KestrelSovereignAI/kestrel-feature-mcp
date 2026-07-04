@@ -5,6 +5,8 @@ These are local copies of values from kestrel_sovereign.kestrel_config.constants
 so the MCP package doesn't need a runtime dependency on sovereign's config module.
 """
 
+import os
+
 # Subprocess command timeouts (seconds)
 SSH_COMMAND_TIMEOUT_SHORT = 10
 SSH_COMMAND_TIMEOUT_DEFAULT = 30
@@ -13,6 +15,11 @@ SSH_COMMAND_TIMEOUT_DEFAULT = 30
 HTTP_TIMEOUT_SHORT = 5
 SESSION_CONNECT_TIMEOUT_SHORT = 10
 SESSION_CONNECT_TIMEOUT_DEFAULT = 15
+
+# Upper bound on a single MCP tool invocation (seconds). Without this a wedged
+# downstream MCP server makes ``session.call_tool`` await forever, hanging the
+# whole agent turn (F402). Overridable via ``KESTREL_MCP_CALL_TIMEOUT``.
+CALL_TOOL_TIMEOUT = int(os.environ.get("KESTREL_MCP_CALL_TIMEOUT", "120"))
 
 # Container management
 MCP_MAX_CONNECTION_ATTEMPTS = 10
