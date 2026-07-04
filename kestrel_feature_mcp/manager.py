@@ -43,6 +43,7 @@ except ImportError:
 from .constants import (
     SESSION_CONNECT_TIMEOUT_SHORT,
     SESSION_CONNECT_TIMEOUT_DEFAULT,
+    CALL_TOOL_TIMEOUT,
     MCP_MAX_CONNECTION_ATTEMPTS,
     MCP_CONNECTION_RETRY_DELAY,
 )
@@ -512,7 +513,12 @@ class MCPToolManager:
             raise ValueError(f"Tool {container_name} not connected")
 
         session = self.active_tools[container_name]["session"]
-        result = await session.call_tool(tool_name, arguments or {})
+        # Bound the call so a wedged downstream MCP server can't hang the whole
+        # agent turn forever (F402); TimeoutError surfaces to the tool wrapper.
+        result = await asyncio.wait_for(
+            session.call_tool(tool_name, arguments or {}),
+            timeout=CALL_TOOL_TIMEOUT,
+        )
         return result
 
     def get_all_tools(self):
@@ -711,7 +717,12 @@ class MCPGatewayManager:
         if tool_name not in self.tools:
             raise ValueError(f"Unknown tool: {tool_name}. Available: {list(self.tools.keys())}")
 
-        result = await self.session.call_tool(tool_name, arguments or {})
+        # Bound the call so a wedged gateway/server can't hang the agent turn
+        # forever (F402); TimeoutError surfaces to the tool wrapper.
+        result = await asyncio.wait_for(
+            self.session.call_tool(tool_name, arguments or {}),
+            timeout=CALL_TOOL_TIMEOUT,
+        )
         return result
 
     def get_all_tools(self) -> List[Dict[str, Any]]:
