@@ -421,7 +421,13 @@ class MCPToolManager:
             try:
                 session = await asyncio.wait_for(session_future, timeout=SESSION_CONNECT_TIMEOUT_SHORT)
 
-                result = await session.list_tools()
+                # Bound list_tools too (F402/P11): a server can complete the
+                # initialize handshake (session_future resolves) but then wedge on
+                # tools/list, hanging the agent turn forever. The enclosing
+                # except asyncio.TimeoutError surfaces it as a connect failure.
+                result = await asyncio.wait_for(
+                    session.list_tools(), timeout=CALL_TOOL_TIMEOUT
+                )
                 tools = result.tools
 
                 self.active_tools[container_name] = {
@@ -632,7 +638,12 @@ class MCPGatewayManager:
         try:
             self.session = await asyncio.wait_for(session_future, timeout=SESSION_CONNECT_TIMEOUT_DEFAULT)
 
-            result = await self.session.list_tools()
+            # Bound list_tools too (F402/P11): a gateway can finish the handshake
+            # but wedge on tools/list; the enclosing except asyncio.TimeoutError
+            # surfaces it as a gateway-connect timeout instead of hanging.
+            result = await asyncio.wait_for(
+                self.session.list_tools(), timeout=CALL_TOOL_TIMEOUT
+            )
             for tool in result.tools:
                 self.tools[tool.name] = tool
 
@@ -640,6 +651,10 @@ class MCPGatewayManager:
             return list(self.tools.values())
 
         except asyncio.TimeoutError:
+            # self.session may already be assigned (a list_tools timeout, P11):
+            # cancelling the loop task leaves it dead, so clear it or is_connected
+            # (session is not None) would report the failed gateway as live.
+            self.session = None
             if self._session_task:
                 self._session_task.cancel()
                 try:
@@ -648,6 +663,7 @@ class MCPGatewayManager:
                     pass
             raise DockerMCPGatewayError("Timeout connecting to gateway")
         except (aiohttp.ClientError, DockerMCPGatewayError) as e:
+            self.session = None
             if self._session_task:
                 self._session_task.cancel()
                 try:
