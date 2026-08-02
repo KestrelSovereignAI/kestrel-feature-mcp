@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-mcp"
-version = "0.4.0"
+version = "0.4.1"
 description = "Model Context Protocol (MCP) server management for Kestrel Sovereign agents"
 readme = "README.md"
 license = "Apache-2.0"
@@ -8,7 +8,16 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
     "kestrel-sovereign-sdk>=0.10,<1",
     "docker>=7.1.0",
-    "mcp>=1.26.0",
+    # Upper bound is load-bearing, not caution: this package does not work on
+    # mcp 2.x. 2.0 removed the `mcp.server.fastmcp` module outright and renamed
+    # `streamablehttp_client` to `streamable_http_client`, so `feature.py` fails
+    # at import. Leaving it unbounded also let a host `kestrel update` resolve
+    # mcp 2.0 independently of the host's own uv.lock (which pins 1.28.1) and
+    # overwrite it — which broke `import phoenix` on the sovereign host, because
+    # pydantic-ai-slim 1.x imports `mcp.shared.session` and `RequestContext`,
+    # both deleted in 2.0. A feature package must not be able to drag the host's
+    # locked transitive deps forward into an untested major.
+    "mcp>=1.26.0,<2",
     "aiohttp>=3.13.3",
 ]
 
