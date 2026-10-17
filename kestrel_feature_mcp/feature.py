@@ -341,6 +341,7 @@ class MCPAgent(Feature):
 
         requested_name = container_name_for_image(image_name)
         self._unmount_tools(_container_owner(requested_name))
+        failure_context = {"container": requested_name, "image": image_name}
         try:
             container_name = await self.manager.start_tool_container(
                 image_name, container_name=requested_name, command=args,
@@ -379,10 +380,10 @@ class MCPAgent(Feature):
             )
         except (TimeoutError, RuntimeError, ValueError) as e:
             logger.error(f"Failed to load tool {image_name}: {e}")
-            return ToolResult.failed(f"Failed to load MCP tool: {str(e)}")
+            return ToolResult.failed(f"Failed to load MCP tool: {str(e)}", data=failure_context)
         except Exception as e:
             logger.error(f"Unexpected error loading tool {image_name}: {e}", exc_info=True)
-            return ToolResult.failed(f"Failed to load MCP tool: {str(e)}")
+            return ToolResult.failed(f"Failed to load MCP tool: {str(e)}", data=failure_context)
 
     async def _retire_gateway(self):
         """Retire an owned gateway even when its MCP transport already died."""
@@ -1059,6 +1060,6 @@ class MCPAgent(Feature):
         async with AsyncExitStack() as cleanup:
             if manager is not None:
                 cleanup.push_async_callback(manager.aclose)
-                for name in reversed(list(manager.active_tools)):
+                for name in reversed(list(manager.owned_containers)):
                     cleanup.push_async_callback(stop_container, name)
             cleanup.push_async_callback(self._retire_gateway)

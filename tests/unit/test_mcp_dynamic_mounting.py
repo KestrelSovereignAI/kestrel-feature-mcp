@@ -264,7 +264,7 @@ class TestMounting:
 @pytest.mark.asyncio
 async def test_shutdown_attempts_every_resource_and_propagates_cleanup_errors():
     manager = MagicMock()
-    manager.active_tools = {"a": {}, "b": {}}
+    manager.owned_containers = {"a": {}, "b": {}}
     manager.stop_tool = AsyncMock(side_effect=[TimeoutError("a close failed"), True])
     manager.aclose = AsyncMock()
     gateway = MagicMock()
@@ -355,11 +355,13 @@ async def test_failed_container_reload_withdraws_handles_and_retires_the_old_own
     first = await feature._load_via_container("acme/native:latest")
     assert first.status is ToolResultStatus.OK
     assert host.registered[owner]
-    previous = manager.active_tools[name]["connection"]
+    previous = manager.owned_containers[name]["connection"]
 
     def restarting():
         assert owner not in host.registered
-        assert not manager.active_tools
+        assert manager.owned_containers[name]["container"] is container
+        assert manager.owned_containers[name]["connection"] is None
+        assert manager.owned_containers[name]["tools"] is None
         assert not previous.is_connected
 
     container.restart.side_effect = restarting
@@ -370,10 +372,11 @@ async def test_failed_container_reload_withdraws_handles_and_retires_the_old_own
     try:
         result = await feature._load_via_container("acme/native:latest")
         assert result.status is ToolResultStatus.ERROR
+        assert result.data == {"container": name, "image": "acme/native:latest"}
         expected_error = "healthcheck" if failure == "healthcheck" else "deadline"
         assert expected_error in result.error
         assert owner not in host.registered
-        assert manager.active_tools == {}
+        assert manager.owned_containers[name]["container"] is container
         assert manager.get_all_tools() == []
         assert previous._task is None
         manager._wait_for_container_ready.side_effect = None
@@ -384,6 +387,6 @@ async def test_failed_container_reload_withdraws_handles_and_retires_the_old_own
         assert (await manager.call_tool(name, "echo", {"text": "recovered"})).content[0].text == "recovered"
     finally:
         mcp_http_server.settings["discover_delay"] = 0
-        if name in manager.active_tools:
+        if name in manager.owned_containers:
             await manager._drop_connection(name)
         await manager.aclose()

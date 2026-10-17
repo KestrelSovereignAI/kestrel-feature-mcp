@@ -82,7 +82,7 @@ class MCPToolManager:
                 "docker package is required for MCPToolManager. "
                 "Install it with: pip install kestrel-feature-mcp"
             )
-        self.active_tools: Dict[str, Dict[str, Any]] = {}
+        self.owned_containers: Dict[str, Dict[str, Any]] = {}
         if docker_client is not None:
             # Pre-built client (async ``create`` path, or a test double).
             self.docker_client = docker_client
@@ -256,6 +256,7 @@ class MCPToolManager:
                 container = await asyncio.to_thread(
                     self.docker_client.containers.get, container_name
                 )
+                self._retain_container(container_name, container)
                 if container.status == 'running':
                     logger.info(f"Container {container_name} exists and running. Restarting for clean state...")
                     await asyncio.to_thread(container.restart)
@@ -265,8 +266,9 @@ class MCPToolManager:
                 else:
                     logger.info(f"Container {container_name} exists but not running (status={container.status}). Removing and recreating...")
                     await self._remove_container(container_name, container)
+                    self.owned_containers.pop(container_name, None)
             except NotFound:
-                pass
+                self.owned_containers.pop(container_name, None)
 
             try:
                 await asyncio.to_thread(self.docker_client.images.get, image_name)
@@ -303,6 +305,7 @@ class MCPToolManager:
                 )
             )
 
+            self._retain_container(container_name, container)
             await self._wait_for_container_ready(container_name, port=8000)
             await asyncio.to_thread(container.reload)
             return container_name
@@ -331,13 +334,27 @@ class MCPToolManager:
             logger.error(f"Failed to start tool container {image_name}: {e}", exc_info=True)
             raise
 
+    def _retain_container(self, name: str, container):
+        """Keep resource custody independently of transport publication.
+
+        A None catalog is unpublished; an empty list is a discovered server
+        with no tools. Both states still own the container and its cleanup.
+        """
+        record = self.owned_containers.setdefault(
+            name, {"container": container, "connection": None, "tools": None},
+        )
+        record["container"] = container
+        return record
+
     async def _drop_connection(self, container_name: str) -> None:
-        """Disconnect a restarted container without changing its lifecycle."""
-        info = self.active_tools.get(container_name)
+        """Retire a transport while retaining its container for unload/retry."""
+        info = self.owned_containers.get(container_name)
         if info is not None:
-            info["tools"] = []
-            await info["connection"].close()
-            del self.active_tools[container_name]
+            info["tools"] = None
+            connection = info["connection"]
+            if connection is not None:
+                await connection.close()
+            info["connection"] = None
 
     async def connect_to_tool(self, container_name: str):
         """Connect to a running container with native Streamable HTTP."""
@@ -348,15 +365,15 @@ class MCPToolManager:
         if not ports or not ports.get("8000/tcp"):
             raise ValueError(f"Container {container_name} does not expose port 8000")
         host_port = ports["8000/tcp"][0]["HostPort"]
+        record = self._retain_container(container_name, container)
         connection = MCPConnection(
             f"http://localhost:{host_port}/mcp",
             connect_timeout=SESSION_CONNECT_TIMEOUT_SHORT,
             call_timeout=CALL_TOOL_TIMEOUT,
         )
+        record["connection"] = connection
         tools = await connection.connect()
-        self.active_tools[container_name] = {
-            "container": container, "connection": connection, "tools": tools
-        }
+        record["tools"] = tools
         logger.info("Connected to %s; found %s tools", container_name, len(tools))
         return tools
 
@@ -378,17 +395,18 @@ class MCPToolManager:
     async def stop_tool(self, container_name: str) -> bool:
         """Stops a tool, closes connection, and stops container.
 
-        Returns ``True`` if a loaded container by that name was actually
-        stopped, ``False`` if nothing was loaded under that name (a no-op).
-        Lets callers report an honest no-op instead of a phantom success
-        (#9, finding #4)."""
-        if container_name in self.active_tools:
-            tool_info = self.active_tools[container_name]
+        Returns True when this manager retires an owned container record,
+        including one whose connection never finished. Returns False when
+        this manager owns no container under that name."""
+        if container_name in self.owned_containers:
+            tool_info = self.owned_containers[container_name]
 
-            tool_info["tools"] = []
+            tool_info["tools"] = None
             container = tool_info["container"]
             try:
-                await tool_info["connection"].close()
+                connection = tool_info["connection"]
+                if connection is not None:
+                    await connection.close()
             finally:
                 # Reclaim the process even if connection exit failed. Retain
                 # bookkeeping on failure so a later unload can rejoin cleanup.
@@ -399,7 +417,7 @@ class MCPToolManager:
                 finally:
                     await self._remove_container(container_name, container)
 
-            del self.active_tools[container_name]
+            del self.owned_containers[container_name]
             logger.info(f"Stopped tool {container_name}")
             return True
 
@@ -408,16 +426,19 @@ class MCPToolManager:
 
     async def call_tool(self, container_name: str, tool_name: str, arguments: dict = None):
         """Calls a tool on a specific container."""
-        if container_name not in self.active_tools:
+        info = self.owned_containers.get(container_name)
+        if info is None or info["connection"] is None or info["tools"] is None:
             raise ValueError(f"Tool {container_name} not connected")
 
-        connection = self.active_tools[container_name]["connection"]
+        connection = info["connection"]
         return await connection.call_tool(tool_name, arguments or {})
 
     def get_all_tools(self):
         """Returns a list of all available tools across all containers."""
         all_tools = []
-        for c_name, info in self.active_tools.items():
+        for c_name, info in self.owned_containers.items():
+            if info["tools"] is None:
+                continue
             for tool in info["tools"]:
                 all_tools.append({
                     "container": c_name,

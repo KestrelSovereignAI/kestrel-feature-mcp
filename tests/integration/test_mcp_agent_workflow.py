@@ -248,17 +248,30 @@ class TestAgentErrorRecovery:
     """
 
     @pytest.mark.asyncio
-    async def test_agent_handles_unknown_server(self):
-        """Agent tries to start with non-existent server."""
-        manager = MCPGatewayManager(port=9800)
+    async def test_agent_rejects_unknown_catalog_server(self):
+        """The agent rejects a catalog miss before starting a gateway."""
+        from types import SimpleNamespace
+        from kestrel_feature_mcp.feature import MCPAgent
+        from kestrel_sdk.tools.result import ToolResultStatus
 
+        feature = MCPAgent(SimpleNamespace())
+        feature.gateway_manager = None
+        result = await feature.gateway_start("nonexistent_server_xyz")
+        assert result.status is ToolResultStatus.ERROR
+        assert "Unknown MCP server" in result.error
+        assert feature.gateway_manager is None
+
+    @pytest.mark.asyncio
+    async def test_gateway_reports_requested_configuration_without_inventing_readiness(self):
+        manager = MCPGatewayManager()
         try:
-            # Try to start with fake server
-            with pytest.raises(Exception):  # Should fail
-                await manager.start(["nonexistent_server_xyz"])
+            tools = await manager.start(["nonexistent_server_xyz"])
+            assert tools == []
+            assert manager.get_all_tools() == []
+            assert manager.is_connected
+            assert manager.gateway.requested_servers == {"nonexistent_server_xyz"}
         finally:
-            if manager.is_connected:
-                await manager.stop()
+            await manager.stop()
 
     @pytest.mark.asyncio
     async def test_agent_handles_tool_not_found(self):

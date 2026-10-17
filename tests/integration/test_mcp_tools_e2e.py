@@ -65,9 +65,43 @@ async def mcp_manager(check_docker):
     manager = await MCPToolManager.create()
     yield manager
     # Cleanup all active tools
-    active_containers = list(manager.active_tools.keys())
+    active_containers = list(manager.owned_containers.keys())
     for container in active_containers:
         await manager.stop_tool(container)
+
+
+@pytest.mark.asyncio
+@pytest.mark.docker
+@pytest.mark.timeout(60)
+async def test_failed_real_container_reload_remains_owned_and_can_be_unloaded(mcp_manager, build_test_image):
+    """A process that exits on restart loses its tools but retains cleanup custody."""
+    from docker.errors import NotFound
+
+    name = "test-mcp-failed-reload"
+    await mcp_manager.start_tool_container(build_test_image, container_name=name)
+    await mcp_manager.connect_to_tool(name)
+    connection = mcp_manager.owned_containers[name]["connection"]
+    result = await mcp_manager.call_tool(name, "echo", {"text": "before reload"})
+    assert result.content[0].text == "Echo: before reload"
+
+    container = mcp_manager.owned_containers[name]["container"]
+    changed = await asyncio.to_thread(container.exec_run, [
+        "python", "-c",
+        "from pathlib import Path; Path('/app/server.py').write_text('raise SystemExit(23)\\n')",
+    ])
+    assert changed.exit_code == 0, changed.output
+    with pytest.raises(RuntimeError, match="exited unexpectedly"):
+        await mcp_manager.start_tool_container(build_test_image, container_name=name)
+
+    assert not connection.is_connected
+    assert mcp_manager.get_all_tools() == []
+    assert mcp_manager.owned_containers[name]["container"].id == container.id
+    with pytest.raises(ValueError, match="not connected"):
+        await mcp_manager.call_tool(name, "echo", {})
+    assert await mcp_manager.stop_tool(name)
+    assert name not in mcp_manager.owned_containers
+    with pytest.raises(NotFound):
+        await asyncio.to_thread(mcp_manager.docker_client.containers.get, name)
 
 @pytest.mark.asyncio
 async def test_mcp_server_lifecycle(mcp_manager, build_test_image):
@@ -151,4 +185,3 @@ async def test_mcp_server_lifecycle(mcp_manager, build_test_image):
         assert container.status != "running"
     except docker.errors.NotFound:
         pass # Container removed, which is also fine
-
