@@ -214,7 +214,7 @@ class TestRegistryIntegration:
         server = registry.get("test-server")
 
         assert server is not None, "test-server not in registry"
-        assert server.transport == TransportType.SSE, "test-server should use SSE"
+        assert server.transport == TransportType.STREAMABLE_HTTP, "test-server should use Streamable HTTP"
 
         container_name = "test-registry-lookup"
         await mcp_manager.start_tool_container(
@@ -229,7 +229,7 @@ class TestRegistryIntegration:
     async def test_registry_sse_servers(self):
         """Verify registry correctly identifies SSE-ready servers."""
         registry = get_registry()
-        sse_servers = registry.list_sse_ready()
+        sse_servers = registry.list_http_ready()
 
         # Should have at least test-server as SSE-native
         names = [s.name for s in sse_servers]
@@ -237,7 +237,7 @@ class TestRegistryIntegration:
 
         # All should have SSE transport
         for server in sse_servers:
-            assert server.transport == TransportType.SSE
+            assert server.transport == TransportType.STREAMABLE_HTTP
 
     @pytest.mark.asyncio
     async def test_registry_stdio_servers(self):

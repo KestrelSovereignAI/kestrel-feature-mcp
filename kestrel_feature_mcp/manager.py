@@ -4,9 +4,9 @@ MCP Tool Manager - Manages MCP tools via Docker.
 This module provides two modes of operation:
 
 1. **Gateway Mode (Recommended)**: Uses Docker MCP Gateway for unified access
-   to 311+ MCP servers with automatic stdio->SSE conversion.
+   to 311+ MCP servers with automatic stdio->Streamable HTTP conversion.
 
-2. **Container Mode (Legacy)**: Direct container management for SSE-native
+2. **Container Mode**: Direct container management for Streamable HTTP
    servers or custom test servers.
 
 Gateway mode is recommended for production use as it provides access to
@@ -15,7 +15,8 @@ all MCP servers regardless of their native transport.
 
 import logging
 import asyncio
-import aiohttp
+import httpx2
+from mcp.shared.exceptions import MCPError
 import time
 from typing import Dict, Any, List, Optional
 
@@ -31,14 +32,7 @@ except ImportError:
     APIError = None  # type: ignore[assignment,misc]
     ImageNotFound = None  # type: ignore[assignment,misc]
 
-try:
-    from mcp.client.sse import sse_client
-    from mcp.client.streamable_http import streamablehttp_client
-    from mcp.client.session import ClientSession
-except ImportError:
-    sse_client = None  # type: ignore[assignment]
-    streamablehttp_client = None  # type: ignore[assignment]
-    ClientSession = None  # type: ignore[assignment,misc]
+from .connection import MCPConnection
 
 from .constants import (
     SESSION_CONNECT_TIMEOUT_SHORT,
@@ -75,7 +69,7 @@ IMAGE_PULL_TIMEOUT = 600.0
 class MCPToolManager:
     """
     Manages MCP tools running in Docker containers.
-    Handles container lifecycle and SSE connections.
+    Handles container lifecycle and MCP connections.
     """
 
     def __init__(self, docker_client=None):
@@ -194,7 +188,7 @@ class MCPToolManager:
                 host_port = int(ports[port_key][0]['HostPort'])
 
                 if await self._check_port_ready('localhost', host_port):
-                    if await self._check_sse_ready('localhost', host_port):
+                    if await self._check_mcp_ready('localhost', host_port):
                         logger.info(
                             f"Container {container_name} ready after {attempt} attempts "
                             f"({elapsed:.1f}s)"
@@ -231,18 +225,18 @@ class MCPToolManager:
         except (OSError, asyncio.TimeoutError, ConnectionRefusedError):
             return False
 
-    async def _check_sse_ready(self, host: str, port: int, timeout: float = 2.0) -> bool:
-        """Check if the SSE endpoint is ready by making an HTTP request."""
-        url = f"http://{host}:{port}/sse"
+    async def _check_mcp_ready(self, host: str, port: int, timeout: float = 2.0) -> bool:
+        """Check readiness through the same native client used for tool calls."""
+        connection = MCPConnection(
+            f"http://{host}:{port}/mcp", connect_timeout=timeout, call_timeout=timeout
+        )
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                    return resp.status == 200
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+            await connection.connect()
+            return True
+        except (MCPError, httpx2.HTTPError, TimeoutError, OSError):
             return False
-        except Exception as e:
-            logger.debug(f"Unexpected error checking SSE readiness: {e}", exc_info=True)
-            return False
+        finally:
+            await connection.close()
 
     async def start_tool_container(self, image_name: str, container_name: str = None, command: List[str] = None, environment: Dict[str, str] = None, volumes: Dict[str, Dict[str, str]] = None) -> str:
         """Starts a Docker container for an MCP tool. Returns the container name."""
@@ -334,138 +328,33 @@ class MCPToolManager:
             logger.error(f"Failed to start tool container {image_name}: {e}", exc_info=True)
             raise
 
-    async def _run_session_loop(self, url: str, session_future: asyncio.Future):
-        """Background task to run the MCP session loop."""
-        try:
-            async with sse_client(url) as (read_stream, write_stream):
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    session_future.set_result(session)
-                    await asyncio.Future()
-        except asyncio.CancelledError:
-            logger.info(f"Session loop for {url} cancelled.")
-            raise
-        except ExceptionGroup as eg:
-            for exc in eg.exceptions:
-                logger.error(f"Sub-exception in session loop for {url}: {type(exc).__name__}: {exc}")
-            if not session_future.done():
-                session_future.set_exception(eg)
-            raise
-        except aiohttp.ClientError as e:
-            logger.error(f"HTTP client error in session loop for {url}: {e}")
-            if not session_future.done():
-                session_future.set_exception(e)
-            raise
-        except Exception as e:
-            logger.error(f"Error in session loop for {url}: {e}", exc_info=True)
-            if not session_future.done():
-                session_future.set_exception(e)
-            raise
-
-    async def _drop_stale_session(self, container_name: str) -> None:
-        """Cancel and forget a cached SSE session WITHOUT stopping the container.
-
-        Used before a reconnect: the container has just been restarted for a
-        clean state, so its cached session task is bound to the dead process.
-        Unlike ``stop_tool`` this leaves the (restarted, running) container in
-        place — we only release the stale connection so a fresh one can bind.
-        """
-        info = self.active_tools.pop(container_name, None)
-        if not info:
-            return
-        task = info.get("task")
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    f"Error cancelling stale session task for {container_name}: {e}"
-                )
+    async def _drop_connection(self, container_name: str) -> None:
+        """Disconnect a restarted container without changing its lifecycle."""
+        info = self.active_tools.get(container_name)
+        if info is not None:
+            await info["connection"].close()
+            del self.active_tools[container_name]
 
     async def connect_to_tool(self, container_name: str):
-        """Connects to a running MCP tool container via SSE."""
-        if container_name in self.active_tools:
-            # The caller (load_tool) restarts an already-running container for a
-            # clean state BEFORE reconnecting, so the cached SSE session here is
-            # now stale (bound to the pre-restart process). Tear it down and
-            # reconnect fresh below — the old bare `return` (None) made load_tool
-            # crash on `[t.name for t in tools]`, and returning the cached tools
-            # would report success over a dead session whose call_tool fails.
-            logger.info(
-                f"Reconnecting to {container_name}: dropping stale session"
-            )
-            await self._drop_stale_session(container_name)
-
-        try:
-            container = await asyncio.to_thread(
-                self.docker_client.containers.get, container_name
-            )
-            await asyncio.to_thread(container.reload)
-            ports = container.ports
-            logger.info(f"Container {container_name} ports after reload: {ports}")
-
-            if not ports or '8000/tcp' not in ports or not ports['8000/tcp']:
-                raise ValueError(f"Container {container_name} does not expose port 8000")
-
-            host_port = ports['8000/tcp'][0]['HostPort']
-            url = f"http://localhost:{host_port}/sse"
-
-            logger.info(f"Connecting to MCP tool at {url}...")
-
-            session_future = asyncio.Future()
-            task = asyncio.create_task(self._run_session_loop(url, session_future))
-
-            try:
-                session = await asyncio.wait_for(session_future, timeout=SESSION_CONNECT_TIMEOUT_SHORT)
-
-                # Bound list_tools too (F402/P11): a server can complete the
-                # initialize handshake (session_future resolves) but then wedge on
-                # tools/list, hanging the agent turn forever. The enclosing
-                # except asyncio.TimeoutError surfaces it as a connect failure.
-                result = await asyncio.wait_for(
-                    session.list_tools(), timeout=CALL_TOOL_TIMEOUT
-                )
-                tools = result.tools
-
-                self.active_tools[container_name] = {
-                    "container": container,
-                    "session": session,
-                    "task": task,
-                    "tools": tools
-                }
-
-                logger.info(f"Connected to {container_name}. Found {len(tools)} tools.")
-                return tools
-
-            except asyncio.TimeoutError as e:
-                logger.error(f"Timeout connecting to tool {container_name}: {e}")
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                raise
-            except Exception as e:
-                logger.error(f"Failed to connect to tool {container_name}: {e}", exc_info=True)
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                raise
-
-        except docker.errors.NotFound as e:
-            logger.error(f"Container {container_name} not found: {e}")
-            raise
-        except docker.errors.APIError as e:
-            logger.error(f"Docker API error connecting to {container_name}: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to connect to tool {container_name}: {e}", exc_info=True)
-            raise
+        """Connect to a running container with native Streamable HTTP."""
+        await self._drop_connection(container_name)
+        container = await asyncio.to_thread(self.docker_client.containers.get, container_name)
+        await asyncio.to_thread(container.reload)
+        ports = container.ports
+        if not ports or not ports.get("8000/tcp"):
+            raise ValueError(f"Container {container_name} does not expose port 8000")
+        host_port = ports["8000/tcp"][0]["HostPort"]
+        connection = MCPConnection(
+            f"http://localhost:{host_port}/mcp",
+            connect_timeout=SESSION_CONNECT_TIMEOUT_SHORT,
+            call_timeout=CALL_TOOL_TIMEOUT,
+        )
+        tools = await connection.connect()
+        self.active_tools[container_name] = {
+            "container": container, "connection": connection, "tools": tools
+        }
+        logger.info("Connected to %s; found %s tools", container_name, len(tools))
+        return tools
 
     async def stop_tool(self, container_name: str) -> bool:
         """Stops a tool, closes connection, and stops container.
@@ -477,15 +366,7 @@ class MCPToolManager:
         if container_name in self.active_tools:
             tool_info = self.active_tools[container_name]
 
-            if "task" in tool_info:
-                task = tool_info["task"]
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.error(f"Error stopping session task for {container_name}: {e}", exc_info=True)
+            await tool_info["connection"].close()
 
             container = tool_info["container"]
             try:
@@ -518,11 +399,11 @@ class MCPToolManager:
         if container_name not in self.active_tools:
             raise ValueError(f"Tool {container_name} not connected")
 
-        session = self.active_tools[container_name]["session"]
+        connection = self.active_tools[container_name]["connection"]
         # Bound the call so a wedged downstream MCP server can't hang the whole
         # agent turn forever (F402); TimeoutError surfaces to the tool wrapper.
         result = await asyncio.wait_for(
-            session.call_tool(tool_name, arguments or {}),
+            connection.call_tool(tool_name, arguments or {}),
             timeout=CALL_TOOL_TIMEOUT,
         )
         return result
@@ -536,7 +417,7 @@ class MCPToolManager:
                     "container": c_name,
                     "name": tool.name,
                     "description": tool.description,
-                    "inputSchema": tool.inputSchema
+                    "inputSchema": tool.input_schema
                 })
         return all_tools
 
@@ -575,159 +456,66 @@ class MCPGatewayManager:
     def __init__(self, port: int = 0, transport: str = DockerMCPGateway.DEFAULT_TRANSPORT,
                  long_lived: bool = True):
         self.gateway = DockerMCPGateway(port=port, transport=transport, long_lived=long_lived)
-        self.session: Optional[ClientSession] = None
+        self.connection: MCPConnection | None = None
         self.tools: Dict[str, Any] = {}
-        self._session_task: Optional[asyncio.Task] = None
 
     async def start(self, servers: List[str] = None):
-        """Start the gateway and connect over its transport."""
+        """Start and publish only a gateway with a working native connection."""
         if servers is None:
             servers = ["fetch"]
+        published = False
+        try:
+            auth_token = await self.gateway.start(servers)
+            tools = await self._connect(auth_token)
+            published = True
+            return tools
+        finally:
+            if not published:
+                await self.stop()
 
-        auth_token = await self.gateway.start(servers)
-        return await self._connect(auth_token)
-
-    def _open_transport(self, url: str, headers: Dict[str, str]):
-        """Open the MCP client transport for the gateway's active transport.
-
-        Returns an async-context-manager yielding ``(read, write[, ...])``.
-        Streamable HTTP yields a third element (a session-id callback) that we
-        don't need; sse yields a 2-tuple. The session_loop unpacks defensively.
-        """
-        if self.gateway._is_streaming:
-            if streamablehttp_client is None:
-                raise RuntimeError("mcp streamable-http client unavailable")
-            return streamablehttp_client(url, headers=headers)
-        if sse_client is None:
-            raise RuntimeError("mcp sse client unavailable")
-        return sse_client(url, headers=headers)
+    async def _disconnect(self):
+        connection = self.connection
+        self.connection = None
+        self.tools = {}
+        if connection is not None:
+            await connection.close()
 
     async def _connect(self, auth_token: str):
-        """Connect to the gateway over its transport with Bearer auth."""
-        url = self.gateway.endpoint_url
-
-        logger.info(f"Connecting to gateway at {url}...")
-
-        session_future = asyncio.Future()
-
-        async def session_loop():
-            try:
-                headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-                async with self._open_transport(url, headers) as streams:
-                    read_stream, write_stream = streams[0], streams[1]
-                    async with ClientSession(read_stream, write_stream) as session:
-                        await session.initialize()
-                        session_future.set_result(session)
-                        await asyncio.Future()
-            except asyncio.CancelledError:
-                logger.info("Gateway session cancelled")
-                raise
-            except aiohttp.ClientError as e:
-                logger.error(f"Gateway session HTTP error: {e}")
-                if not session_future.done():
-                    session_future.set_exception(e)
-                raise
-            except Exception as e:
-                logger.error(f"Gateway session error: {e}", exc_info=True)
-                if not session_future.done():
-                    session_future.set_exception(e)
-                raise
-
-        self._session_task = asyncio.create_task(session_loop())
-
+        await self._disconnect()
+        headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+        connection = MCPConnection(
+            self.gateway.endpoint_url, headers=headers,
+            connect_timeout=SESSION_CONNECT_TIMEOUT_DEFAULT,
+            call_timeout=CALL_TOOL_TIMEOUT,
+        )
         try:
-            self.session = await asyncio.wait_for(session_future, timeout=SESSION_CONNECT_TIMEOUT_DEFAULT)
-
-            # Bound list_tools too (F402/P11): a gateway can finish the handshake
-            # but wedge on tools/list; the enclosing except asyncio.TimeoutError
-            # surfaces it as a gateway-connect timeout instead of hanging.
-            result = await asyncio.wait_for(
-                self.session.list_tools(), timeout=CALL_TOOL_TIMEOUT
-            )
-            for tool in result.tools:
-                self.tools[tool.name] = tool
-
-            logger.info(f"Connected to gateway with {len(self.tools)} tools")
-            return list(self.tools.values())
-
-        except asyncio.TimeoutError:
-            # self.session may already be assigned (a list_tools timeout, P11):
-            # cancelling the loop task leaves it dead, so clear it or is_connected
-            # (session is not None) would report the failed gateway as live.
-            self.session = None
-            if self._session_task:
-                self._session_task.cancel()
-                try:
-                    await self._session_task
-                except asyncio.CancelledError:
-                    pass
-            raise DockerMCPGatewayError("Timeout connecting to gateway")
-        except (aiohttp.ClientError, DockerMCPGatewayError) as e:
-            self.session = None
-            if self._session_task:
-                self._session_task.cancel()
-                try:
-                    await self._session_task
-                except asyncio.CancelledError:
-                    pass
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error connecting to gateway: {e}", exc_info=True)
-            if self._session_task:
-                self._session_task.cancel()
-                try:
-                    await self._session_task
-                except asyncio.CancelledError:
-                    pass
-            raise
+            tools = await connection.connect()
+        except TimeoutError as error:
+            raise DockerMCPGatewayError("Timeout connecting to gateway") from error
+        self.connection = connection
+        self.tools = {tool.name: tool for tool in tools}
+        return tools
 
     async def stop(self):
-        """Stop the gateway and disconnect."""
-        if self._session_task:
-            self._session_task.cancel()
-            try:
-                await self._session_task
-            except asyncio.CancelledError:
-                pass
-            self._session_task = None
-
-        self.session = None
-        self.tools = {}
-        await self.gateway.stop()
+        """Join the client owner before stopping the gateway process."""
+        try:
+            await self._disconnect()
+        finally:
+            await self.gateway.stop()
 
     async def enable_server(self, server_name: str):
-        """Enable a server and reconnect."""
+        await self._disconnect()
         auth_token = await self.gateway.add_server(server_name)
-
-        if self._session_task:
-            self._session_task.cancel()
-            try:
-                await self._session_task
-            except asyncio.CancelledError:
-                pass
-
-        self.session = None
-        self.tools = {}
         return await self._connect(auth_token)
 
     async def disable_server(self, server_name: str):
-        """Disable a server and reconnect."""
+        await self._disconnect()
         auth_token = await self.gateway.remove_server(server_name)
-
-        if self._session_task:
-            self._session_task.cancel()
-            try:
-                await self._session_task
-            except asyncio.CancelledError:
-                pass
-
-        self.session = None
-        self.tools = {}
         return await self._connect(auth_token)
 
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any] = None):
         """Call a tool through the gateway."""
-        if not self.session:
+        if self.connection is None:
             raise RuntimeError("Not connected to gateway")
 
         if tool_name not in self.tools:
@@ -736,7 +524,7 @@ class MCPGatewayManager:
         # Bound the call so a wedged gateway/server can't hang the agent turn
         # forever (F402); TimeoutError surfaces to the tool wrapper.
         result = await asyncio.wait_for(
-            self.session.call_tool(tool_name, arguments or {}),
+            self.connection.call_tool(tool_name, arguments or {}),
             timeout=CALL_TOOL_TIMEOUT,
         )
         return result
@@ -747,7 +535,7 @@ class MCPGatewayManager:
             {
                 "name": tool.name,
                 "description": tool.description,
-                "inputSchema": tool.inputSchema
+                "inputSchema": tool.input_schema
             }
             for tool in self.tools.values()
         ]
@@ -755,4 +543,5 @@ class MCPGatewayManager:
     @property
     def is_connected(self) -> bool:
         """Check if connected to the gateway."""
-        return self.session is not None and self.gateway.is_running
+        return (self.connection is not None
+                and self.connection.is_connected and self.gateway.is_running)

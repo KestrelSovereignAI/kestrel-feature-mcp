@@ -170,7 +170,7 @@ async def test_call_tool_routes_gateway_owner_to_gateway():
     gw = MagicMock()
     gw.is_connected = True
     gw.call_tool = AsyncMock(return_value=SimpleNamespace(
-        content=[SimpleNamespace(text="17:24 UTC")], isError=False))
+        content=[SimpleNamespace(text="17:24 UTC")], is_error=False))
     feat = _feature(manager=MagicMock(), gateway=gw)
     res = await feat.call_tool("gateway", "get_current_time", {"timezone": "UTC"})
     assert res.status is ToolResultStatus.OK

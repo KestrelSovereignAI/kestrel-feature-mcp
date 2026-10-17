@@ -42,3 +42,21 @@ Once installed, the `MCPAgent` feature is automatically discovered by kestrel-so
 uv pip install kestrel-sovereign-sdk && uv pip install -e ".[test]"
 uv run pytest
 ```
+
+## Native MCP protocol
+
+Version 0.5 uses the official MCP 2.x `Client` with protocol `2026-07-28` over
+Streamable HTTP. Container servers must expose native MCP at `/mcp`; the
+standalone HTTP+SSE transport and gateway `transport="sse"` selection have been
+removed. Gateway loading requires a gateway that supports the same native
+revision. Docker MCP Gateway 0.44.1, its newest published release when checked,
+rejects this revision. Gateway rollout remains blocked on the scope decision in
+[Kestrel #3683](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3683).
+Tool discovery follows pagination and fails on repeated cursors. Connection and
+call deadlines also apply while discovering tools; cancelled startup joins its
+transport owner before returning.
+
+Upgrade the MCP feature before upgrading a host with the Phoenix 20/Pydantic AI
+2 dependency set. Feature 0.4's `mcp<2` requirement cannot resolve with that set.
+The host dependency lock must be regenerated and verified as part of the same
+rollout (Kestrel Sovereign epic #3679).

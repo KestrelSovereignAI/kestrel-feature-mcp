@@ -1,8 +1,8 @@
 """
-SSE-native MCP Test Server with useful tools.
+Streamable HTTP MCP Test Server with useful tools.
 
 This server demonstrates:
-1. Native SSE transport (no wrapper needed)
+1. Native MCP 2026-07-28 transport (no wrapper needed)
 2. Multiple tool categories
 3. Async operations
 4. Error handling
@@ -18,15 +18,14 @@ Tools provided:
 - reverse_text: Reverse a string
 """
 
-from mcp.server.fastmcp import FastMCP
-import uvicorn
+from mcp.server import MCPServer
 import random
 import datetime
 import ast
 import operator
 
-# Create FastMCP server
-mcp = FastMCP("kestrel-tools-server")
+# Create MCPServer server
+mcp = MCPServer("kestrel-tools-server")
 
 # Safe math operators for calculate
 SAFE_OPERATORS = {
@@ -143,6 +142,5 @@ def uuid() -> str:
 
 
 if __name__ == "__main__":
-    print("Starting Kestrel Tools MCP Server on 0.0.0.0:8000")
-    print("Tools: echo, reverse_text, word_count, add, multiply, calculate, get_time, random_number, uuid")
-    uvicorn.run(mcp.sse_app, host="0.0.0.0", port=8000)
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000,
+            stateless_http=True, json_response=True)

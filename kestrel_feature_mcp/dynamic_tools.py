@@ -31,7 +31,7 @@ def extract_mcp_result(result) -> tuple[str, bool]:
     """Pull display text + error flag from an MCP ``CallToolResult``.
 
     MCP signals tool-level failures by returning a normal result with
-    ``isError=True`` rather than raising, so callers must branch on the flag to
+    ``is_error=True`` rather than raising, so callers must branch on the flag to
     keep the ToolResult status envelope honest. Multiple content blocks are all
     preserved (joined) — dropping the tail would silently truncate output.
     """
@@ -43,7 +43,7 @@ def extract_mcp_result(result) -> tuple[str, bool]:
         text = "\n".join(parts)
     else:
         text = str(result)
-    return text, bool(getattr(result, "isError", False))
+    return text, bool(getattr(result, "is_error", False))
 
 
 class _MCPToolSchema:

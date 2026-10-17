@@ -24,7 +24,7 @@ from kestrel_feature_mcp.feature import MCPAgent, _GATEWAY_OWNER, _container_own
 
 def _result(text="ok", *, is_error=False, blocks=None):
     content = blocks if blocks is not None else [SimpleNamespace(text=text)]
-    return SimpleNamespace(content=content, isError=is_error)
+    return SimpleNamespace(content=content, is_error=is_error)
 
 
 class _FakeHost:

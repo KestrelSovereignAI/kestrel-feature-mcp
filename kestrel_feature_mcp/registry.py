@@ -39,7 +39,6 @@ class ServerType(Enum):
 
 class TransportType(Enum):
     """MCP transport protocol."""
-    SSE = "sse"
     STDIO = "stdio"
     STREAMABLE_HTTP = "streamable_http"
 
@@ -65,7 +64,7 @@ class MCPServerEntry:
     tools: List[str] = field(default_factory=list)
     categories: List[ServerCategory] = field(default_factory=list)
     server_type: ServerType = ServerType.DOCKER
-    transport: TransportType = TransportType.SSE
+    transport: TransportType = TransportType.STREAMABLE_HTTP
     image: Optional[str] = None
     env_required: List[str] = field(default_factory=list)
     env_optional: List[str] = field(default_factory=list)
@@ -131,49 +130,23 @@ class MCPRegistry:
         self._load_catalog()
 
     def _load_catalog(self):
-        if not self._catalog_path.exists():
-            logger.warning(f"MCP catalog not found at {self._catalog_path}")
-            return
-
-        try:
-            with open(self._catalog_path, "rb") as f:
-                catalog = tomllib.load(f)
-
-            for name, data in catalog.get("servers", {}).items():
-                entry = self._parse_server_entry(name, data)
-                self.servers[name] = entry
-                logger.debug(f"Loaded MCP server: {name}")
-
-            logger.info(f"Loaded {len(self.servers)} MCP servers from catalog")
-
-        except (OSError, IOError) as e:
-            logger.error(f"Failed to read MCP catalog file: {e}")
-        except tomllib.TOMLDecodeError as e:
-            logger.error(f"Failed to parse MCP catalog TOML: {e}")
-        except Exception as e:
-            logger.error(f"Failed to load MCP catalog: {e}", exc_info=True)
+        with self._catalog_path.open("rb") as stream:
+            catalog = tomllib.load(stream)
+        entries = {
+            name: self._parse_server_entry(name, data)
+            for name, data in catalog.get("servers", {}).items()
+        }
+        self.servers = entries
+        logger.info("Loaded %s MCP servers from catalog", len(entries))
 
     def _parse_server_entry(self, name: str, data: Dict[str, Any]) -> MCPServerEntry:
-        categories = []
-        for cat_name in data.get("categories", []):
-            try:
-                categories.append(ServerCategory(cat_name))
-            except ValueError:
-                logger.warning(f"Unknown category '{cat_name}' for server {name}")
+        categories = [ServerCategory(value) for value in data.get("categories", [])]
 
-        server_type_str = data.get("type", "docker")
         try:
-            server_type = ServerType(server_type_str)
-        except ValueError:
-            logger.warning(f"Unknown server type '{server_type_str}' for {name}, defaulting to docker")
-            server_type = ServerType.DOCKER
-
-        transport_str = data.get("transport", "sse")
-        try:
-            transport = TransportType(transport_str)
-        except ValueError:
-            logger.warning(f"Unknown transport '{transport_str}' for {name}, defaulting to sse")
-            transport = TransportType.SSE
+            server_type = ServerType(data.get("type", "docker"))
+            transport = TransportType(data.get("transport", "streamable_http"))
+        except ValueError as error:
+            raise ValueError(f"Invalid MCP catalog entry {name!r}: {error}") from error
 
         return MCPServerEntry(
             name=name,
@@ -206,9 +179,9 @@ class MCPRegistry:
     def list_builtin(self) -> List[MCPServerEntry]:
         return [s for s in self.servers.values() if s.server_type == ServerType.BUILTIN]
 
-    def list_sse_ready(self) -> List[MCPServerEntry]:
+    def list_http_ready(self) -> List[MCPServerEntry]:
         return [s for s in self.servers.values()
-                if s.transport == TransportType.SSE and not s.is_builtin]
+                if s.transport == TransportType.STREAMABLE_HTTP and not s.is_builtin]
 
     def list_requires_wrapper(self) -> List[MCPServerEntry]:
         return [s for s in self.servers.values() if s.requires_wrapper]

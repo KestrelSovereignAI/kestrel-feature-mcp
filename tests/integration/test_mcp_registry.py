@@ -306,7 +306,7 @@ class TestRegistryCatalogContent:
         """Verify test-server has SSE transport."""
         server = registry.get("test-server")
         assert server is not None
-        assert server.transport == TransportType.SSE  # Native SSE support
+        assert server.transport == TransportType.STREAMABLE_HTTP  # Native Streamable HTTP
 
     def test_has_sqlite_server(self, registry):
         """Verify sqlite Docker server exists."""

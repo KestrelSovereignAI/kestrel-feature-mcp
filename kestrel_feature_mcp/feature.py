@@ -6,7 +6,7 @@ This feature provides two modes of operation:
 1. **Gateway Mode (Recommended)**: Uses Docker MCP Gateway for unified access
    to 311+ MCP servers. Commands: !mcp-gateway-start, !mcp-gateway-stop
 
-2. **Container Mode (Legacy)**: Direct container management for custom servers.
+2. **Container Mode**: Direct container management for custom servers.
    Commands: !mcp-load, !mcp-unload
 
 Gateway mode is recommended as it provides access to all servers regardless
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 # Dynamic-tool registry owner keys (see ToolRegistryMixin.register_dynamic_tools).
 # Gateway-mounted tools share one owner (the gateway aggregates many servers and
-# does not attribute tools per-server); each legacy container is its own owner.
+# does not attribute tools per-server); each container is its own owner.
 _GATEWAY_OWNER = "mcp:gateway"
 
 
@@ -777,7 +777,7 @@ class MCPAgent(Feature):
         Start the Docker MCP Gateway with specified servers.
 
         The gateway provides unified access to 311+ MCP servers from Docker's catalog
-        with automatic stdio->SSE conversion.
+        with automatic stdio->Streamable HTTP conversion.
 
         Args:
             servers: Comma-separated list of server names (e.g., "fetch,sqlite")

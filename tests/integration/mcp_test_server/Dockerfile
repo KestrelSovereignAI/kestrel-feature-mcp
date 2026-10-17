@@ -2,15 +2,8 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies.
-#
-# The mcp bound must match the package's own (see pyproject.toml): this image
-# is built fresh at test time, so an unbounded spec silently tracks whatever is
-# newest on PyPI rather than what the code under test supports. mcp 2.0 removed
-# `mcp.server.fastmcp`, which server.py imports, so the container started
-# exiting at import the day 2.0 shipped — turning a dependency problem into a
-# "container exited unexpectedly" failure several layers from its cause.
-RUN pip install "mcp[cli]>=1.26,<2" uvicorn starlette
+# Match the native protocol SDK used by the host.
+RUN pip install "mcp>=2.3,<3"
 
 # Copy server code
 COPY server.py .
