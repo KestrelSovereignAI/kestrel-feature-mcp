@@ -64,6 +64,12 @@ DOCKER_CLIENT_TIMEOUT = 120
 # trickling bytes forever (F397).
 IMAGE_PULL_TIMEOUT = 600.0
 
+
+def container_name_for_image(image_name: str) -> str:
+    """The canonical container name used by load and lifecycle management."""
+    return f"mcp-{image_name.replace('/', '-').replace(':', '-')}"
+
+
 class MCPToolManager:
     """
     Manages MCP tools running in Docker containers.
@@ -240,7 +246,10 @@ class MCPToolManager:
     async def start_tool_container(self, image_name: str, container_name: str = None, command: List[str] = None, environment: Dict[str, str] = None, volumes: Dict[str, Dict[str, str]] = None) -> str:
         """Starts a Docker container for an MCP tool. Returns the container name."""
         if not container_name:
-            container_name = f"mcp-{image_name.replace('/', '-').replace(':', '-')}"
+            container_name = container_name_for_image(image_name)
+        # Retire the old transport before Docker restarts/replaces its process.
+        # A failed healthcheck must not leave an earlier connection published.
+        await self._drop_connection(container_name)
 
         try:
             try:
@@ -326,6 +335,7 @@ class MCPToolManager:
         """Disconnect a restarted container without changing its lifecycle."""
         info = self.active_tools.get(container_name)
         if info is not None:
+            info["tools"] = []
             await info["connection"].close()
             del self.active_tools[container_name]
 

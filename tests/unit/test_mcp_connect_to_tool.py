@@ -95,3 +95,22 @@ async def test_removal_is_confirmed_before_reporting_unload(monkeypatch, removed
             await manager.stop_tool("test")
         assert "test" in manager.active_tools
     assert manager.docker_client.containers.get.call_count == 2
+
+
+@pytest.mark.parametrize("image,name", [("acme/native:latest", "mcp-acme-native-latest"), ("private.registry:5000/image:v2", "mcp-private.registry-5000-image-v2")])
+def test_default_container_name_is_shared_with_load_planning(image, name):
+    from kestrel_feature_mcp.manager import container_name_for_image
+    assert container_name_for_image(image) == name
+
+
+@pytest.mark.asyncio
+async def test_failed_retirement_unpublishes_tools_and_prevents_container_restart():
+    manager = MCPToolManager(docker_client=MagicMock())
+    connection = AsyncMock()
+    connection.close.side_effect = TimeoutError("retirement deadline exceeded")
+    manager.active_tools["owned"] = {"connection": connection, "tools": [object()]}
+    with pytest.raises(TimeoutError, match="retirement deadline"):
+        await manager.start_tool_container("image", container_name="owned")
+    assert manager.active_tools["owned"]["connection"] is connection
+    assert manager.get_all_tools() == []
+    manager.docker_client.containers.get.assert_not_called()
