@@ -18,4 +18,7 @@ async def test_container_fixture_tools_run_on_mcp2():
         assert not result.is_error
         assert result.structured_content == {"result": 10}
         failure = await client.call_tool("calculate", {"expression": "__import__('os')"})
+        assert failure.is_error
         assert "Unsupported expression type" in failure.content[0].text
+        zero_division = await client.call_tool("calculate", {"expression": "1 / 0"})
+        assert zero_division.is_error

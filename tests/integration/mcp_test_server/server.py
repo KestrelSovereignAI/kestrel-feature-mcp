@@ -19,6 +19,7 @@ Tools provided:
 """
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 import random
 import datetime
 import ast
@@ -114,8 +115,8 @@ def calculate(expression: str) -> str:
         tree = ast.parse(expression, mode='eval')
         result = safe_eval(tree.body)
         return str(result)
-    except Exception as e:
-        return f"Error: {str(e)}"
+    except (ArithmeticError, SyntaxError, ValueError) as error:
+        raise ToolError(f"Invalid expression: {error}") from error
 
 
 # =============================================================================
