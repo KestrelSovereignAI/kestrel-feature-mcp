@@ -1,6 +1,7 @@
 """Real HTTP fixtures shared by native MCP lifecycle and deadline tests."""
 
 import asyncio
+from dataclasses import dataclass
 import socket
 
 import pytest_asyncio
@@ -9,6 +10,18 @@ from mcp import types
 from mcp_types.version import LATEST_PROTOCOL_VERSION
 from mcp.server import MCPServer
 from mcp.shared.exceptions import MCPError
+
+
+@dataclass
+class HTTPMCPServer:
+    url: str
+    requests: list
+    server: uvicorn.Server
+    task: asyncio.Task
+
+    async def stop(self):
+        self.server.should_exit = True
+        await asyncio.wait_for(self.task, 5)
 
 
 @pytest_asyncio.fixture
@@ -93,7 +106,7 @@ async def mcp_http_server(request):
 
     try:
         await asyncio.wait_for(ready(), 5)
-        yield f"http://127.0.0.1:{port}/mcp", requests
+        yield HTTPMCPServer(f"http://127.0.0.1:{port}/mcp", requests, server, task)
     finally:
         server.should_exit = True
         await asyncio.wait_for(task, 5)

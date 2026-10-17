@@ -25,7 +25,7 @@ def test_invalid_deadlines_fail_before_any_connection(value, field):
 
 @pytest.mark.asyncio
 async def test_requests_use_modern_wire_and_bearer_header(mcp_http_server):
-    url, requests = mcp_http_server
+    url, requests = mcp_http_server.url, mcp_http_server.requests
     connection = MCPConnection(url, headers={"Authorization": "Bearer test-token"})
     try:
         tools = await connection.connect()
@@ -57,7 +57,7 @@ async def test_requests_use_modern_wire_and_bearer_header(mcp_http_server):
 
 @pytest.mark.asyncio
 async def test_sdk_tool_failure_is_preserved(mcp_http_server):
-    url, _ = mcp_http_server
+    url = mcp_http_server.url
     connection = MCPConnection(url)
     try:
         await connection.connect()
@@ -70,7 +70,7 @@ async def test_sdk_tool_failure_is_preserved(mcp_http_server):
 
 @pytest.mark.asyncio
 async def test_failed_startup_joins_owner_and_can_retry(mcp_http_server):
-    url, _ = mcp_http_server
+    url = mcp_http_server.url
     connection = MCPConnection(url.replace("/mcp", "/missing"), call_timeout=1)
     with pytest.raises(ExceptionGroup) as caught:
         await connection.connect()
@@ -123,7 +123,7 @@ async def test_abandoned_startup_joins_owner(monkeypatch, cancel_caller):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mcp_http_server", [{"paginate": True}], indirect=True)
 async def test_all_tool_pages_are_discovered(mcp_http_server):
-    url, requests = mcp_http_server
+    url, requests = mcp_http_server.url, mcp_http_server.requests
     connection = MCPConnection(url)
     try:
         tools = await connection.connect()
@@ -139,7 +139,7 @@ async def test_all_tool_pages_are_discovered(mcp_http_server):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mcp_http_server", [{"repeat_cursor": True}], indirect=True)
 async def test_repeated_cursor_fails_without_leaking_owner(mcp_http_server):
-    url, _ = mcp_http_server
+    url = mcp_http_server.url
     connection = MCPConnection(url)
     with pytest.raises(ValueError, match="repeated.*cursor"):
         await connection.connect()
@@ -158,7 +158,7 @@ def container_manager(url):
 
 @pytest.mark.asyncio
 async def test_container_reconnect_uses_native_client_and_retires_old_owner(mcp_http_server):
-    url, requests = mcp_http_server
+    url, requests = mcp_http_server.url, mcp_http_server.requests
     manager = container_manager(url)
     try:
         await manager.connect_to_tool("test")
@@ -177,7 +177,7 @@ async def test_container_reconnect_uses_native_client_and_retires_old_owner(mcp_
 
 @pytest.mark.asyncio
 async def test_gateway_uses_same_native_client_with_its_bearer_token(mcp_http_server):
-    url, requests = mcp_http_server
+    url, requests = mcp_http_server.url, mcp_http_server.requests
     manager = MCPGatewayManager()
     manager.gateway = SimpleNamespace(endpoint_url=url, is_running=True)
     try:
@@ -199,7 +199,7 @@ async def test_gateway_uses_same_native_client_with_its_bearer_token(mcp_http_se
 @pytest.mark.parametrize("mcp_http_server", [{"list_delay": 0.25}], indirect=True)
 @pytest.mark.parametrize("kind", ["gateway", "container"])
 async def test_list_timeout_never_publishes_a_dead_manager(monkeypatch, mcp_http_server, kind):
-    url, _ = mcp_http_server
+    url = mcp_http_server.url
     monkeypatch.setattr("kestrel_feature_mcp.manager.CALL_TOOL_TIMEOUT", 0.05)
     if kind == "container":
         manager = container_manager(url)
@@ -221,7 +221,7 @@ async def test_list_timeout_never_publishes_a_dead_manager(monkeypatch, mcp_http
 
 @pytest.mark.asyncio
 async def test_container_readiness_checks_the_actual_protocol(mcp_http_server):
-    url, _ = mcp_http_server
+    url = mcp_http_server.url
     manager = container_manager(url)
     port = int(url.split(":")[-1].split("/")[0])
     assert await manager._check_mcp_ready("127.0.0.1", port)
@@ -231,7 +231,7 @@ async def test_container_readiness_checks_the_actual_protocol(mcp_http_server):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mcp_http_server", [{"legacy": True}], indirect=True)
 async def test_official_sdk_negotiates_a_published_handshake_revision(mcp_http_server):
-    url, requests = mcp_http_server
+    url, requests = mcp_http_server.url, mcp_http_server.requests
     connection = MCPConnection(url)
     try:
         await connection.connect()
@@ -248,7 +248,7 @@ async def test_official_sdk_negotiates_a_published_handshake_revision(mcp_http_s
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mcp_http_server", [{"legacy": True, "delete_delay": 0.5}], indirect=True)
 async def test_slow_session_termination_has_a_finite_shutdown_deadline(mcp_http_server):
-    url, _ = mcp_http_server
+    url = mcp_http_server.url
     connection = MCPConnection(url, close_timeout=0.05)
     await connection.connect()
     owner = connection._task
@@ -262,7 +262,7 @@ async def test_slow_session_termination_has_a_finite_shutdown_deadline(mcp_http_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mcp_http_server", [{"legacy": True, "delete_delay": 0.2}], indirect=True)
 async def test_cancelled_close_propagates_and_retains_the_owner_for_rejoin(mcp_http_server):
-    url, requests = mcp_http_server
+    url, requests = mcp_http_server.url, mcp_http_server.requests
     connection = MCPConnection(url)
     await connection.connect()
     owner = connection._task
@@ -286,7 +286,7 @@ async def test_cancelled_close_propagates_and_retains_the_owner_for_rejoin(mcp_h
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mcp_http_server", [{"list_delay": 0.25}], indirect=True)
 async def test_initial_discovery_uses_the_call_budget_after_connecting(mcp_http_server):
-    url, _ = mcp_http_server
+    url = mcp_http_server.url
     connection = MCPConnection(url, connect_timeout=0.15, call_timeout=1)
     try:
         tools = await connection.connect()
@@ -319,7 +319,7 @@ async def test_readiness_does_not_hide_unexpected_group_members(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mcp_http_server", [{"discover_delay": 0.25}], indirect=True)
 async def test_connect_deadline_joins_a_real_slow_negotiation(mcp_http_server):
-    url, _ = mcp_http_server
+    url = mcp_http_server.url
     connection = MCPConnection(url, connect_timeout=0.05)
     with pytest.raises(TimeoutError):
         await connection.connect()
@@ -330,7 +330,7 @@ async def test_connect_deadline_joins_a_real_slow_negotiation(mcp_http_server):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mcp_http_server", [{"unsupported_version": True}], indirect=True)
 async def test_no_common_revision_fails_without_a_private_fallback(mcp_http_server):
-    url, requests = mcp_http_server
+    url, requests = mcp_http_server.url, mcp_http_server.requests
     connection = MCPConnection(url)
     with pytest.raises(ExceptionGroup) as caught:
         await connection.connect()
@@ -339,3 +339,28 @@ async def test_no_common_revision_fails_without_a_private_fallback(mcp_http_serv
     assert connection._task is None
     assert not connection.is_connected
     assert [json.loads(body)["method"] for _, body in requests if body] == ["server/discover"]
+
+
+@pytest.mark.asyncio
+async def test_close_of_a_dead_transport_does_not_rethrow_its_historical_failure(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url, call_timeout=1)
+    await connection.connect()
+    owner = connection._task
+    await mcp_http_server.stop()
+    with pytest.raises((MCPError, ExceptionGroup)):
+        await connection.call_tool("echo", {"text": "unreachable"})
+    async with asyncio.timeout(2):
+        while not owner.done():
+            await asyncio.sleep(0)
+    assert owner.exception() is not None
+    await connection.close()
+    assert connection._task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"legacy": True, "delete_delay": 0.5}], indirect=True)
+async def test_readiness_cleanup_uses_its_own_budget_and_reports_failure(mcp_http_server):
+    manager = MCPToolManager(docker_client=MagicMock())
+    port = int(mcp_http_server.url.split(":")[-1].split("/")[0])
+    assert not await manager._check_mcp_ready("127.0.0.1", port, timeout=0.1)
+    assert not [task for task in asyncio.all_tasks() if task.get_name() == "mcp-connection"]

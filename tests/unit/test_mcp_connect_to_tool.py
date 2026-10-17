@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kestrel_feature_mcp.manager import MCPToolManager, MCPGatewayManager
-from docker.errors import APIError
+from docker.errors import APIError, NotFound
 
 
 @pytest.mark.asyncio
@@ -42,6 +42,7 @@ async def test_stop_still_reclaims_container_when_connection_teardown_fails():
     connection = AsyncMock()
     connection.close.side_effect = OSError("close failed")
     container = MagicMock()
+    manager.docker_client.containers.get.side_effect = NotFound("removed")
     manager.active_tools["test"] = {"connection": connection, "container": container, "tools": []}
     with pytest.raises(OSError, match="close failed"):
         await manager.stop_tool("test")
@@ -56,10 +57,12 @@ async def test_docker_cleanup_failure_is_explicit_and_preserves_retry(operation)
     connection = AsyncMock()
     container = MagicMock()
     getattr(container, operation).side_effect = APIError("daemon refused cleanup")
+    manager.docker_client.containers.get.side_effect = NotFound("removed")
     manager.active_tools["test"] = {"connection": connection, "container": container, "tools": []}
     with pytest.raises(APIError, match="daemon refused cleanup"):
         await manager.stop_tool("test")
     assert manager.active_tools["test"]["connection"] is connection
+    container.remove.assert_called_once_with(force=True)
 
 
 @pytest.mark.asyncio
@@ -73,3 +76,22 @@ async def test_failed_gateway_disconnect_retains_owner_for_cleanup_retry():
         await manager._disconnect()
     assert manager.connection is connection
     assert manager.tools == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("removed", [False, True])
+async def test_removal_is_confirmed_before_reporting_unload(monkeypatch, removed):
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCP_MAX_CONNECTION_ATTEMPTS", 2)
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCP_CONNECTION_RETRY_DELAY", 0)
+    manager = MCPToolManager(docker_client=MagicMock())
+    container = MagicMock()
+    manager.active_tools["test"] = {"connection": AsyncMock(), "container": container, "tools": []}
+    manager.docker_client.containers.get.side_effect = [container, NotFound("removed")] if removed else [container, container]
+    if removed:
+        assert await manager.stop_tool("test")
+        assert "test" not in manager.active_tools
+    else:
+        with pytest.raises(TimeoutError, match="still registered"):
+            await manager.stop_tool("test")
+        assert "test" in manager.active_tools
+    assert manager.docker_client.containers.get.call_count == 2

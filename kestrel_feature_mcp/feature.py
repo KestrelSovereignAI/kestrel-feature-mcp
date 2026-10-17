@@ -14,6 +14,7 @@ of their native transport protocol.
 """
 
 import asyncio
+from contextlib import AsyncExitStack
 import logging
 import json
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
@@ -405,6 +406,16 @@ class MCPAgent(Feature):
             logger.error(f"Unexpected error loading tool {image_name}: {e}", exc_info=True)
             return ToolResult.failed(f"Failed to load MCP tool: {str(e)}")
 
+    async def _retire_gateway(self):
+        """Retire an owned gateway even when its MCP transport already died."""
+        gateway = self.gateway_manager
+        try:
+            if gateway is not None:
+                await gateway.stop()
+        finally:
+            self._unmount_tools(_GATEWAY_OWNER)
+        self.gateway_manager = None
+
     async def _load_via_gateway(self, server_name: str) -> ToolResult:
         """Load a single catalog/stdio server through the shared gateway.
 
@@ -434,6 +445,7 @@ class MCPAgent(Feature):
                 before = set((self.gateway_manager.tools or {}).keys())
                 tools = await self.gateway_manager.enable_server(server_name)
             else:
+                await self._retire_gateway()
                 self.gateway_manager = MCPGatewayManager()
                 before = set()
                 tools = await self.gateway_manager.start([server_name])
@@ -441,19 +453,16 @@ class MCPAgent(Feature):
             tool_names = [t.name for t in tools]
             new_tools = sorted(set(tool_names) - before)
             mounted = self._mount_gateway_tools()
-            # Persist/report against the gateway's AUTHORITATIVE enabled set:
-            # enable_server can fail to add the requested server yet reconnect to
-            # the prior servers and return their tools, so a naive persist would
-            # auto-restore a server that never loaded (#9 honesty).
-            enabled_now = getattr(
-                getattr(self.gateway_manager, "gateway", None), "enabled_servers", set()
+            # Record requested configuration after reconnection; the flat
+            # tool list cannot prove which server supplied any given tool.
+            requested_now = getattr(
+                getattr(self.gateway_manager, "gateway", None), "requested_servers", set()
             )
-            if server_name not in enabled_now:
+            if server_name not in requested_now:
                 return ToolResult.failed(
-                    f"Could not load {server_name} via the gateway — it did not "
-                    f"enable (it may need credentials/configuration). The gateway "
+                    f"Could not configure {server_name} in the gateway request. The gateway "
                     f"is still serving {len(tool_names)} tool(s) from other servers.",
-                    data={"server": server_name, "enabled": sorted(enabled_now),
+                    data={"server": server_name, "requested": sorted(requested_now),
                           "tools": tool_names, "via": "gateway"},
                 )
             await self._persist_server(
@@ -471,14 +480,14 @@ class MCPAgent(Feature):
             # "Loaded" (#9 honesty contract).
             if not new_tools:
                 return ToolResult.partial(
-                    f"Loaded {server_name} via the gateway, but it added 0 new "
+                    f"Requested {server_name} via the gateway, but it added 0 new "
                     f"tools (it may need credentials/configuration, or its tools "
                     f"were already present). Gateway total: {len(tool_names)} tools.",
                     f"{server_name} contributed no new tools",
                     data=data,
                 )
             return ToolResult.ok(
-                f"Loaded {server_name} via the gateway — added {len(new_tools)} "
+                f"Requested {server_name} via the gateway — added {len(new_tools)} "
                 f"tool(s): {', '.join(new_tools[:10])}"
                 + (f" (+{len(new_tools) - 10} more)" if len(new_tools) > 10 else "")
                 + f"\n\n**Gateway total:** {len(tool_names)} tools"
@@ -541,7 +550,7 @@ class MCPAgent(Feature):
 
         gwm = self.gateway_manager
         if gwm is not None and gwm.is_connected:
-            enabled = getattr(getattr(gwm, "gateway", None), "enabled_servers", set())
+            enabled = getattr(getattr(gwm, "gateway", None), "requested_servers", set())
             # Accept the catalog name OR the same image alias the load accepted
             # (e.g. `mcp/time` -> `time`), so load/unload stay symmetric.
             route, resolved = await self._resolve_load_route(container_name)
@@ -597,7 +606,7 @@ class MCPAgent(Feature):
         gwm = self.gateway_manager
         try:
             remaining = [
-                s for s in gwm.gateway.enabled_servers if s != server_name
+                s for s in gwm.gateway.requested_servers if s != server_name
             ]
             if remaining:
                 await gwm.disable_server(server_name)
@@ -605,9 +614,7 @@ class MCPAgent(Feature):
             else:
                 # Last server — tear the gateway down rather than leave an empty
                 # one running, and drop the aggregate mount.
-                await gwm.stop()
-                self._unmount_tools(_GATEWAY_OWNER)
-                self.gateway_manager = None
+                await self._retire_gateway()
                 mounted = 0
             await self._forget_server(server_name)
             return ToolResult.ok(
@@ -810,25 +817,16 @@ class MCPAgent(Feature):
             if rejection is not None:
                 return rejection
 
-            if self.gateway_manager and self.gateway_manager.is_connected:
-                await self.gateway_manager.stop()
-                self._unmount_tools(_GATEWAY_OWNER)
-
+            await self._retire_gateway()
             self.gateway_manager = MCPGatewayManager()
             tools = await self.gateway_manager.start(server_list)
 
             tool_names = [t.name for t in tools]
             mounted = self._mount_gateway_tools()
-            # The gateway's ACTUAL enabled set is authoritative — a requested
-            # server can fail to enable while the gateway still starts with
-            # the subset. Persist that set (stale servers forgotten) AND
-            # report against it so we never claim a server is running that
-            # the gateway dropped.
-            actual_set = getattr(getattr(self.gateway_manager, "gateway", None),
-                                 "enabled_servers", None)
-            actual = sorted(actual_set) if actual_set else list(server_list)
-            await self._reconcile_gateway_persistence(actual)
-            not_enabled = [s for s in server_list if s not in set(actual)]
+            # Docker exposes an aggregated tool catalog, not per-server
+            # readiness. Persist desired configuration, never an invented
+            # observed-enabled set.
+            await self._reconcile_gateway_persistence(server_list)
 
             mount_note = (
                 f"\n\n**Mounted {mounted} tools** — call them directly."
@@ -842,21 +840,12 @@ class MCPAgent(Feature):
             )
             data = {
                 "requested": server_list,
-                "enabled": actual,
-                "not_enabled": not_enabled,
                 "tools": tool_names,
                 "mounted": mounted,
             }
-            # The gateway aggregates servers behind a flat tool list and does
-            # NOT attribute tools per server, so we can't prove which server
-            # produced which tool. Report only what IS verifiable — the
-            # gateway's enabled set and the real tool count — and flag a
-            # PARTIAL (not a blanket "ok") whenever the effect is short of
-            # the request: no tools at all, or a requested server the gateway
-            # didn't end up enabling. Callers inspect `Tools:` for coverage.
+            # Requested server names and observed tools are different facts.
             summary = (
                 f"**Requested:** {', '.join(server_list)}\n"
-                f"**Gateway enabled:** {', '.join(actual) or 'none'}\n"
                 f"{tools_line}" + mount_note
             )
             if not tool_names:
@@ -865,14 +854,6 @@ class MCPAgent(Feature):
                     f"{len(server_list)} requested server(s). The servers may "
                     f"need credentials or configuration.\n\n{summary}",
                     "no tools mounted from the requested servers",
-                    data=data,
-                )
-            if not_enabled:
-                return ToolResult.partial(
-                    f"Gateway started with {len(tool_names)} tools, but "
-                    f"{len(not_enabled)} requested server(s) were not enabled: "
-                    f"{', '.join(not_enabled)}.\n\n{summary}",
-                    f"requested servers not enabled: {', '.join(not_enabled)}",
                     data=data,
                 )
             return ToolResult.ok(
@@ -904,17 +885,13 @@ class MCPAgent(Feature):
         # or deltas left from a prior run). Otherwise "off" would be impossible.
         await self._forget_all_gateway_servers()
 
-        if self.gateway_manager is None or not self.gateway_manager.is_connected:
-            return ToolResult.ok("Gateway is not running.")
-
+        had_owner = self.gateway_manager is not None
         try:
-            await self.gateway_manager.stop()
-            self.gateway_manager = None
-            self._unmount_tools(_GATEWAY_OWNER)
-            return ToolResult.ok("Gateway stopped.")
+            await self._retire_gateway()
+            return ToolResult.ok("Gateway stopped." if had_owner else "Gateway is not running.")
         except asyncio.CancelledError:
             logger.info("Gateway stop cancelled")
-            return ToolResult.failed("Gateway stop cancelled")
+            raise
         except Exception as e:
             logger.error(f"Failed to stop gateway: {e}", exc_info=True)
             return ToolResult.failed(f"Failed to stop gateway: {str(e)}")
@@ -1024,7 +1001,7 @@ class MCPAgent(Feature):
             # PARTIAL instead of a confident "Enabled" (#9, finding #3).
             if not new_tools:
                 return ToolResult.partial(
-                    f"Enabled {server_name}, but it added 0 new tools "
+                    f"Requested {server_name}, but it added 0 new tools "
                     f"(it may need credentials/configuration, or its tools "
                     f"were already present). Gateway total: {len(tool_names)} "
                     f"tools.",
@@ -1032,7 +1009,7 @@ class MCPAgent(Feature):
                     data=data,
                 )
             return ToolResult.ok(
-                f"Enabled {server_name} — added {len(new_tools)} tool(s): "
+                f"Requested {server_name} — added {len(new_tools)} tool(s): "
                 f"{', '.join(new_tools[:10])}"
                 + (f" (+{len(new_tools) - 10} more)" if len(new_tools) > 10 else "")
                 + f"\n\n**Gateway total:** {len(tool_names)} tools"
@@ -1147,23 +1124,19 @@ class MCPAgent(Feature):
                 logger.warning("Failed to restore MCP container %s: %s", image, e)
 
     async def shutdown(self):
-        """Stops all active tools, gateway, and closes the Docker client."""
-        if self.gateway_manager and self.gateway_manager.is_connected:
+        """Attempt every owned cleanup, then propagate any cleanup failure."""
+        manager = self.manager
+        async def stop_container(name):
             try:
-                await self.gateway_manager.stop()
-            except asyncio.CancelledError:
-                logger.info("Gateway stop cancelled during shutdown")
-            except Exception as e:
-                logger.warning(f"Error stopping gateway: {e}", exc_info=True)
-            self.gateway_manager = None
-        self._unmount_tools(_GATEWAY_OWNER)
+                await manager.stop_tool(name)
+            finally:
+                self._unmount_tools(_container_owner(name))
 
-        if self.manager is None:
-            return
-
-        active_containers = list(self.manager.active_tools.keys())
-        for container in active_containers:
-            await self.manager.stop_tool(container)
-            self._unmount_tools(_container_owner(container))
-
-        await self.manager.aclose()
+        # The stack attempts all callbacks even if an earlier resource fails
+        # or its caller is cancelled. Docker closes after the server owners.
+        async with AsyncExitStack() as cleanup:
+            if manager is not None:
+                cleanup.push_async_callback(manager.aclose)
+                for name in reversed(list(manager.active_tools)):
+                    cleanup.push_async_callback(stop_container, name)
+            cleanup.push_async_callback(self._retire_gateway)

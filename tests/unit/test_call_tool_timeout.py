@@ -13,7 +13,7 @@ from kestrel_feature_mcp.manager import MCPGatewayManager, MCPToolManager
 @pytest.mark.parametrize("mcp_http_server", [{"tool_delay": 0.25}], indirect=True)
 @pytest.mark.parametrize("kind", ["container", "gateway"])
 async def test_call_timeout_uses_the_real_connection(kind, mcp_http_server):
-    url, _ = mcp_http_server
+    url = mcp_http_server.url
     connection = MCPConnection(url, call_timeout=0.05)
     try:
         await connection.connect()

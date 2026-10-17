@@ -82,7 +82,7 @@ class DockerMCPGateway:
         port: TCP port for the Streamable HTTP endpoint
         process: The gateway subprocess
         auth_token: Bearer token for authentication
-        enabled_servers: Set of currently enabled server names
+        requested_servers: Requested server names passed to the gateway, not per-server readiness
     """
 
     #: MCP deprecated the standalone HTTP+SSE transport (2025-03-26 spec) in
@@ -130,7 +130,7 @@ class DockerMCPGateway:
         # (the gateway prints no Bearer line), so we mint the token up-front and
         # inject it into the gateway process and send it on every request.
         self.auth_token: Optional[str] = None
-        self.enabled_servers: Set[str] = set()
+        self.requested_servers: Set[str] = set()
         self._timeout_task: Optional[asyncio.Task] = None
         self._start_time: Optional[float] = None
         # Single owner of the gateway's stdout for the process's whole life
@@ -232,13 +232,13 @@ class DockerMCPGateway:
             raise ValueError("MCP gateway needs a non-empty list of server names")
         # --servers is the gateway's authoritative per-process selection. The
         # old global `docker mcp server enable` command was removed by Docker.
-        self.enabled_servers = set(servers)
+        self.requested_servers = set(servers)
 
         # Resolve the port at bind time: an explicit port is honoured, otherwise
         # pick a fresh ephemeral one so two gateways never fight over :9000 (#12).
         self.port = self._requested_port or self._find_free_port()
 
-        servers_arg = ",".join(sorted(self.enabled_servers))
+        servers_arg = ",".join(sorted(self.requested_servers))
         cmd = [
             "docker", "mcp", "gateway", "run",
             f"--transport={self.transport}",
@@ -442,28 +442,28 @@ class DockerMCPGateway:
                 self.auth_token = None
                 self._start_time = None
                 logger.info("Gateway stopped")
-        # enabled_servers tracks what THIS gateway process is serving; a stopped
+        # requested_servers tracks what THIS gateway process is serving; a stopped
         # gateway serves nothing. restart()/add_server()/remove_server() all
         # snapshot the desired list before calling stop(), so clearing here is
         # safe and keeps the set from accumulating stale servers across restarts.
-        self.enabled_servers.clear()
+        self.requested_servers.clear()
 
     async def restart(self, servers: List[str] = None) -> str:
         """Restart the gateway with optionally different servers."""
         if servers is None:
-            servers = list(self.enabled_servers)
+            servers = list(self.requested_servers)
         await self.stop()
         return await self.start(servers)
 
     async def add_server(self, server_name: str) -> str:
         """Add a server to the gateway (requires restart)."""
-        servers = list(self.enabled_servers)
+        servers = list(self.requested_servers)
         servers.append(server_name)
         return await self.restart(servers)
 
     async def remove_server(self, server_name: str) -> str:
         """Remove a server from the gateway (requires restart)."""
-        servers = list(self.enabled_servers)
+        servers = list(self.requested_servers)
         if server_name in servers:
             servers.remove(server_name)
         if not servers:
@@ -506,7 +506,7 @@ async def list_available_servers() -> List[str]:
         return []
 
 
-async def list_enabled_servers() -> List[str]:
+async def list_requested_servers() -> List[str]:
     """List currently enabled servers in Docker MCP."""
     try:
         result = await asyncio.to_thread(

@@ -53,6 +53,8 @@ removed. Docker MCP Gateway 0.44.1 negotiates `2025-11-25`; its lack of the
 newer revision is tracked in
 [Kestrel #3683](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3683).
 Features requiring newer capabilities must check the negotiated connection.
+Gateway server lists describe requested configuration; observed tools do not
+prove readiness of every requested server.
 Tool discovery follows pagination and fails on repeated cursors. Negotiation
 uses the connection deadline, then discovery uses the whole-call deadline.
 Cancelled startup joins its transport owner before returning. Shutdown has its

@@ -64,7 +64,7 @@ def test_start_cmd_includes_long_lived_when_enabled(monkeypatch):
     # A new explicit selection replaces the old selection on this process;
     # it does not retain servers from an earlier start.
     asyncio.run(gw.start(["time"]))
-    assert gw.enabled_servers == {"time"}
+    assert gw.requested_servers == {"time"}
     assert "--servers=time" in captured["cmd"]
 
     gw2 = DockerMCPGateway(port=12346, long_lived=False)

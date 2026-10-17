@@ -259,3 +259,20 @@ class TestMounting:
         # The host sanitises, but the proposed handles should already be tame.
         ws = build_wrappers("fetch", [{"name": "do_thing", "inputSchema": {}}], AsyncMock())
         assert re.fullmatch(r"[a-zA-Z0-9_-]+", ws[0].name)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_attempts_every_resource_and_propagates_cleanup_errors():
+    manager = MagicMock()
+    manager.active_tools = {"a": {}, "b": {}}
+    manager.stop_tool = AsyncMock(side_effect=[TimeoutError("a close failed"), True])
+    manager.aclose = AsyncMock()
+    gateway = MagicMock()
+    gateway.is_connected = False
+    gateway.stop = AsyncMock()
+    feature = _feature(manager=manager, gateway=gateway)
+    with pytest.raises(TimeoutError, match="a close failed"):
+        await feature.shutdown()
+    assert [call.args[0] for call in manager.stop_tool.await_args_list] == ["a", "b"]
+    manager.aclose.assert_awaited_once()
+    gateway.stop.assert_awaited_once()

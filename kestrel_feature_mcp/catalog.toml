@@ -33,7 +33,7 @@ categories = ["devtools", "utility"]
 # =============================================================================
 # STREAMABLE HTTP SERVERS (Direct connection, no wrapper needed)
 # =============================================================================
-# These servers must serve native MCP 2026-07-28 on /mcp and can be connected to directly.
+# These servers must expose Streamable HTTP at /mcp; the SDK negotiates a shared published revision and can be connected to directly.
 
 [servers.test-server]
 type = "docker"

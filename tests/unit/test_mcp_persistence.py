@@ -6,6 +6,7 @@ mocked; what's verified is the persist/forget/restore wiring."""
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
 
 import pytest
 
@@ -59,7 +60,7 @@ class TestPersistHelpers:
         await feat._forget_server("fetch")
 
 
-class TestGatewayAuthoritativePersistence:
+class TestGatewayDesiredPersistence:
     @pytest.mark.asyncio
     async def test_reconcile_forgets_replaced_servers(self):
         # Prior gateway had fetch+old; new gateway_start is just [time] -> persist
@@ -168,3 +169,35 @@ class TestUnloadForgets:
         feat = _feature(host, manager=manager)
         await feat.unload_tool("mcp_fetch_abc")
         host.clear_feature_enablement.assert_awaited_once_with("mcp_server", "mcp_fetch_abc")
+
+
+@pytest.mark.asyncio
+async def test_gateway_reports_requests_and_observed_tools_without_invented_readiness(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(feat_mod, "check_docker_mcp_available", lambda: True)
+    gateway = MagicMock()
+    gateway.start = AsyncMock(return_value=[SimpleNamespace(name="fetch")])
+    gateway.gateway = SimpleNamespace(requested_servers={"fetch", "sqlite"})
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", lambda: gateway)
+    feature = _feature(manager=MagicMock())
+    feature._reject_unknown_servers = AsyncMock(return_value=None)
+    feature._mount_gateway_tools = MagicMock(return_value=1)
+    feature._reconcile_gateway_persistence = AsyncMock()
+    result = await feature.gateway_start("fetch,sqlite")
+    assert result.data["requested"] == ["fetch", "sqlite"]
+    assert result.data["tools"] == ["fetch"]
+    assert "enabled" not in result.data and "not_enabled" not in result.data
+    assert "Gateway enabled" not in result.confirmation
+    feature._reconcile_gateway_persistence.assert_awaited_once_with(["fetch", "sqlite"])
+
+
+@pytest.mark.asyncio
+async def test_explicit_stop_retires_a_disconnected_gateway_owner():
+    gateway = SimpleNamespace(is_connected=False, stop=AsyncMock())
+    feature = _feature(manager=MagicMock(), gateway=gateway)
+    feature._forget_all_gateway_servers = AsyncMock()
+    feature._unmount_tools = MagicMock()
+    await feature.gateway_stop()
+    gateway.stop.assert_awaited_once()
+    assert feature.gateway_manager is None

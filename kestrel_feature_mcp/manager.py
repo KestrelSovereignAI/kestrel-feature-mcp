@@ -227,17 +227,18 @@ class MCPToolManager:
     async def _check_mcp_ready(self, host: str, port: int, timeout: float = 2.0) -> bool:
         """Check readiness through the same native client used for tool calls."""
         connection = MCPConnection(
-            f"http://{host}:{port}/mcp", connect_timeout=timeout, call_timeout=timeout
+            f"http://{host}:{port}/mcp", connect_timeout=timeout,
+            call_timeout=timeout, close_timeout=timeout
         )
+        ready = True
         try:
-            ready = True
             try:
                 await connection.connect()
-            except* (MCPError, httpx2.HTTPError, TimeoutError, OSError, ValidationError):
-                ready = False
-            return ready
-        finally:
-            await connection.close()
+            finally:
+                await connection.close()
+        except* (MCPError, httpx2.HTTPError, TimeoutError, OSError, ValidationError):
+            ready = False
+        return ready
 
     async def start_tool_container(self, image_name: str, container_name: str = None, command: List[str] = None, environment: Dict[str, str] = None, volumes: Dict[str, Dict[str, str]] = None) -> str:
         """Starts a Docker container for an MCP tool. Returns the container name."""
@@ -257,12 +258,7 @@ class MCPToolManager:
                     return container_name
                 else:
                     logger.info(f"Container {container_name} exists but not running (status={container.status}). Removing and recreating...")
-                    try:
-                        await asyncio.to_thread(container.remove, force=True)
-                    except docker.errors.APIError as e:
-                        logger.warning(f"Error removing stale container: {e}")
-                    except Exception as e:
-                        logger.warning(f"Unexpected error removing stale container: {e}", exc_info=True)
+                    await self._remove_container(container_name, container)
             except NotFound:
                 pass
 
@@ -357,6 +353,21 @@ class MCPToolManager:
         logger.info("Connected to %s; found %s tools", container_name, len(tools))
         return tools
 
+    async def _remove_container(self, name: str, container) -> None:
+        """Remove a container and require its name to become reusable."""
+        try:
+            await asyncio.to_thread(container.remove, force=True)
+        except NotFound:
+            return
+        for attempt in range(MCP_MAX_CONNECTION_ATTEMPTS):
+            try:
+                await asyncio.to_thread(self.docker_client.containers.get, name)
+            except NotFound:
+                return
+            if attempt + 1 < MCP_MAX_CONNECTION_ATTEMPTS:
+                await asyncio.sleep(MCP_CONNECTION_RETRY_DELAY)
+        raise TimeoutError(f"MCP container {name!r} is still registered after removal")
+
     async def stop_tool(self, container_name: str) -> bool:
         """Stops a tool, closes connection, and stops container.
 
@@ -376,9 +387,10 @@ class MCPToolManager:
                 # bookkeeping on failure so a later unload can rejoin cleanup.
                 try:
                     await asyncio.to_thread(container.stop)
-                    await asyncio.to_thread(container.remove, force=True)
                 except NotFound:
                     pass
+                finally:
+                    await self._remove_container(container_name, container)
 
             del self.active_tools[container_name]
             logger.info(f"Stopped tool {container_name}")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import logging
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
 
@@ -12,6 +13,9 @@ from mcp import Client, types
 from mcp.client.streamable_http import streamable_http_client
 
 from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSION_CLOSE_TIMEOUT_DEFAULT
+
+
+logger = logging.getLogger(__name__)
 
 
 class _ConnectionResources(AsyncExitStack):
@@ -76,6 +80,8 @@ class MCPConnection:
         # Deliver startup failures to connect immediately instead of waiting
         # for the connection timeout and hiding the original error.
         error = None if task.cancelled() else task.exception()
+        if error is not None:
+            logger.warning("MCP connection owner failed", exc_info=error)
         if self._ready is not None and not self._ready.done():
             if error is not None:
                 self._ready.set_exception(error)
@@ -155,6 +161,7 @@ class MCPConnection:
         task = self._task
         if task is None:
             return
+        already_done = task.done()
         if not task.cancelling():
             task.cancel()
         try:
@@ -162,7 +169,9 @@ class MCPConnection:
             # with cancellation of this caller. A cancelled caller retains the
             # owner so shutdown can be rejoined; the owner bounds its cleanup.
             await asyncio.wait({task})
-            if not task.cancelled():
+            # A historical transport failure is already observed/logged by
+            # the owner callback. It must not masquerade as a new close error.
+            if not task.cancelled() and not already_done:
                 task.result()
         finally:
             if task.done():

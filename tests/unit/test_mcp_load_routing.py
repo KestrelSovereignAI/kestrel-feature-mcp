@@ -112,7 +112,7 @@ async def test_load_stdio_server_delegates_to_gateway(monkeypatch):
         def __init__(self):
             self.is_connected = False
             self.tools = {}
-            self.gateway = SimpleNamespace(enabled_servers={"time"})
+            self.gateway = SimpleNamespace(requested_servers={"time"})
 
         async def start(self, servers):
             started["servers"] = servers
@@ -152,7 +152,7 @@ async def test_load_native_image_uses_container_path(monkeypatch):
 async def test_unload_routes_gateway_server_to_gateway_disable():
     gw = MagicMock()
     gw.is_connected = True
-    gw.gateway = SimpleNamespace(enabled_servers={"time", "fetch"})
+    gw.gateway = SimpleNamespace(requested_servers={"time", "fetch"})
     gw.disable_server = AsyncMock()
     feat = _feature(manager=MagicMock(), gateway=gw)
     feat._mount_gateway_tools = MagicMock(return_value=3)
@@ -180,12 +180,12 @@ async def test_call_tool_routes_gateway_owner_to_gateway():
 @pytest.mark.asyncio
 async def test_load_via_gateway_does_not_persist_failed_enable(monkeypatch):
     # enable_server reconnects to prior servers (returns their tools) but the
-    # requested server never lands in enabled_servers -> must fail, not persist.
+    # requested server never lands in requested_servers -> must fail, not persist.
     monkeypatch.setattr("kestrel_feature_mcp.feature.check_docker_mcp_available", lambda: True)
     gw = MagicMock()
     gw.is_connected = True
     gw.tools = {"fetch": object()}
-    gw.gateway = SimpleNamespace(enabled_servers={"fetch"})  # 'broken' never added
+    gw.gateway = SimpleNamespace(requested_servers={"fetch"})  # 'broken' never added
     gw.enable_server = AsyncMock(return_value=[SimpleNamespace(name="fetch")])
     gw.get_all_tools = MagicMock(return_value=[{"name": "fetch", "description": "", "inputSchema": {}}])
     feat = _feature(manager=MagicMock(), gateway=gw)
@@ -203,7 +203,7 @@ async def test_unload_accepts_image_alias_for_gateway_server():
     # alias must hit the gateway server, not fall through to container unload.
     gw = MagicMock()
     gw.is_connected = True
-    gw.gateway = SimpleNamespace(enabled_servers={"time", "fetch"})
+    gw.gateway = SimpleNamespace(requested_servers={"time", "fetch"})
     gw.disable_server = AsyncMock()
     feat = _feature(manager=MagicMock(), gateway=gw)
     feat._mount_gateway_tools = MagicMock(return_value=2)
@@ -219,7 +219,7 @@ async def test_unload_accepts_image_alias_for_gateway_server():
 async def test_unload_last_gateway_server_stops_gateway():
     gw = MagicMock()
     gw.is_connected = True
-    gw.gateway = SimpleNamespace(enabled_servers={"time"})
+    gw.gateway = SimpleNamespace(requested_servers={"time"})
     gw.stop = AsyncMock()
     feat = _feature(manager=MagicMock(), gateway=gw)
     feat._forget_server = AsyncMock()
