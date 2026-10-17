@@ -20,7 +20,7 @@ import hashlib
 import json
 from contextlib import ExitStack
 from functools import wraps
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Awaitable, Callable
 
 import docker
 from docker.errors import NotFound
@@ -446,14 +446,24 @@ class MCPToolManager:
         logger.info(f"stop_tool: no active container named {container_name}")
         return False
 
-    async def call_tool(self, container_name: str, tool_name: str, arguments: dict = None):
-        """Calls a tool on a specific container."""
+    def tool_caller(self, container_name: str) -> Callable[..., Awaitable[Any]]:
+        """Bind a mounted handle to the connection that advertised its schema."""
         info = self.owned_containers.get(container_name)
         if info is None or info["connection"] is None or info["tools"] is None:
             raise ValueError(f"Tool {container_name} not connected")
-
         connection = info["connection"]
-        return await connection.call_tool(tool_name, arguments or {})
+
+        async def call(tool_name: str, arguments: dict = None):
+            if (self.owned_containers.get(container_name) is not info
+                    or info["connection"] is not connection or info["tools"] is None):
+                raise ValueError(f"MCP connection {container_name} changed; rediscover its tools before calling")
+            return await connection.call_tool(tool_name, arguments or {})
+
+        return call
+
+    async def call_tool(self, container_name: str, tool_name: str, arguments: dict = None):
+        """Call a currently published container connection."""
+        return await self.tool_caller(container_name)(tool_name, arguments)
 
     def get_all_tools(self):
         """Returns a list of all available tools across all containers."""
@@ -563,15 +573,24 @@ class MCPGatewayManager:
         auth_token = await self.gateway.remove_server(server_name)
         return await self._connect(auth_token)
 
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any] = None):
-        """Call a tool through the gateway."""
+    def tool_caller(self) -> Callable[..., Awaitable[Any]]:
+        """Bind a mounted handle to this gateway's advertised connection."""
         if self.connection is None:
             raise RuntimeError("Not connected to gateway")
+        connection = self.connection
 
-        if tool_name not in self.tools:
-            raise ValueError(f"Unknown tool: {tool_name}. Available: {list(self.tools.keys())}")
+        async def call(tool_name: str, arguments: Dict[str, Any] = None):
+            if self.connection is not connection:
+                raise ValueError("MCP gateway connection changed; rediscover its tools before calling")
+            if tool_name not in self.tools:
+                raise ValueError(f"Unknown tool: {tool_name}. Available: {list(self.tools.keys())}")
+            return await connection.call_tool(tool_name, arguments or {})
 
-        return await self.connection.call_tool(tool_name, arguments or {})
+        return call
+
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any] = None):
+        """Call the currently published gateway connection."""
+        return await self.tool_caller()(tool_name, arguments)
 
     def get_all_tools(self) -> List[Dict[str, Any]]:
         """Get all available tools."""

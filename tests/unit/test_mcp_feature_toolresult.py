@@ -91,80 +91,8 @@ class TestDockerUnavailableFails:
         assert result.status is ToolResultStatus.ERROR
 
     @pytest.mark.asyncio
-    async def test_call_tool_without_manager(self):
-        result = await _make_feature(manager=None).call_tool("c", "t", {})
-        assert result.status is ToolResultStatus.ERROR
-
-    @pytest.mark.asyncio
-    async def test_gateway_call_without_gateway(self):
-        result = await _make_feature(gateway=None).gateway_call("fetch")
-        assert result.status is ToolResultStatus.ERROR
-        assert "not running" in (result.error or "")
-
-    @pytest.mark.asyncio
     async def test_gateway_stop_when_idle_is_ok(self):
         # Stopping an already-stopped gateway is idempotent, not an error.
         result = await _make_feature(gateway=None).gateway_stop()
         assert result.status is ToolResultStatus.OK
 
-
-# ---------------------------------------------------------------------------
-# MCP tool-level failures (CallToolResult.is_error=True) must surface as ERROR,
-# not OK — MCP signals these without raising.
-# ---------------------------------------------------------------------------
-class TestIsErrorSurfacesAsFailed:
-    @staticmethod
-    def _error_result():
-        from types import SimpleNamespace
-        return SimpleNamespace(
-            content=[SimpleNamespace(text="tool blew up")],
-            is_error=True,
-        )
-
-    @pytest.mark.asyncio
-    async def test_legacy_call_tool_iserror_is_failed(self):
-        from unittest.mock import AsyncMock
-        manager = MagicMock()
-        manager.call_tool = AsyncMock(return_value=self._error_result())
-        result = await _make_feature(manager=manager).call_tool("c", "t", {})
-        assert result.status is ToolResultStatus.ERROR
-        assert "tool blew up" in (result.error or "")
-
-    @pytest.mark.asyncio
-    async def test_gateway_call_iserror_is_failed(self):
-        from unittest.mock import AsyncMock
-        gw = MagicMock()
-        gw.is_connected = True
-        gw.call_tool = AsyncMock(return_value=self._error_result())
-        result = await _make_feature(gateway=gw).gateway_call("fetch", {})
-        assert result.status is ToolResultStatus.ERROR
-        assert "tool blew up" in (result.error or "")
-
-    @pytest.mark.asyncio
-    async def test_gateway_call_success_is_ok(self):
-        from types import SimpleNamespace
-        from unittest.mock import AsyncMock
-        ok_result = SimpleNamespace(content=[SimpleNamespace(text="hello")], is_error=False)
-        gw = MagicMock()
-        gw.is_connected = True
-        gw.call_tool = AsyncMock(return_value=ok_result)
-        result = await _make_feature(gateway=gw).gateway_call("fetch", {})
-        assert result.status is ToolResultStatus.OK
-        assert "hello" in result.confirmation
-
-    @pytest.mark.asyncio
-    async def test_multi_block_content_is_preserved(self):
-        """All content blocks must survive — not just the first."""
-        from types import SimpleNamespace
-        from unittest.mock import AsyncMock
-        multi = SimpleNamespace(
-            content=[SimpleNamespace(text="block-one"), SimpleNamespace(text="block-two")],
-            is_error=False,
-        )
-        gw = MagicMock()
-        gw.is_connected = True
-        gw.call_tool = AsyncMock(return_value=multi)
-        result = await _make_feature(gateway=gw).gateway_call("fetch", {})
-        assert result.status is ToolResultStatus.OK
-        assert "block-one" in result.confirmation
-        assert "block-two" in result.confirmation

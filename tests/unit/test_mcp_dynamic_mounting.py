@@ -220,6 +220,43 @@ async def test_saved_container_mode_never_reenters_environment_dependent_routing
 # ---------------------------------------------------------------------------
 # Wrapper + schema
 # ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_container_mount_keeps_the_connection_that_advertised_its_schema(mcp_http_server):
+    feature, manager, name = _native_container_feature(mcp_http_server, "acme/native:latest")
+    owner = _container_owner(name)
+    try:
+        assert (await feature.load_tool("acme/native:latest")).status is ToolResultStatus.OK
+        original = next(tool for tool in feature.agent.registered[owner] if tool._real_name == "echo")
+        assert (await original.execute(text="original"))["status"] == "ok"
+        assert (await feature.load_tool("acme/native:latest")).status is ToolResultStatus.OK
+        assert (await original.execute(text="stale"))["status"] == "error"
+        current = next(tool for tool in feature.agent.registered[owner] if tool._real_name == "echo")
+        assert (await current.execute(text="current"))["confirmation"] == "current"
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_gateway_mount_keeps_the_connection_that_advertised_its_schema(mcp_http_server):
+    from kestrel_feature_mcp.manager import MCPGatewayManager
+
+    manager = MCPGatewayManager()
+    manager.gateway = SimpleNamespace(endpoint_url=mcp_http_server.url, is_running=True)
+    feature = _feature(gateway=manager)
+    try:
+        await manager._connect("test")
+        feature._mount_gateway_tools()
+        original = next(tool for tool in feature.agent.registered[_GATEWAY_OWNER] if tool._real_name == "echo")
+        assert (await original.execute(text="original"))["status"] == "ok"
+        await manager._connect("test")
+        feature._mount_gateway_tools()
+        assert (await original.execute(text="stale"))["status"] == "error"
+        current = next(tool for tool in feature.agent.registered[_GATEWAY_OWNER] if tool._real_name == "echo")
+        assert (await current.execute(text="current"))["confirmation"] == "current"
+    finally:
+        await manager._disconnect()
+
+
 class TestWrapper:
     @pytest.mark.asyncio
     async def test_execute_returns_dict_envelope_ok(self):
@@ -279,10 +316,11 @@ class TestWrapper:
 # Mount / unmount wiring
 # ---------------------------------------------------------------------------
 class TestMounting:
-    def test_host_without_registry_degrades(self):
+    def test_host_without_registry_is_refused(self):
         feat = _feature(MagicMock(spec=[]))  # no register_dynamic_tools attr
         assert feat._host_supports_dynamic_tools() is False
-        assert feat._mount_tools("mcp:x", "x", [{"name": "t"}], AsyncMock()) == 0
+        with pytest.raises(RuntimeError, match="dynamic tool registry"):
+            feat._mount_tools("mcp:x", "x", [{"name": "t"}], AsyncMock())
 
     def test_mount_refreshes_then_registers(self):
         host = _FakeHost()
@@ -300,6 +338,7 @@ class TestMounting:
         gw.is_connected = True
         gw.get_all_tools.return_value = [{"name": "fetch", "description": "d", "inputSchema": {}}]
         gw.call_tool = AsyncMock(return_value=_result("page"))
+        gw.tool_caller.return_value = gw.call_tool
         feat = _feature(host, gateway=gw)
 
         mounted = feat._mount_gateway_tools()

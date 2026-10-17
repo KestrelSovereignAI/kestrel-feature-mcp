@@ -273,6 +273,67 @@ async def test_gateway_uses_same_native_client_with_its_bearer_token(mcp_http_se
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["record", "connection", "catalog"])
+async def test_bound_container_caller_rejects_withdrawn_identity_before_io(mcp_http_server, change):
+    manager = container_manager(mcp_http_server.url)
+    replacement = MCPConnection(mcp_http_server.url)
+    original = None
+    try:
+        await manager.connect_to_tool("test")
+        info = manager.owned_containers["test"]
+        original = info["connection"]
+        bound = manager.tool_caller("test")
+        assert (await bound("echo", {"text": "original"})).content[0].text == "original"
+        if change == "record":
+            manager.owned_containers["test"] = dict(info)
+        elif change == "connection":
+            await replacement.connect()
+            info["connection"] = replacement
+        else:
+            info["tools"] = None
+        count = len(mcp_http_server.requests)
+        assert original.is_connected  # Publication, rather than a dead socket, must refuse it.
+        with pytest.raises(ValueError, match="changed; rediscover"):
+            await bound("echo", {"text": "stale"})
+        assert len(mcp_http_server.requests) == count
+    finally:
+        await replacement.close()
+        if original is not None:
+            await original.close()
+        await manager._drop_connection("test")
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["disconnect", "connection"])
+async def test_bound_gateway_caller_does_not_follow_a_replacement(mcp_http_server, change):
+    manager = MCPGatewayManager()
+    manager.gateway = SimpleNamespace(endpoint_url=mcp_http_server.url, is_running=True)
+    replacement = MCPConnection(mcp_http_server.url)
+    original = None
+    try:
+        await manager._connect("test")
+        original = manager.connection
+        bound = manager.tool_caller()
+        assert (await bound("echo", {"text": "original"})).content[0].text == "original"
+        if change == "connection":
+            await replacement.connect()
+            manager.connection = replacement
+        else:
+            manager.connection = None
+        count = len(mcp_http_server.requests)
+        assert original.is_connected
+        with pytest.raises(ValueError, match="changed; rediscover"):
+            await bound("echo", {"text": "stale"})
+        assert len(mcp_http_server.requests) == count
+    finally:
+        await replacement.close()
+        if original is not None:
+            await original.close()
+        await manager._disconnect()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mcp_http_server", [{"list_delay": 0.25}], indirect=True)
 @pytest.mark.parametrize("kind", ["gateway", "container"])
 async def test_list_timeout_never_publishes_a_dead_manager(monkeypatch, mcp_http_server, kind):

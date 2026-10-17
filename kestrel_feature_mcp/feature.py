@@ -21,7 +21,7 @@ from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
-from .dynamic_tools import build_wrappers, extract_mcp_result as _extract_mcp_result
+from .dynamic_tools import build_wrappers
 from .images import normalize_image_ref
 from .registry import (
     get_registry,
@@ -91,14 +91,13 @@ class MCPAgent(Feature):
     def _host_supports_dynamic_tools(self) -> bool:
         """Whether the host exposes the dynamic-tool registry (#1979 PR2).
 
-        Older hosts lack it; we degrade gracefully to dispatcher-only (the
-        ``mcp_gateway_call`` / ``mcp_call_tool`` indirection) rather than fail.
+        MCP execution requires the host's governed dynamic-tool path.
         """
         agent = getattr(self, "agent", None)
         return (
             agent is not None
-            and hasattr(agent, "register_dynamic_tools")
-            and hasattr(agent, "unregister_dynamic_tools")
+            and callable(getattr(agent, "register_dynamic_tools", None))
+            and callable(getattr(agent, "unregister_dynamic_tools", None))
         )
 
     def _mount_tools(self, owner: str, handle_prefix: str, tool_dicts, caller) -> int:
@@ -106,10 +105,10 @@ class MCPAgent(Feature):
 
         Idempotent refresh: any previously-mounted tools for ``owner`` are
         dropped first, then the current set is registered. Returns the number
-        of tools mounted (0 when the host has no dynamic registry).
+        of tools mounted. A host without a dynamic registry is unsupported.
         """
         if not self._host_supports_dynamic_tools():
-            return 0
+            raise RuntimeError("MCP execution requires the host's governed dynamic tool registry")
         self.agent.unregister_dynamic_tools(owner)
         wrappers = build_wrappers(handle_prefix, tool_dicts, caller)
         return self.agent.register_dynamic_tools(owner, wrappers)
@@ -245,15 +244,15 @@ class MCPAgent(Feature):
 
         Used after start/enable — the gateway aggregates servers and reports a
         flat tool list, so we refresh the whole owner each time. The caller
-        reads ``self.gateway_manager`` at call time so it always targets the
-        current connection.
+        binds the connection that advertised these schemas; a pending approval
+        must not follow a later gateway reconfiguration.
         """
         if self.gateway_manager is None or not self.gateway_manager.is_connected:
             return 0
         tool_dicts = self.gateway_manager.get_all_tools()
         return self._mount_tools(
             _GATEWAY_OWNER, "gateway", tool_dicts,
-            lambda name, arguments: self.gateway_manager.call_tool(name, arguments),
+            self.gateway_manager.tool_caller(),
         )
 
     async def _resolve_load_route(self, server: str) -> tuple[str, str]:
@@ -343,7 +342,7 @@ class MCPAgent(Feature):
             tools = await self.manager.connect_to_tool(container_name)
             # Mount the container's tools as first-class LLM tools. The caller
             # closure binds the container; the host registry routes the call
-            # back through manager.call_tool with the tool's real MCP name.
+            # through the connection that advertised the tool's real MCP name.
             tool_dicts = [
                 t for t in (self.manager.get_all_tools() or [])
                 if t.get("container") == container_name
@@ -352,7 +351,7 @@ class MCPAgent(Feature):
             owner = _container_owner(container_name)
             mounted = self._mount_tools(
                 owner, container_name, tool_dicts,
-                lambda name, arguments, c=container_name: self.manager.call_tool(c, name, arguments),
+                self.manager.tool_caller(container_name),
             )
             # Persist so this container is auto-restored on restart.
             await self._persist_server(
@@ -372,7 +371,7 @@ class MCPAgent(Feature):
             mount_note = (
                 f" Mounted {mounted} as callable tools."
                 if mounted else
-                " (Call them via mcp_call_tool — host has no dynamic registry.)"
+                " No callable tools were retained by the host registry."
             )
             return ToolResult.ok(
                 f"Loaded {image_name} as {container_name}. Tools: {', '.join(tool_names)}."
@@ -631,48 +630,6 @@ class MCPAgent(Feature):
             return ToolResult.failed(f"Failed to unload {server_name}: {str(e)}")
 
     @tool(
-        name="mcp_call_tool",
-        description="Call a tool on a specific MCP server.",
-        category=ToolCategory.SYSTEM,
-        command_prefix="!mcp-call"
-    )
-    async def call_tool(self, container_name: str, tool_name: str, args: Dict[str, Any]) -> ToolResult:
-        """Call a tool on a loaded server.
-
-        ``mcp_list_servers`` lists gateway-loaded tools under the synthetic
-        container ``"gateway"``; route that identifier to the gateway so every
-        listed tool is actually callable through this verb (container tools
-        still dispatch through the per-container manager).
-        """
-        if self.manager is None:
-            return ToolResult.failed("MCP tools are not available (Docker not accessible)")
-
-        try:
-            if container_name == "gateway":
-                gwm = self.gateway_manager
-                if gwm is None or not gwm.is_connected:
-                    return ToolResult.failed("Gateway not running; no 'gateway' tools to call.")
-                result = await gwm.call_tool(tool_name, args)
-            else:
-                result = await self.manager.call_tool(container_name, tool_name, args)
-            text, is_error = _extract_mcp_result(result)
-            if is_error:
-                return ToolResult.failed(
-                    f"Tool '{tool_name}' reported an error:\n{text}",
-                    data={"container": container_name, "tool": tool_name},
-                )
-            return ToolResult.ok(
-                f"Result:\n{text}",
-                data={"container": container_name, "tool": tool_name},
-            )
-        except ValueError as e:
-            logger.error(f"Tool not found or invalid arguments: {e}")
-            return ToolResult.failed(f"Tool execution failed: {str(e)}")
-        except Exception as e:
-            logger.error(f"Tool execution failed: {e}", exc_info=True)
-            return ToolResult.failed(f"Tool execution failed: {str(e)}")
-
-    @tool(
         name="mcp_search",
         description="Search available MCP servers by capability, name, or category.",
         category=ToolCategory.SYSTEM,
@@ -833,7 +790,7 @@ class MCPAgent(Feature):
             mount_note = (
                 f"\n\n**Mounted {mounted} tools** — call them directly."
                 if mounted else
-                "\n\nUse `!mcp-gateway-call <tool> <args>` to call tools."
+                "\n\nNo callable tools were retained by the host registry."
             )
             tools_line = (
                 f"**Tools:** {', '.join(tool_names[:10])}"
@@ -897,43 +854,6 @@ class MCPAgent(Feature):
         except Exception as e:
             logger.error(f"Failed to stop gateway: {e}", exc_info=True)
             return ToolResult.failed(f"Failed to stop gateway: {str(e)}")
-
-    @tool(
-        name="mcp_gateway_call",
-        description="Call a tool through the Docker MCP Gateway.",
-        category=ToolCategory.SYSTEM,
-        command_prefix="!mcp-gateway-call"
-    )
-    async def gateway_call(self, tool_name: str, arguments: Dict[str, Any] = None) -> ToolResult:
-        """
-        Call a tool through the gateway.
-
-        Args:
-            tool_name: Name of the tool to call
-            arguments: Tool arguments as JSON object
-        """
-        if self.gateway_manager is None or not self.gateway_manager.is_connected:
-            return ToolResult.failed("Gateway not running. Use `!mcp-gateway-start` first.")
-
-        try:
-            result = await self.gateway_manager.call_tool(tool_name, arguments or {})
-            text, is_error = _extract_mcp_result(result)
-            if is_error:
-                return ToolResult.failed(
-                    f"**{tool_name}** reported an error:\n\n{text}",
-                    data={"tool": tool_name},
-                )
-            return ToolResult.ok(
-                f"**{tool_name}** result:\n\n{text}",
-                data={"tool": tool_name},
-            )
-
-        except (ValueError, RuntimeError) as e:
-            logger.error(f"Gateway tool call failed: {e}")
-            return ToolResult.failed(f"Tool call failed: {str(e)}")
-        except Exception as e:
-            logger.error(f"Gateway tool call failed: {e}", exc_info=True)
-            return ToolResult.failed(f"Tool call failed: {str(e)}")
 
     @tool(
         name="mcp_gateway_tools",

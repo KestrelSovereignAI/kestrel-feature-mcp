@@ -125,6 +125,11 @@ async def test_load_stdio_server_delegates_to_gateway(monkeypatch):
                 {"name": "convert_time", "description": "d", "inputSchema": {}},
             ]
 
+        def tool_caller(self):
+            async def unexpected_call(*args):
+                raise AssertionError("The routing fixture must not execute remote tools")
+            return unexpected_call
+
     monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", _FakeGatewayMgr)
 
     res = await feat.load_tool("time")
@@ -162,19 +167,6 @@ async def test_unload_routes_gateway_server_to_gateway_disable():
     assert res.status is ToolResultStatus.OK
     gw.disable_server.assert_awaited_once_with("time")
     feat._forget_server.assert_awaited_once_with("time")
-
-
-@pytest.mark.asyncio
-async def test_call_tool_routes_gateway_owner_to_gateway():
-    # Tools listed as container="gateway" must be callable via mcp_call_tool.
-    gw = MagicMock()
-    gw.is_connected = True
-    gw.call_tool = AsyncMock(return_value=SimpleNamespace(
-        content=[SimpleNamespace(text="17:24 UTC")], is_error=False))
-    feat = _feature(manager=MagicMock(), gateway=gw)
-    res = await feat.call_tool("gateway", "get_current_time", {"timezone": "UTC"})
-    assert res.status is ToolResultStatus.OK
-    gw.call_tool.assert_awaited_once_with("get_current_time", {"timezone": "UTC"})
 
 
 @pytest.mark.asyncio

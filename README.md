@@ -23,12 +23,24 @@ Once installed, the `MCPAgent` feature is automatically discovered by kestrel-so
 
 - `!mcp-gateway-start <servers>` — Start Docker MCP Gateway
 - `!mcp-gateway-stop` — Stop gateway
-- `!mcp-gateway-call <tool> <args>` — Call tool through gateway
 - `!mcp-load <image>` — Load MCP server from Docker image
 - `!mcp-unload <container>` — Unload a container and remove its saved connection
 - `!mcp-list` — List running MCP servers
 - `!mcp-search <query>` — Search MCP catalog
 - `!mcp-catalog` — List all available servers
+
+## Calling tools
+
+Discovered server tools are mounted in the host's dynamic registry. Invoke the
+advertised handle through Kestrel's governed tool dispatch; its exact owner and
+handle determine permissions, approvals and audit records. The generic
+`mcp_call_tool` / `mcp_gateway_call` tools and their command aliases have been
+removed: allowing a generic dispatcher could otherwise bypass a DENY on its
+target. A host without the dynamic registry cannot mount MCP tools.
+
+Each handle is bound to the connection that advertised its schema. Reloading or
+withdrawing that connection invalidates its old handles, including a call still
+waiting for approval. A fresh handle and approval are required after reload.
 
 ## Configuration
 
