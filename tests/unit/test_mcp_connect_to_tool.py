@@ -120,10 +120,15 @@ async def test_failed_retirement_unpublishes_tools_and_prevents_container_restar
 
 
 @pytest.mark.asyncio
-async def test_healthcheck_failure_keeps_the_container_owned_for_unload():
+@pytest.mark.parametrize("initial_state", ["existing", "new"])
+async def test_healthcheck_failure_keeps_the_container_owned_for_unload(initial_state):
     manager = MCPToolManager(docker_client=MagicMock())
     container = MagicMock(status="running")
     manager.docker_client.containers.get.return_value = container
+    if initial_state == "new":
+        # The second inspection retrieves logs after the failed healthcheck.
+        manager.docker_client.containers.get.side_effect = [NotFound("absent"), container]
+        manager.docker_client.containers.run.return_value = container
     manager._wait_for_container_ready = AsyncMock(side_effect=TimeoutError("healthcheck failed"))
     with pytest.raises(TimeoutError, match="healthcheck failed"):
         await manager.start_tool_container("image", container_name="owned")
