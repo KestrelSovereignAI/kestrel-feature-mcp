@@ -20,15 +20,12 @@ from kestrel_feature_mcp.gateway import (
     DockerMCPGateway,
     DockerMCPGatewayError,
     DockerMCPNotInstalledError,
-    list_available_servers,
-    list_enabled_servers,
 )
 from kestrel_feature_mcp.manager import MCPGatewayManager
 from kestrel_feature_mcp.registry import (
     check_docker_mcp_available,
     list_docker_catalog_servers,
     search_docker_catalog,
-    format_docker_catalog_summary,
 )
 
 # Configure logging
@@ -60,12 +57,6 @@ class TestDockerMCPAvailability:
         # This should return True or False, not raise
         assert isinstance(result, bool)
 
-    def test_format_docker_catalog_summary(self):
-        """Test catalog summary formatting."""
-        summary = format_docker_catalog_summary()
-        assert isinstance(summary, str)
-        # Should either show server count or indicate not installed
-        assert "Docker MCP" in summary or "not installed" in summary.lower()
 
 
 class TestDockerMCPCatalog:
@@ -140,7 +131,7 @@ class TestDockerMCPGateway:
         assert auth_token is not None
         assert len(auth_token) > 10
         assert gateway.is_running
-        assert "fetch" in gateway.enabled_servers
+        assert "fetch" in gateway.requested_servers
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(GATEWAY_TIMEOUT)
@@ -159,7 +150,7 @@ class TestDockerMCPGateway:
         """Test restarting gateway with different servers."""
         # Start with fetch
         token1 = await gateway.start(["fetch"])
-        assert "fetch" in gateway.enabled_servers
+        assert "fetch" in gateway.requested_servers
 
         # Restart with different servers
         token2 = await gateway.restart(["fetch", "time"])
@@ -172,12 +163,12 @@ class TestDockerMCPGateway:
     async def test_gateway_add_server(self, gateway):
         """Test adding a server to running gateway."""
         await gateway.start(["fetch"])
-        initial_servers = set(gateway.enabled_servers)
+        initial_servers = set(gateway.requested_servers)
 
         # Add time server
         await gateway.add_server("time")
-        assert "time" in gateway.enabled_servers
-        assert "fetch" in gateway.enabled_servers
+        assert "time" in gateway.requested_servers
+        assert "fetch" in gateway.requested_servers
 
 
 class TestMCPGatewayManager:

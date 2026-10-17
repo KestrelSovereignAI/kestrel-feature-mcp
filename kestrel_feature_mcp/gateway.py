@@ -8,7 +8,7 @@ Docker's 311+ server catalog.
 The gateway handles stdio->Streamable-HTTP conversion automatically, so we
 can use any MCP server regardless of its native transport. MCP deprecated the
 standalone HTTP+SSE transport (2025-03-26 spec) in favour of Streamable HTTP;
-``sse`` remains selectable only for legacy interop.
+Only Streamable HTTP is supported by this host.
 
 Usage:
     gateway = DockerMCPGateway()              # ephemeral port, streaming
@@ -21,9 +21,7 @@ import asyncio
 import contextlib
 import logging
 import os
-import re
 import secrets
-import shutil
 import socket
 import subprocess
 import threading
@@ -74,20 +72,20 @@ class DockerMCPGateway:
     """
     Manages the Docker MCP Gateway process.
 
-    The Docker MCP Gateway is a unified SSE endpoint that can expose
-    any MCP server from Docker's catalog. It handles the stdio->SSE
+    The Docker MCP Gateway is a unified Streamable HTTP endpoint that can expose
+    any MCP server from Docker's catalog. It handles the stdio->Streamable HTTP
     conversion automatically.
 
     Attributes:
-        port: TCP port for the SSE endpoint
+        port: TCP port for the Streamable HTTP endpoint
         process: The gateway subprocess
         auth_token: Bearer token for authentication
-        enabled_servers: Set of currently enabled server names
+        requested_servers: Requested server names passed to the gateway, not per-server readiness
     """
 
     #: MCP deprecated the standalone HTTP+SSE transport (2025-03-26 spec) in
     #: favour of Streamable HTTP. We default to the gateway's ``streaming``
-    #: transport; ``sse`` remains selectable only for legacy interop (#12).
+    #: transport. Legacy HTTP+SSE is no longer accepted.
     DEFAULT_TRANSPORT = "streaming"
 
     def __init__(
@@ -108,7 +106,7 @@ class DockerMCPGateway:
                            auto-stops. None = no timeout (default).
                            Recommended: 300-900 for agent sessions.
             transport: Gateway transport — ``streaming`` (Streamable HTTP, the
-                       current MCP standard, default) or ``sse`` (deprecated).
+                       current MCP standard). Other transports are refused.
             long_lived: Keep one container alive per server for the gateway's
                        lifetime (default True). Without it the gateway runs a
                        throwaway container per tool call, so stateful servers
@@ -116,6 +114,8 @@ class DockerMCPGateway:
                        in-process state between calls. The containers are reaped
                        when the gateway stops.
         """
+        if transport != self.DEFAULT_TRANSPORT:
+            raise ValueError("MCP gateway requires the streaming (Streamable HTTP) transport")
         self.transport = transport
         self.long_lived = long_lived
         # Remember whether a fixed port was requested; 0 means "pick a free one
@@ -126,9 +126,9 @@ class DockerMCPGateway:
         self.process: Optional[subprocess.Popen] = None
         # Streamable HTTP authenticates via the MCP_GATEWAY_AUTH_TOKEN env var
         # (the gateway prints no Bearer line), so we mint the token up-front and
-        # inject it. Legacy sse parses the token from stdout instead.
+        # inject it into the gateway process and send it on every request.
         self.auth_token: Optional[str] = None
-        self.enabled_servers: Set[str] = set()
+        self.requested_servers: Set[str] = set()
         self._timeout_task: Optional[asyncio.Task] = None
         self._start_time: Optional[float] = None
         # Single owner of the gateway's stdout for the process's whole life
@@ -140,10 +140,6 @@ class DockerMCPGateway:
         self._stdout_history: "deque[str]" = deque(maxlen=GATEWAY_LOG_HISTORY)
         self._startup_queue: Optional[asyncio.Queue] = None
         self._feed_startup_queue: bool = False
-
-    @property
-    def _is_streaming(self) -> bool:
-        return self.transport != "sse"
 
     @staticmethod
     def _find_free_port() -> int:
@@ -198,55 +194,6 @@ class DockerMCPGateway:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return None
 
-    async def _enable_server(self, server_name: str) -> bool:
-        """Enable a server in Docker MCP."""
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["docker", "mcp", "server", "enable", server_name],
-                capture_output=True,
-                text=True,
-                timeout=SSH_COMMAND_TIMEOUT_DEFAULT
-            )
-            if result.returncode == 0:
-                logger.info(f"Enabled MCP server: {server_name}")
-                self.enabled_servers.add(server_name)
-                return True
-            else:
-                logger.warning(f"Failed to enable {server_name}: {result.stderr}")
-                return False
-        except subprocess.TimeoutExpired:
-            logger.error(f"Timeout enabling server {server_name}")
-            return False
-
-    async def _disable_server(self, server_name: str) -> bool:
-        """Disable a server in Docker MCP."""
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["docker", "mcp", "server", "disable", server_name],
-                capture_output=True,
-                text=True,
-                timeout=SSH_COMMAND_TIMEOUT_DEFAULT
-            )
-            if result.returncode == 0:
-                logger.info(f"Disabled MCP server: {server_name}")
-                self.enabled_servers.discard(server_name)
-                return True
-            else:
-                logger.warning(f"Failed to disable {server_name}: {result.stderr}")
-                return False
-        except subprocess.TimeoutExpired:
-            logger.error(f"Timeout disabling server {server_name}")
-            return False
-
-    def _parse_auth_token(self, line: str) -> Optional[str]:
-        """Parse the auth token from gateway output (legacy sse transport)."""
-        match = re.search(r'Authorization:\s*Bearer\s+([a-zA-Z0-9]+)', line)
-        if match:
-            return match.group(1)
-        return None
-
     @staticmethod
     def _is_ready_line(line: str) -> bool:
         """Detect the streaming-transport readiness banner.
@@ -279,23 +226,22 @@ class DockerMCPGateway:
 
         await self.stop()
 
-        for server in servers:
-            await self._enable_server(server)
-
-        if not self.enabled_servers:
-            raise DockerMCPGatewayError(
-                f"Failed to enable any servers from: {servers}"
-            )
+        if not servers or any(not server or "," in server for server in servers):
+            raise ValueError("MCP gateway needs a non-empty list of server names")
+        # --servers is the gateway's authoritative per-process selection. The
+        # old global `docker mcp server enable` command was removed by Docker.
+        self.requested_servers = set(servers)
 
         # Resolve the port at bind time: an explicit port is honoured, otherwise
         # pick a fresh ephemeral one so two gateways never fight over :9000 (#12).
         self.port = self._requested_port or self._find_free_port()
 
-        servers_arg = ",".join(self.enabled_servers)
+        servers_arg = ",".join(sorted(self.requested_servers))
         cmd = [
             "docker", "mcp", "gateway", "run",
             f"--transport={self.transport}",
             f"--port={self.port}",
+            "--host=127.0.0.1",
             f"--servers={servers_arg}",
         ]
         if self.long_lived:
@@ -304,11 +250,8 @@ class DockerMCPGateway:
             cmd.append("--long-lived")
 
         env = dict(os.environ)
-        if self._is_streaming:
-            # Streamable HTTP has no token line to parse — mint one and inject
-            # it; the client sends it back as a Bearer header.
-            self.auth_token = secrets.token_hex(24)
-            env["MCP_GATEWAY_AUTH_TOKEN"] = self.auth_token
+        self.auth_token = secrets.token_hex(24)
+        env["MCP_GATEWAY_AUTH_TOKEN"] = self.auth_token
 
         logger.info(f"Starting Docker MCP Gateway: {' '.join(cmd)}")
 
@@ -374,41 +317,20 @@ class DockerMCPGateway:
 
             logger.debug(f"Gateway: {line.rstrip()}")
 
-            if self._is_streaming:
-                # e.g. "> Start streaming server on port 9477"
-                if self._is_ready_line(line):
-                    # Stop feeding the startup queue NOW, before the (up to
-                    # 10s) port wait — otherwise the drainer keeps enqueuing
-                    # into the unbounded queue during that window and nothing
-                    # drains it after startup (codex P2). The bounded history
-                    # deque keeps absorbing lines for error context.
-                    self._feed_startup_queue = False
-                    if not await self._wait_port_listening():
-                        await self.stop()
-                        raise DockerMCPGatewayError(
-                            "Gateway reported ready but the streaming port "
-                            f"{self.port} never accepted connections."
-                        )
-                    self._start_time = time.monotonic()
-                    logger.info(
-                        f"Gateway ready at {self.endpoint_url}"
-                    )
-                    if self.session_timeout:
-                        self._start_timeout_task()
-                    return self.auth_token
-                continue
-
-            token = self._parse_auth_token(line)
-            if token:
+            if self._is_ready_line(line):
+                # Stop queueing before waiting for the port. The stdout drainer
+                # remains active for the process lifetime, with bounded history.
                 self._feed_startup_queue = False
-                self.auth_token = token
+                if not await self._wait_port_listening():
+                    await self.stop()
+                    raise DockerMCPGatewayError(
+                        f"Gateway reported ready but port {self.port} never accepted connections"
+                    )
                 self._start_time = time.monotonic()
-                logger.info(f"Gateway ready at {self.endpoint_url}")
+                logger.info("Gateway ready at %s", self.endpoint_url)
                 if self.session_timeout:
                     self._start_timeout_task()
-                return token
-            if "Start sse server" in line or "Gateway URL:" in line:
-                continue
+                return self.auth_token
 
     def _drain_stdout(self, proc, loop, startup_queue) -> None:
         """Single lifelong owner of the gateway's stdout (F398).
@@ -518,28 +440,28 @@ class DockerMCPGateway:
                 self.auth_token = None
                 self._start_time = None
                 logger.info("Gateway stopped")
-        # enabled_servers tracks what THIS gateway process is serving; a stopped
+        # requested_servers tracks what THIS gateway process is serving; a stopped
         # gateway serves nothing. restart()/add_server()/remove_server() all
         # snapshot the desired list before calling stop(), so clearing here is
         # safe and keeps the set from accumulating stale servers across restarts.
-        self.enabled_servers.clear()
+        self.requested_servers.clear()
 
     async def restart(self, servers: List[str] = None) -> str:
         """Restart the gateway with optionally different servers."""
         if servers is None:
-            servers = list(self.enabled_servers)
+            servers = list(self.requested_servers)
         await self.stop()
         return await self.start(servers)
 
     async def add_server(self, server_name: str) -> str:
         """Add a server to the gateway (requires restart)."""
-        servers = list(self.enabled_servers)
+        servers = list(self.requested_servers)
         servers.append(server_name)
         return await self.restart(servers)
 
     async def remove_server(self, server_name: str) -> str:
         """Remove a server from the gateway (requires restart)."""
-        servers = list(self.enabled_servers)
+        servers = list(self.requested_servers)
         if server_name in servers:
             servers.remove(server_name)
         if not servers:
@@ -549,72 +471,10 @@ class DockerMCPGateway:
 
     @property
     def endpoint_url(self) -> str:
-        """The MCP endpoint URL for the active transport.
-
-        Streamable HTTP serves at ``/mcp``; legacy sse serves at ``/sse``.
-        """
-        path = "sse" if not self._is_streaming else "mcp"
-        return f"http://localhost:{self.port}/{path}"
-
-    @property
-    def sse_url(self) -> str:
-        """Deprecated alias for :attr:`endpoint_url` (kept for callers/tests)."""
-        return self.endpoint_url
+        """The gateway's Streamable HTTP endpoint."""
+        return f"http://localhost:{self.port}/mcp"
 
     @property
     def is_running(self) -> bool:
         """Check if the gateway is running."""
         return self.process is not None and self.process.poll() is None
-
-
-async def list_available_servers() -> List[str]:
-    """List all available servers from Docker MCP catalog."""
-    try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            ["docker", "mcp", "catalog", "show", "docker-mcp"],
-            capture_output=True,
-            text=True,
-            timeout=SSH_COMMAND_TIMEOUT_DEFAULT
-        )
-        if result.returncode != 0:
-            return []
-
-        servers = []
-        for line in result.stdout.split('\n'):
-            match = re.search(r'\*\*([a-zA-Z0-9_-]+)\*\*', line)
-            if match:
-                servers.append(match.group(1))
-
-        return servers
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return []
-
-
-async def list_enabled_servers() -> List[str]:
-    """List currently enabled servers in Docker MCP."""
-    try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            ["docker", "mcp", "server", "ls"],
-            capture_output=True,
-            text=True,
-            timeout=SSH_COMMAND_TIMEOUT_DEFAULT
-        )
-        if result.returncode != 0:
-            return []
-
-        servers = []
-        in_table = False
-        for line in result.stdout.split('\n'):
-            if 'NAME' in line and 'DESCRIPTION' in line:
-                in_table = True
-                continue
-            if in_table and line.strip() and not line.startswith('-'):
-                parts = line.split()
-                if parts:
-                    servers.append(parts[0])
-
-        return servers
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return []

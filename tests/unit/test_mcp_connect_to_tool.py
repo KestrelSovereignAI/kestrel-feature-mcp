@@ -1,62 +1,97 @@
-"""Unit tests for ``MCPToolManager`` reconnect behavior.
+"""Container reconnect retires the old native connection before publishing another."""
 
-Regression chain (Emma's MCP lifecycle dogfood):
-- ``connect_to_tool`` did a bare ``return`` (None) on the already-connected
-  branch, so re-loading a running container made ``MCPFeature.load_tool`` crash
-  on ``[t.name for t in tools]`` ('NoneType' object is not iterable) and report
-  a false failure.
-- The caller (``load_tool``) restarts an already-running container for a clean
-  state first, so the cached SSE session is stale — returning the cached tools
-  would report success over a dead connection. The fix tears the stale session
-  down (``_drop_stale_session``) and reconnects fresh.
-"""
-
-import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kestrel_feature_mcp.manager import MCPToolManager
-
-
-def _manager_without_docker() -> MCPToolManager:
-    # The reconnect-teardown path never touches Docker; build the instance
-    # without the Docker-requiring __init__ so this runs in CI.
-    return MCPToolManager.__new__(MCPToolManager)
+from kestrel_feature_mcp.manager import MCPToolManager, MCPGatewayManager
+from docker.errors import APIError, NotFound
 
 
 @pytest.mark.asyncio
-async def test_drop_stale_session_cancels_task_and_forgets_entry():
-    mgr = _manager_without_docker()
-
-    async def _idle():
-        await asyncio.sleep(3600)
-
-    stale_task = asyncio.ensure_future(_idle())
-    await asyncio.sleep(0)  # let it start
-    mgr.active_tools = {
-        "mcp-test": {"tools": [object()], "task": stale_task}
-    }
-
-    await mgr._drop_stale_session("mcp-test")
-
-    # Entry forgotten so a fresh connect can rebind, and the stale session
-    # task is cancelled (no leaked connection to the dead process).
-    assert "mcp-test" not in mgr.active_tools
-    assert stale_task.cancelled()
+async def test_drop_connection_closes_owner_and_forgets_entry():
+    manager = MCPToolManager(docker_client=MagicMock())
+    connection = AsyncMock()
+    manager.active_tools = {"old": {"connection": connection}, "other": {}}
+    await manager._drop_connection("old")
+    connection.close.assert_awaited_once()
+    assert manager.active_tools == {"other": {}}
 
 
 @pytest.mark.asyncio
-async def test_drop_stale_session_is_a_noop_when_not_connected():
-    mgr = _manager_without_docker()
-    mgr.active_tools = {}
-    # Must not raise when there's nothing to drop.
-    await mgr._drop_stale_session("never-loaded")
-    assert mgr.active_tools == {}
+async def test_drop_connection_is_noop_when_not_connected():
+    manager = MCPToolManager(docker_client=MagicMock())
+    await manager._drop_connection("missing")
+    assert manager.active_tools == {}
 
 
 @pytest.mark.asyncio
-async def test_drop_stale_session_handles_missing_task_key():
-    mgr = _manager_without_docker()
-    mgr.active_tools = {"mcp-test": {"tools": []}}  # no 'task'
-    await mgr._drop_stale_session("mcp-test")
-    assert "mcp-test" not in mgr.active_tools
+async def test_failed_teardown_preserves_entry_for_retry():
+    manager = MCPToolManager(docker_client=MagicMock())
+    connection = AsyncMock()
+    connection.close.side_effect = OSError("close failed")
+    manager.active_tools["old"] = {"connection": connection}
+    with pytest.raises(OSError, match="close failed"):
+        await manager._drop_connection("old")
+    assert manager.active_tools["old"]["connection"] is connection
+
+
+@pytest.mark.asyncio
+async def test_stop_still_reclaims_container_when_connection_teardown_fails():
+    manager = MCPToolManager(docker_client=MagicMock())
+    connection = AsyncMock()
+    connection.close.side_effect = OSError("close failed")
+    container = MagicMock()
+    manager.docker_client.containers.get.side_effect = NotFound("removed")
+    manager.active_tools["test"] = {"connection": connection, "container": container, "tools": []}
+    with pytest.raises(OSError, match="close failed"):
+        await manager.stop_tool("test")
+    container.stop.assert_called_once()
+    container.remove.assert_called_once_with(force=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["stop", "remove"])
+async def test_docker_cleanup_failure_is_explicit_and_preserves_retry(operation):
+    manager = MCPToolManager(docker_client=MagicMock())
+    connection = AsyncMock()
+    container = MagicMock()
+    getattr(container, operation).side_effect = APIError("daemon refused cleanup")
+    manager.docker_client.containers.get.side_effect = NotFound("removed")
+    manager.active_tools["test"] = {"connection": connection, "container": container, "tools": []}
+    with pytest.raises(APIError, match="daemon refused cleanup"):
+        await manager.stop_tool("test")
+    assert manager.active_tools["test"]["connection"] is connection
+    container.remove.assert_called_once_with(force=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_gateway_disconnect_retains_owner_for_cleanup_retry():
+    manager = MCPGatewayManager()
+    connection = AsyncMock()
+    connection.close.side_effect = OSError("close failed")
+    manager.connection = connection
+    manager.tools = {"echo": object()}
+    with pytest.raises(OSError, match="close failed"):
+        await manager._disconnect()
+    assert manager.connection is connection
+    assert manager.tools == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("removed", [False, True])
+async def test_removal_is_confirmed_before_reporting_unload(monkeypatch, removed):
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCP_REMOVAL_ATTEMPTS", 2)
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCP_REMOVAL_RETRY_DELAY", 0)
+    manager = MCPToolManager(docker_client=MagicMock())
+    container = MagicMock()
+    manager.active_tools["test"] = {"connection": AsyncMock(), "container": container, "tools": []}
+    manager.docker_client.containers.get.side_effect = [container, NotFound("removed")] if removed else [container, container]
+    if removed:
+        assert await manager.stop_tool("test")
+        assert "test" not in manager.active_tools
+    else:
+        with pytest.raises(TimeoutError, match="still registered"):
+            await manager.stop_tool("test")
+        assert "test" in manager.active_tools
+    assert manager.docker_client.containers.get.call_count == 2

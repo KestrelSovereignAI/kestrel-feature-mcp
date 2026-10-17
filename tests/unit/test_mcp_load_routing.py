@@ -112,7 +112,7 @@ async def test_load_stdio_server_delegates_to_gateway(monkeypatch):
         def __init__(self):
             self.is_connected = False
             self.tools = {}
-            self.gateway = SimpleNamespace(enabled_servers={"time"})
+            self.gateway = SimpleNamespace(requested_servers={"time"})
 
         async def start(self, servers):
             started["servers"] = servers
@@ -152,7 +152,7 @@ async def test_load_native_image_uses_container_path(monkeypatch):
 async def test_unload_routes_gateway_server_to_gateway_disable():
     gw = MagicMock()
     gw.is_connected = True
-    gw.gateway = SimpleNamespace(enabled_servers={"time", "fetch"})
+    gw.gateway = SimpleNamespace(requested_servers={"time", "fetch"})
     gw.disable_server = AsyncMock()
     feat = _feature(manager=MagicMock(), gateway=gw)
     feat._mount_gateway_tools = MagicMock(return_value=3)
@@ -170,31 +170,11 @@ async def test_call_tool_routes_gateway_owner_to_gateway():
     gw = MagicMock()
     gw.is_connected = True
     gw.call_tool = AsyncMock(return_value=SimpleNamespace(
-        content=[SimpleNamespace(text="17:24 UTC")], isError=False))
+        content=[SimpleNamespace(text="17:24 UTC")], is_error=False))
     feat = _feature(manager=MagicMock(), gateway=gw)
     res = await feat.call_tool("gateway", "get_current_time", {"timezone": "UTC"})
     assert res.status is ToolResultStatus.OK
     gw.call_tool.assert_awaited_once_with("get_current_time", {"timezone": "UTC"})
-
-
-@pytest.mark.asyncio
-async def test_load_via_gateway_does_not_persist_failed_enable(monkeypatch):
-    # enable_server reconnects to prior servers (returns their tools) but the
-    # requested server never lands in enabled_servers -> must fail, not persist.
-    monkeypatch.setattr("kestrel_feature_mcp.feature.check_docker_mcp_available", lambda: True)
-    gw = MagicMock()
-    gw.is_connected = True
-    gw.tools = {"fetch": object()}
-    gw.gateway = SimpleNamespace(enabled_servers={"fetch"})  # 'broken' never added
-    gw.enable_server = AsyncMock(return_value=[SimpleNamespace(name="fetch")])
-    gw.get_all_tools = MagicMock(return_value=[{"name": "fetch", "description": "", "inputSchema": {}}])
-    feat = _feature(manager=MagicMock(), gateway=gw)
-    feat._reject_unknown_servers = AsyncMock(return_value=None)
-    feat._persist_server = AsyncMock()
-
-    res = await feat._load_via_gateway("broken")
-    assert res.status is ToolResultStatus.ERROR
-    feat._persist_server.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -203,7 +183,7 @@ async def test_unload_accepts_image_alias_for_gateway_server():
     # alias must hit the gateway server, not fall through to container unload.
     gw = MagicMock()
     gw.is_connected = True
-    gw.gateway = SimpleNamespace(enabled_servers={"time", "fetch"})
+    gw.gateway = SimpleNamespace(requested_servers={"time", "fetch"})
     gw.disable_server = AsyncMock()
     feat = _feature(manager=MagicMock(), gateway=gw)
     feat._mount_gateway_tools = MagicMock(return_value=2)
@@ -219,7 +199,7 @@ async def test_unload_accepts_image_alias_for_gateway_server():
 async def test_unload_last_gateway_server_stops_gateway():
     gw = MagicMock()
     gw.is_connected = True
-    gw.gateway = SimpleNamespace(enabled_servers={"time"})
+    gw.gateway = SimpleNamespace(requested_servers={"time"})
     gw.stop = AsyncMock()
     feat = _feature(manager=MagicMock(), gateway=gw)
     feat._forget_server = AsyncMock()

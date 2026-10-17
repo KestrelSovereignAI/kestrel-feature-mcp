@@ -143,12 +143,6 @@ async def test_gateway_stdout_drained_after_startup(monkeypatch):
         DockerMCPGateway, "check_docker_mcp_available", staticmethod(lambda: True)
     )
 
-    async def _ok_enable(self, server):
-        self.enabled_servers.add(server)
-        return True
-
-    monkeypatch.setattr(DockerMCPGateway, "_enable_server", _ok_enable)
-
     async def _ready(self, timeout=10.0):
         return True
 

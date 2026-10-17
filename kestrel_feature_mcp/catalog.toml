@@ -6,7 +6,7 @@
 #   - builtin: Built-in tool implemented locally (no Docker required)
 #
 # Transport Types:
-#   - sse: Server-Sent Events (HTTP-based, can connect directly)
+#   - streamable_http: Native MCP over Streamable HTTP
 #   - stdio: Standard I/O (needs wrapper like Supergateway for HTTP access)
 #
 # Categories:
@@ -31,13 +31,13 @@ tools = ["execute", "execute_background"]
 categories = ["devtools", "utility"]
 
 # =============================================================================
-# SSE-NATIVE SERVERS (Direct connection, no wrapper needed)
+# STREAMABLE HTTP SERVERS (Direct connection, no wrapper needed)
 # =============================================================================
-# These servers natively support SSE transport and can be connected to directly.
+# These servers must expose Streamable HTTP at /mcp; the SDK negotiates a shared published revision and can be connected to directly.
 
 [servers.test-server]
 type = "docker"
-transport = "sse"
+transport = "streamable_http"
 image = "kestrel-mcp-test-server:latest"
 description = "Simple test server with echo and add tools (for testing)"
 tools = ["echo", "add"]
@@ -48,8 +48,8 @@ port = 8000
 # STDIO SERVERS (Require Supergateway wrapper)
 # =============================================================================
 # Official MCP servers from Docker Hub that use stdio transport.
-# These need to be wrapped with Supergateway to expose via SSE.
-# Use: docker run -p 8000:8000 supercorp/supergateway --stdio "mcp-server-xxx"
+# These need to be wrapped with Supergateway to expose via Streamable HTTP.
+# Use: docker run -p 8000:8000 supercorp/supergateway --stdio "mcp-server-xxx" --outputTransport streamableHttp
 
 [servers.fetch]
 type = "docker"
@@ -179,7 +179,7 @@ port = 8000
 
 [servers.fhir]
 type = "docker"
-transport = "sse"
+transport = "streamable_http"
 image = "mcp-fhir:latest"
 description = "FHIR healthcare data access (HL7 FHIR R4)"
 tools = ["search_patients", "get_patient", "get_observations", "create_observation"]
@@ -192,7 +192,7 @@ port = 8000
 
 [servers.kestrel-sovereignty]
 type = "docker"
-transport = "sse"
+transport = "streamable_http"
 image = "mcp-sovereignty:latest"
 description = "Kestrel sovereignty operations - backup, restore, export"
 tools = ["export_sovereignty", "import_sovereignty", "verify_integrity"]

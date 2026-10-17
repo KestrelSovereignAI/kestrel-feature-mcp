@@ -109,7 +109,7 @@ class TestDockerUnavailableFails:
 
 
 # ---------------------------------------------------------------------------
-# MCP tool-level failures (CallToolResult.isError=True) must surface as ERROR,
+# MCP tool-level failures (CallToolResult.is_error=True) must surface as ERROR,
 # not OK — MCP signals these without raising.
 # ---------------------------------------------------------------------------
 class TestIsErrorSurfacesAsFailed:
@@ -118,7 +118,7 @@ class TestIsErrorSurfacesAsFailed:
         from types import SimpleNamespace
         return SimpleNamespace(
             content=[SimpleNamespace(text="tool blew up")],
-            isError=True,
+            is_error=True,
         )
 
     @pytest.mark.asyncio
@@ -144,7 +144,7 @@ class TestIsErrorSurfacesAsFailed:
     async def test_gateway_call_success_is_ok(self):
         from types import SimpleNamespace
         from unittest.mock import AsyncMock
-        ok_result = SimpleNamespace(content=[SimpleNamespace(text="hello")], isError=False)
+        ok_result = SimpleNamespace(content=[SimpleNamespace(text="hello")], is_error=False)
         gw = MagicMock()
         gw.is_connected = True
         gw.call_tool = AsyncMock(return_value=ok_result)
@@ -159,7 +159,7 @@ class TestIsErrorSurfacesAsFailed:
         from unittest.mock import AsyncMock
         multi = SimpleNamespace(
             content=[SimpleNamespace(text="block-one"), SimpleNamespace(text="block-two")],
-            isError=False,
+            is_error=False,
         )
         gw = MagicMock()
         gw.is_connected = True

@@ -7,7 +7,6 @@ tools:
   - start_mcp_gateway
   - stop_mcp_gateway
   - search_mcp_servers
-  - list_enabled_servers
   - call_mcp_tool
   - load_mcp_server
   - unload_mcp_server

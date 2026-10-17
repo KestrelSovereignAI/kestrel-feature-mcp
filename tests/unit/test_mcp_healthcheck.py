@@ -78,7 +78,7 @@ class TestMCPHealthcheck:
         mock_docker_client.containers.get.return_value = mock_container
 
         with patch.object(manager, '_check_port_ready', new_callable=AsyncMock) as mock_port_check:
-            with patch.object(manager, '_check_sse_ready', new_callable=AsyncMock) as mock_sse_check:
+            with patch.object(manager, '_check_mcp_ready', new_callable=AsyncMock) as mock_sse_check:
                 mock_port_check.return_value = True
                 mock_sse_check.return_value = True
 
@@ -103,7 +103,7 @@ class TestMCPHealthcheck:
             return call_count >= 3
 
         with patch.object(manager, '_check_port_ready', new_callable=AsyncMock) as mock_port:
-            with patch.object(manager, '_check_sse_ready', side_effect=sse_check_side_effect):
+            with patch.object(manager, '_check_mcp_ready', side_effect=sse_check_side_effect):
                 mock_port.return_value = True
                 result = await manager._wait_for_container_ready('test-container', timeout=10.0)
 
@@ -168,7 +168,7 @@ class TestMCPHealthcheck:
         mock_docker_client.containers.get.return_value = mock_container
 
         with patch.object(manager, '_check_port_ready', new_callable=AsyncMock) as mock_port:
-            with patch.object(manager, '_check_sse_ready', new_callable=AsyncMock) as mock_sse:
+            with patch.object(manager, '_check_mcp_ready', new_callable=AsyncMock) as mock_sse:
                 mock_port.return_value = True
                 mock_sse.return_value = True
 
@@ -194,7 +194,7 @@ class TestMCPHealthcheck:
         mock_docker_client.containers.get.return_value = mock_container
 
         with patch.object(manager, '_check_port_ready', new_callable=AsyncMock) as mock_port:
-            with patch.object(manager, '_check_sse_ready', new_callable=AsyncMock) as mock_sse:
+            with patch.object(manager, '_check_mcp_ready', new_callable=AsyncMock) as mock_sse:
                 mock_port.return_value = True
                 mock_sse.return_value = True
 

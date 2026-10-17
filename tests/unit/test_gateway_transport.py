@@ -11,18 +11,17 @@ from kestrel_feature_mcp.gateway import DockerMCPGateway
 def test_default_transport_is_streaming_not_deprecated_sse():
     gw = DockerMCPGateway()
     assert gw.transport == "streaming"
-    assert gw._is_streaming is True
     # Streamable HTTP serves at /mcp, not the deprecated /sse path.
     gw.port = 1234
     assert gw.endpoint_url == "http://localhost:1234/mcp"
 
 
-def test_legacy_sse_transport_still_selectable():
-    gw = DockerMCPGateway(port=9100, transport="sse")
-    assert gw._is_streaming is False
-    assert gw.endpoint_url == "http://localhost:9100/sse"
-    # Back-compat alias still resolves to the active endpoint.
-    assert gw.sse_url == gw.endpoint_url
+def test_deprecated_and_unknown_transports_fail_before_start():
+    import pytest
+
+    for transport in ("sse", "unknown"):
+        with pytest.raises(ValueError, match="Streamable HTTP"):
+            DockerMCPGateway(port=9100, transport=transport)
 
 
 def test_default_port_is_ephemeral():

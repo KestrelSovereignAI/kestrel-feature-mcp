@@ -37,16 +37,16 @@ def test_start_cmd_includes_long_lived_when_enabled(monkeypatch):
             return next(self._lines, "")
 
         def poll(self):
-            return None
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = 0
+
+        def wait(self):
+            return self.returncode
 
     monkeypatch.setattr("kestrel_feature_mcp.gateway.subprocess.Popen", _FakePopen)
     monkeypatch.setattr(DockerMCPGateway, "check_docker_mcp_available", staticmethod(lambda: True))
-
-    async def _ok_enable(self, server):
-        self.enabled_servers.add(server)
-        return True
-
-    monkeypatch.setattr(DockerMCPGateway, "_enable_server", _ok_enable)
 
     async def _ready(self, timeout=10.0):
         return True
@@ -58,6 +58,14 @@ def test_start_cmd_includes_long_lived_when_enabled(monkeypatch):
     gw = DockerMCPGateway(port=12345)
     asyncio.run(gw.start(["sequentialthinking"]))
     assert "--long-lived" in captured["cmd"]
+    assert "--servers=sequentialthinking" in captured["cmd"]
+    assert "--host=127.0.0.1" in captured["cmd"]
+
+    # A new explicit selection replaces the old selection on this process;
+    # it does not retain servers from an earlier start.
+    asyncio.run(gw.start(["time"]))
+    assert gw.requested_servers == {"time"}
+    assert "--servers=time" in captured["cmd"]
 
     gw2 = DockerMCPGateway(port=12346, long_lived=False)
     asyncio.run(gw2.start(["sequentialthinking"]))
