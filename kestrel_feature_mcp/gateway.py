@@ -504,32 +504,3 @@ async def list_available_servers() -> List[str]:
         return servers
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return []
-
-
-async def list_requested_servers() -> List[str]:
-    """List currently enabled servers in Docker MCP."""
-    try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            ["docker", "mcp", "server", "ls"],
-            capture_output=True,
-            text=True,
-            timeout=SSH_COMMAND_TIMEOUT_DEFAULT
-        )
-        if result.returncode != 0:
-            return []
-
-        servers = []
-        in_table = False
-        for line in result.stdout.split('\n'):
-            if 'NAME' in line and 'DESCRIPTION' in line:
-                in_table = True
-                continue
-            if in_table and line.strip() and not line.startswith('-'):
-                parts = line.split()
-                if parts:
-                    servers.append(parts[0])
-
-        return servers
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return []
