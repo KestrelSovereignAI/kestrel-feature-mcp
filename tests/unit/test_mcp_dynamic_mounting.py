@@ -312,6 +312,47 @@ class TestWrapper:
         assert ws[0]._real_name == "fetch"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained", [0, 1])
+async def test_container_load_reports_tools_evicted_by_host_capacity(mcp_http_server, retained):
+    feature, manager, name = _native_container_feature(mcp_http_server, "acme/native:latest")
+
+    def limited_register(owner, tools):
+        feature.agent.registered[owner] = list(tools)[:retained]
+        return len(feature.agent.registered[owner])
+
+    feature.agent.register_dynamic_tools = limited_register
+    try:
+        result = await feature.load_tool("acme/native:latest")
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["mounted"] == retained
+        assert len(result.data["tools"]) == 2
+        assert f"retained {retained} of 2" in result.error
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["load", "start"])
+async def test_gateway_load_reports_tools_evicted_by_host_capacity(monkeypatch, operation):
+    gateway = MagicMock()
+    tools = [SimpleNamespace(name="echo"), SimpleNamespace(name="fail")]
+    gateway.tools = {}
+    gateway.is_connected = True
+    gateway.start = AsyncMock(return_value=tools)
+    gateway.enable_server = AsyncMock(return_value=tools)
+    feature = _feature(manager=MagicMock(), gateway=gateway if operation == "load" else None)
+    feature._mount_gateway_tools = lambda: 0
+    feature._reject_unknown_servers = AsyncMock(return_value=None)
+    monkeypatch.setattr("kestrel_feature_mcp.feature.check_docker_mcp_available", lambda: True)
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", lambda: gateway)
+    result = await feature.load_tool("time") if operation == "load" else await feature.gateway_start("time")
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["mounted"] == 0
+    assert len(result.data["tools"]) == 2
+    assert "retained 0 of 2" in result.error
+
+
 # ---------------------------------------------------------------------------
 # Mount / unmount wiring
 # ---------------------------------------------------------------------------
@@ -431,7 +472,9 @@ class TestMounting:
         gw.enable_server = AsyncMock(return_value=[
             SimpleNamespace(name="fetch"), SimpleNamespace(name="sqlite_query"),
         ])
-        gw.get_all_tools = MagicMock(return_value=[])
+        gw.get_all_tools = MagicMock(return_value=[
+            {"name": "fetch", "inputSchema": {}}, {"name": "sqlite_query", "inputSchema": {}},
+        ])
         feat = _feature(gateway=gw)
 
         async def _known():

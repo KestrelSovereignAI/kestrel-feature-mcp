@@ -55,6 +55,18 @@ def _selector_failure(selector: str) -> Optional[ToolResult]:
     return None
 
 
+def _loaded_tool_result(confirmation: str, *, data: dict) -> ToolResult:
+    """Discovery succeeds independently of the host retaining callable handles."""
+    if data["mounted"] < len(data["tools"]):
+        return ToolResult.partial(
+            confirmation,
+            f"Host registry retained {data['mounted']} of {len(data['tools'])} discovered MCP tools; "
+            "only retained handles can be called. Free registry capacity and reload the server.",
+            data=data,
+        )
+    return ToolResult.ok(confirmation, data=data)
+
+
 class MCPAgent(Feature):
     """
     A Feature Agent that manages Model Context Protocol (MCP) tools.
@@ -373,7 +385,7 @@ class MCPAgent(Feature):
                 if mounted else
                 " No callable tools were retained by the host registry."
             )
-            return ToolResult.ok(
+            return _loaded_tool_result(
                 f"Loaded {image_name} as {container_name}. Tools: {', '.join(tool_names)}."
                 + mount_note,
                 data=data,
@@ -454,7 +466,7 @@ class MCPAgent(Feature):
                     f"{server_name} contributed no new tools",
                     data=data,
                 )
-            return ToolResult.ok(
+            return _loaded_tool_result(
                 f"Requested {server_name} via the gateway — added {len(new_tools)} "
                 f"tool(s): {', '.join(new_tools[:10])}"
                 + (f" (+{len(new_tools) - 10} more)" if len(new_tools) > 10 else "")
@@ -815,7 +827,7 @@ class MCPAgent(Feature):
                     "no tools mounted from the requested servers",
                     data=data,
                 )
-            return ToolResult.ok(
+            return _loaded_tool_result(
                 f"Gateway started with {len(tool_names)} tools.\n\n{summary}",
                 data=data,
             )
