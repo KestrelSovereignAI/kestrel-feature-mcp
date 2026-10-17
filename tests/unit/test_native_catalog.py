@@ -12,7 +12,7 @@ from kestrel_feature_mcp.registry import MCPRegistry
 def test_invalid_catalog_entry_fails_explicitly(tmp_path, field, value):
     catalog = tmp_path / "catalog.toml"
     catalog.write_text(f"[servers.example]\n{field} = {value!r}\n")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="example"):
         MCPRegistry(catalog)
 
 

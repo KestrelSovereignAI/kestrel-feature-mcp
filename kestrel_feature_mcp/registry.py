@@ -140,9 +140,8 @@ class MCPRegistry:
         logger.info("Loaded %s MCP servers from catalog", len(entries))
 
     def _parse_server_entry(self, name: str, data: Dict[str, Any]) -> MCPServerEntry:
-        categories = [ServerCategory(value) for value in data.get("categories", [])]
-
         try:
+            categories = [ServerCategory(value) for value in data.get("categories", [])]
             server_type = ServerType(data.get("type", "docker"))
             transport = TransportType(data.get("transport", "streamable_http"))
         except ValueError as error:

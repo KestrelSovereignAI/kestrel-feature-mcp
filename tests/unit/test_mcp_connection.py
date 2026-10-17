@@ -4,91 +4,23 @@ import asyncio
 import json
 import socket
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, AsyncMock
 
 import pytest
-import pytest_asyncio
-import uvicorn
-from mcp import types
-from mcp.server import MCPServer
 from mcp.shared.exceptions import MCPError
 
-from kestrel_feature_mcp.connection import MCPConnection, MCP_PROTOCOL_VERSION
+from kestrel_feature_mcp.connection import MCPConnection
+from mcp_types.version import LATEST_PROTOCOL_VERSION
 from kestrel_feature_mcp.manager import DockerMCPGatewayError, MCPGatewayManager, MCPToolManager
 
 
 @pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
-@pytest.mark.parametrize("field", ["connect_timeout", "call_timeout"])
+@pytest.mark.parametrize("field", ["connect_timeout", "call_timeout", "close_timeout"])
 def test_invalid_deadlines_fail_before_any_connection(value, field):
     with pytest.raises(ValueError, match="finite positive"):
         MCPConnection("http://127.0.0.1:1/mcp", **{field: value})
 
 
-@pytest_asyncio.fixture
-async def mcp_http_server(request):
-    settings = getattr(request, "param", {})
-
-    class TestServer(MCPServer):
-        async def _handle_list_tools(self, ctx, params):
-            await asyncio.sleep(settings.get("list_delay", 0))
-            listed = await self.list_tools()
-            if settings.get("repeat_cursor"):
-                return types.ListToolsResult(tools=listed, next_cursor="repeated")
-            if settings.get("paginate"):
-                return types.ListToolsResult(
-                    tools=listed[1:] if params and params.cursor else listed[:1],
-                    next_cursor=None if params and params.cursor else "page-2",
-                )
-            return types.ListToolsResult(tools=listed)
-
-    mcp = TestServer("native-connection-test")
-
-    @mcp.tool()
-    async def echo(text: str) -> str:
-        return text
-
-    @mcp.tool()
-    async def fail() -> str:
-        raise ValueError("test tool failure")
-
-    app = mcp.streamable_http_app(stateless_http=True, json_response=True)
-    requests = []
-
-    async def recorded(scope, receive, send):
-        if scope["type"] != "http":
-            return await app(scope, receive, send)
-        body = bytearray()
-
-        async def read():
-            message = await receive()
-            body.extend(message.get("body", b""))
-            return message
-
-        try:
-            await app(scope, read, send)
-        finally:
-            requests.append((scope, bytes(body)))
-
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(recorded, log_level="error"))
-    task = asyncio.create_task(server.serve(sockets=[sock]))
-
-    async def ready():
-        while not server.started:
-            if task.done():
-                await task
-                raise RuntimeError("test HTTP server exited before startup")
-            await asyncio.sleep(0.01)
-
-    try:
-        await asyncio.wait_for(ready(), 5)
-        yield f"http://127.0.0.1:{port}/mcp", requests
-    finally:
-        server.should_exit = True
-        await asyncio.wait_for(task, 5)
-        sock.close()
 
 
 @pytest.mark.asyncio
@@ -97,6 +29,7 @@ async def test_requests_use_modern_wire_and_bearer_header(mcp_http_server):
     connection = MCPConnection(url, headers={"Authorization": "Bearer test-token"})
     try:
         tools = await connection.connect()
+        assert connection.protocol_version == LATEST_PROTOCOL_VERSION
         assert {t.name for t in tools} == {"echo", "fail"}
         assert next(t for t in tools if t.name == "echo").input_schema["properties"]["text"]
         result = await connection.call_tool("echo", {"text": "native MCP"})
@@ -117,9 +50,9 @@ async def test_requests_use_modern_wire_and_bearer_header(mcp_http_server):
             if message["method"] == "tools/call":
                 assert headers[b"mcp-name"] == b"echo"
             messages.append(message)
-    assert [m["method"] for m in messages] == ["tools/list", "tools/call"]
+    assert [m["method"] for m in messages] == ["server/discover", "tools/list", "tools/call"]
     for message in messages:
-        assert MCP_PROTOCOL_VERSION in json.dumps(message["params"]["_meta"])
+        assert LATEST_PROTOCOL_VERSION in json.dumps(message["params"]["_meta"])
 
 
 @pytest.mark.asyncio
@@ -139,8 +72,10 @@ async def test_sdk_tool_failure_is_preserved(mcp_http_server):
 async def test_failed_startup_joins_owner_and_can_retry(mcp_http_server):
     url, _ = mcp_http_server
     connection = MCPConnection(url.replace("/mcp", "/missing"), call_timeout=1)
-    with pytest.raises(MCPError, match="Not Found"):
+    with pytest.raises(ExceptionGroup) as caught:
         await connection.connect()
+    known, unexpected = caught.value.split(MCPError)
+    assert known is not None and unexpected is None
     assert not connection.is_connected
     assert connection._task is None
     connection.url = url
@@ -195,7 +130,8 @@ async def test_all_tool_pages_are_discovered(mcp_http_server):
         assert {t.name for t in tools} == {"echo", "fail"}
     finally:
         await connection.close()
-    messages = [json.loads(body) for _, body in requests if body]
+    messages = [json.loads(body) for _, body in requests if body
+                and json.loads(body)["method"] == "tools/list"]
     assert len(messages) == 2
     assert messages[1]["params"]["cursor"] == "page-2"
 
@@ -233,6 +169,7 @@ async def test_container_reconnect_uses_native_client_and_retires_old_owner(mcp_
         result = await manager.call_tool("test", "echo", {"text": "container"})
         assert result.content[0].text == "container"
         assert manager.get_all_tools()[0]["inputSchema"]
+        assert manager.get_all_tools()[0]["protocol_version"] == LATEST_PROTOCOL_VERSION
     finally:
         await manager._drop_connection("test")
     assert all(scope["path"] == "/mcp" for scope, _ in requests)
@@ -249,6 +186,7 @@ async def test_gateway_uses_same_native_client_with_its_bearer_token(mcp_http_se
         result = await manager.call_tool("echo", {"text": "gateway"})
         assert result.content[0].text == "gateway"
         assert manager.get_all_tools()[0]["inputSchema"]
+        assert manager.get_all_tools()[0]["protocol_version"] == LATEST_PROTOCOL_VERSION
     finally:
         await manager._disconnect()
     assert not manager.is_connected
@@ -288,3 +226,116 @@ async def test_container_readiness_checks_the_actual_protocol(mcp_http_server):
     port = int(url.split(":")[-1].split("/")[0])
     assert await manager._check_mcp_ready("127.0.0.1", port)
     assert not [task for task in asyncio.all_tasks() if task.get_name() == "mcp-connection"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"legacy": True}], indirect=True)
+async def test_official_sdk_negotiates_a_published_handshake_revision(mcp_http_server):
+    url, requests = mcp_http_server
+    connection = MCPConnection(url)
+    try:
+        await connection.connect()
+        assert connection.protocol_version == "2025-11-25"
+        result = await connection.call_tool("echo", {"text": "negotiated"})
+        assert result.content[0].text == "negotiated"
+    finally:
+        await connection.close()
+    methods = [json.loads(body)["method"] for _, body in requests if body]
+    assert methods[:3] == ["server/discover", "initialize", "notifications/initialized"]
+    assert any(scope["method"] == "DELETE" for scope, _ in requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"legacy": True, "delete_delay": 0.5}], indirect=True)
+async def test_slow_session_termination_has_a_finite_shutdown_deadline(mcp_http_server):
+    url, _ = mcp_http_server
+    connection = MCPConnection(url, close_timeout=0.05)
+    await connection.connect()
+    owner = connection._task
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(connection.close(), 0.3)
+    assert owner.done()
+    assert connection._task is None
+    assert not connection.is_connected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"legacy": True, "delete_delay": 0.2}], indirect=True)
+async def test_cancelled_close_propagates_and_retains_the_owner_for_rejoin(mcp_http_server):
+    url, requests = mcp_http_server
+    connection = MCPConnection(url)
+    await connection.connect()
+    owner = connection._task
+    closing = asyncio.create_task(connection.close())
+    try:
+        async with asyncio.timeout(1):
+            while not any(scope["method"] == "DELETE" for scope, _ in requests):
+                await asyncio.sleep(0.001)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert connection._task is owner
+        assert not connection.is_connected
+        with pytest.raises(RuntimeError, match="not connected"):
+            await connection.call_tool("echo", {"text": "closing"})
+    finally:
+        await connection.close()
+    assert owner.done()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"list_delay": 0.25}], indirect=True)
+async def test_initial_discovery_uses_the_call_budget_after_connecting(mcp_http_server):
+    url, _ = mcp_http_server
+    connection = MCPConnection(url, connect_timeout=0.15, call_timeout=1)
+    try:
+        tools = await connection.connect()
+        assert {tool.name for tool in tools} == {"echo", "fail"}
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_readiness_refuses_real_transport_exception_groups():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        manager = MCPToolManager(docker_client=MagicMock())
+        assert not await manager._check_mcp_ready("127.0.0.1", sock.getsockname()[1])
+    assert not [task for task in asyncio.all_tasks() if task.get_name() == "mcp-connection"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_does_not_hide_unexpected_group_members(monkeypatch):
+    error = ExceptionGroup("unexpected", [ValueError("programming defect")])
+    connection = SimpleNamespace(connect=AsyncMock(side_effect=error), close=AsyncMock())
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCPConnection", lambda *a, **kw: connection)
+    manager = MCPToolManager(docker_client=MagicMock())
+    with pytest.raises(ExceptionGroup) as caught:
+        await manager._check_mcp_ready("127.0.0.1", 1)
+    assert caught.value.exceptions == error.exceptions
+    connection.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"discover_delay": 0.25}], indirect=True)
+async def test_connect_deadline_joins_a_real_slow_negotiation(mcp_http_server):
+    url, _ = mcp_http_server
+    connection = MCPConnection(url, connect_timeout=0.05)
+    with pytest.raises(TimeoutError):
+        await connection.connect()
+    assert connection._task is None
+    assert not connection.is_connected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"unsupported_version": True}], indirect=True)
+async def test_no_common_revision_fails_without_a_private_fallback(mcp_http_server):
+    url, requests = mcp_http_server
+    connection = MCPConnection(url)
+    with pytest.raises(ExceptionGroup) as caught:
+        await connection.connect()
+    known, unexpected = caught.value.split(MCPError)
+    assert known is not None and unexpected is None
+    assert connection._task is None
+    assert not connection.is_connected
+    assert [json.loads(body)["method"] for _, body in requests if body] == ["server/discover"]

@@ -12,9 +12,8 @@ uv pip install kestrel-feature-mcp
 
 - `kestrel-sovereign-sdk`
 - `docker>=7.1.0`
-- `mcp>=1.26.0`
-- `trio>=0.32.0`
-- `aiohttp>=3.13.3`
+- `mcp>=2.3,<3`
+- `httpx2>=2.10`
 
 ## Usage
 
@@ -45,16 +44,21 @@ uv run pytest
 
 ## Native MCP protocol
 
-Version 0.5 uses the official MCP 2.x `Client` with protocol `2026-07-28` over
-Streamable HTTP. Container servers must expose native MCP at `/mcp`; the
+Version 0.5 uses the official MCP 2.x `Client` over Streamable HTTP. Its standard
+version negotiation selects `2026-07-28` with modern servers and a mutually
+supported published revision with other servers. Tool listings expose the
+selected `protocol_version`. Container servers must expose MCP at `/mcp`; the
 standalone HTTP+SSE transport and gateway `transport="sse"` selection have been
-removed. Gateway loading requires a gateway that supports the same native
-revision. Docker MCP Gateway 0.44.1, its newest published release when checked,
-rejects this revision. Gateway rollout remains blocked on the scope decision in
+removed. Docker MCP Gateway 0.44.1 negotiates `2025-11-25`; its lack of the
+newer revision is tracked in
 [Kestrel #3683](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3683).
-Tool discovery follows pagination and fails on repeated cursors. Connection and
-call deadlines also apply while discovering tools; cancelled startup joins its
-transport owner before returning.
+Features requiring newer capabilities must check the negotiated connection.
+Tool discovery follows pagination and fails on repeated cursors. Negotiation
+uses the connection deadline, then discovery uses the whole-call deadline.
+Cancelled startup joins its transport owner before returning. Shutdown has its
+own finite deadline (`KESTREL_MCP_CLOSE_TIMEOUT`, default 15 seconds), including
+session termination on handshake-era connections. Cancelling shutdown propagates
+to its caller and preserves the owner for a later cleanup attempt.
 
 Upgrade the MCP feature before upgrading a host with the Phoenix 20/Pydantic AI
 2 dependency set. Feature 0.4's `mcp<2` requirement cannot resolve with that set.

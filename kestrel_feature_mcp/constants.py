@@ -15,6 +15,7 @@ SSH_COMMAND_TIMEOUT_DEFAULT = 30
 HTTP_TIMEOUT_SHORT = 5
 SESSION_CONNECT_TIMEOUT_SHORT = 10
 SESSION_CONNECT_TIMEOUT_DEFAULT = 15
+SESSION_CLOSE_TIMEOUT_DEFAULT = float(os.environ.get("KESTREL_MCP_CLOSE_TIMEOUT", "15"))
 
 # Upper bound on a single MCP tool invocation (seconds). Without this a wedged
 # downstream MCP server makes ``session.call_tool`` await forever, hanging the

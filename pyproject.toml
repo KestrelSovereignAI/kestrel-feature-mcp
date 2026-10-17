@@ -10,7 +10,6 @@ dependencies = [
     "docker>=7.1.0",
     "mcp>=2.3,<3",
     "httpx2>=2.10",
-    "aiohttp>=3.13.3",
 ]
 
 [project.optional-dependencies]

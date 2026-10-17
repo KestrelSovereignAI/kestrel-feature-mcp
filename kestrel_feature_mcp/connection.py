@@ -1,19 +1,29 @@
-"""Lifecycle owner for native MCP 2026-07-28 Streamable HTTP connections."""
+"""Lifecycle owner for the official MCP client's Streamable HTTP connections."""
 
 from __future__ import annotations
 
 import asyncio
 import math
 from collections.abc import Mapping
+from contextlib import AsyncExitStack
 
 import httpx2
 from mcp import Client, types
 from mcp.client.streamable_http import streamable_http_client
 
-from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT
+from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSION_CLOSE_TIMEOUT_DEFAULT
 
 
-MCP_PROTOCOL_VERSION = "2026-07-28"
+class _ConnectionResources(AsyncExitStack):
+    """Exit SDK resources on their owner task with a whole-shutdown deadline."""
+
+    def __init__(self, timeout: float):
+        super().__init__()
+        self._timeout = timeout
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        async with asyncio.timeout(self._timeout):
+            return await super().__aexit__(exc_type, exc_value, traceback)
 
 
 class MCPConnection:
@@ -32,15 +42,17 @@ class MCPConnection:
         auth: httpx2.Auth | None = None,
         connect_timeout: float = SESSION_CONNECT_TIMEOUT_DEFAULT,
         call_timeout: float = CALL_TOOL_TIMEOUT,
+        close_timeout: float = SESSION_CLOSE_TIMEOUT_DEFAULT,
     ) -> None:
         if not all(math.isfinite(value) and value > 0
-                   for value in (connect_timeout, call_timeout)):
-            raise ValueError("MCP connection and call timeouts must be finite positive numbers")
+                   for value in (connect_timeout, call_timeout, close_timeout)):
+            raise ValueError("MCP connection, call and shutdown timeouts must be finite positive numbers")
         self.url = url
         self._headers = dict(headers or {})
         self._auth = auth
         self._connect_timeout = connect_timeout
         self._call_timeout = call_timeout
+        self._close_timeout = close_timeout
         self._client: Client | None = None
         self._task: asyncio.Task[None] | None = None
         self._ready: asyncio.Future[Client] | None = None
@@ -51,7 +63,13 @@ class MCPConnection:
             self._client is not None
             and self._task is not None
             and not self._task.done()
+            and not self._task.cancelling()
         )
+
+    @property
+    def protocol_version(self) -> str | None:
+        """The published revision selected by the SDK's standard negotiation."""
+        return self._client.protocol_version if self.is_connected else None
 
     def _owner_finished(self, task: asyncio.Task[None]) -> None:
         # Always observe the task outcome, including a failure after startup.
@@ -66,26 +84,25 @@ class MCPConnection:
 
     async def _run(self) -> None:
         try:
-            async with httpx2.AsyncClient(
-                headers=self._headers,
-                auth=self._auth,
-                # The SDK/host bound the whole operation, including pagination
-                # and cancellation. An equal per-socket read timeout races that
-                # deadline and can replace its error with a teardown group.
-                timeout=None,
-                follow_redirects=False,
-            ) as http_client:
+            async with _ConnectionResources(self._close_timeout) as resources:
+                http_client = await resources.enter_async_context(httpx2.AsyncClient(
+                    headers=self._headers,
+                    auth=self._auth,
+                    # Socket acquisition/writes are bounded; SDK/host deadlines
+                    # own reads and pagination. Resource exit also has a whole
+                    # deadline, including a handshake peer's session DELETE.
+                    timeout=httpx2.Timeout(self._connect_timeout, read=None),
+                    follow_redirects=False,
+                ))
                 transport = streamable_http_client(self.url, http_client=http_client)
-                async with Client(
+                client = await resources.enter_async_context(Client(
                     transport,
-                    mode=MCP_PROTOCOL_VERSION,
-                    read_timeout_seconds=self._call_timeout,
                     cache=None,
-                ) as client:
-                    self._client = client
-                    if self._ready is not None and not self._ready.done():
-                        self._ready.set_result(client)
-                    await asyncio.Future()
+                ))
+                self._client = client
+                if self._ready is not None and not self._ready.done():
+                    self._ready.set_result(client)
+                await asyncio.Future()
         finally:
             self._client = None
 
@@ -99,7 +116,7 @@ class MCPConnection:
         try:
             async with asyncio.timeout(self._connect_timeout):
                 await self._ready
-                tools = await self.list_tools()
+            tools = await self.list_tools()
             published = True
             return tools
         finally:
@@ -138,12 +155,17 @@ class MCPConnection:
         task = self._task
         if task is None:
             return
-        task.cancel()
+        if not task.cancelling():
+            task.cancel()
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
+            # Waiting observes completion without confusing owner cancellation
+            # with cancellation of this caller. A cancelled caller retains the
+            # owner so shutdown can be rejoined; the owner bounds its cleanup.
+            await asyncio.wait({task})
+            if not task.cancelled():
+                task.result()
         finally:
-            self._task = None
-            self._ready = None
-            self._client = None
+            if task.done():
+                self._task = None
+                self._ready = None
+                self._client = None

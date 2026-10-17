@@ -226,17 +226,17 @@ class TestRegistryIntegration:
         assert len(tools) > 0
 
     @pytest.mark.asyncio
-    async def test_registry_sse_servers(self):
-        """Verify registry correctly identifies SSE-ready servers."""
+    async def test_registry_streamable_http_servers(self):
+        """Verify registry correctly identifies Streamable-HTTP-ready servers."""
         registry = get_registry()
-        sse_servers = registry.list_http_ready()
+        http_servers = registry.list_http_ready()
 
-        # Should have at least test-server as SSE-native
-        names = [s.name for s in sse_servers]
+        # Should have at least test-server as HTTP-native
+        names = [s.name for s in http_servers]
         assert "test-server" in names
 
-        # All should have SSE transport
-        for server in sse_servers:
+        # All should have Streamable HTTP transport
+        for server in http_servers:
             assert server.transport == TransportType.STREAMABLE_HTTP
 
     @pytest.mark.asyncio

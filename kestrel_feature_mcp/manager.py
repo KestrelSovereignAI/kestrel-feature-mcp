@@ -17,6 +17,7 @@ import logging
 import asyncio
 import httpx2
 from mcp.shared.exceptions import MCPError
+from pydantic import ValidationError
 import time
 from typing import Dict, Any, List, Optional
 
@@ -206,8 +207,6 @@ class MCPToolManager:
                 raise
             except docker.errors.DockerException as e:
                 logger.debug(f"Health check attempt {attempt} failed (Docker error): {e}")
-            except Exception as e:
-                logger.debug(f"Health check attempt {attempt} failed: {e}", exc_info=True)
 
             await asyncio.sleep(delay)
             delay = min(delay * HEALTHCHECK_BACKOFF_FACTOR, HEALTHCHECK_MAX_DELAY)
@@ -231,10 +230,12 @@ class MCPToolManager:
             f"http://{host}:{port}/mcp", connect_timeout=timeout, call_timeout=timeout
         )
         try:
-            await connection.connect()
-            return True
-        except (MCPError, httpx2.HTTPError, TimeoutError, OSError):
-            return False
+            ready = True
+            try:
+                await connection.connect()
+            except* (MCPError, httpx2.HTTPError, TimeoutError, OSError, ValidationError):
+                ready = False
+            return ready
         finally:
             await connection.close()
 
@@ -366,26 +367,18 @@ class MCPToolManager:
         if container_name in self.active_tools:
             tool_info = self.active_tools[container_name]
 
-            await tool_info["connection"].close()
-
+            tool_info["tools"] = []
             container = tool_info["container"]
             try:
-                await asyncio.to_thread(container.stop)
-                await asyncio.to_thread(container.remove, force=True)
-                for _ in range(MCP_MAX_CONNECTION_ATTEMPTS):
-                    try:
-                        await asyncio.to_thread(
-                            self.docker_client.containers.get, container_name
-                        )
-                        await asyncio.sleep(MCP_CONNECTION_RETRY_DELAY)
-                    except NotFound:
-                        break
-            except NotFound:
-                pass
-            except docker.errors.APIError as e:
-                logger.warning(f"Docker API error stopping container {container_name}: {e}")
-            except Exception as e:
-                logger.warning(f"Error stopping container {container_name}: {e}", exc_info=True)
+                await tool_info["connection"].close()
+            finally:
+                # Reclaim the process even if connection exit failed. Retain
+                # bookkeeping on failure so a later unload can rejoin cleanup.
+                try:
+                    await asyncio.to_thread(container.stop)
+                    await asyncio.to_thread(container.remove, force=True)
+                except NotFound:
+                    pass
 
             del self.active_tools[container_name]
             logger.info(f"Stopped tool {container_name}")
@@ -400,13 +393,7 @@ class MCPToolManager:
             raise ValueError(f"Tool {container_name} not connected")
 
         connection = self.active_tools[container_name]["connection"]
-        # Bound the call so a wedged downstream MCP server can't hang the whole
-        # agent turn forever (F402); TimeoutError surfaces to the tool wrapper.
-        result = await asyncio.wait_for(
-            connection.call_tool(tool_name, arguments or {}),
-            timeout=CALL_TOOL_TIMEOUT,
-        )
-        return result
+        return await connection.call_tool(tool_name, arguments or {})
 
     def get_all_tools(self):
         """Returns a list of all available tools across all containers."""
@@ -417,7 +404,8 @@ class MCPToolManager:
                     "container": c_name,
                     "name": tool.name,
                     "description": tool.description,
-                    "inputSchema": tool.input_schema
+                    "inputSchema": tool.input_schema,
+                    "protocol_version": info["connection"].protocol_version,
                 })
         return all_tools
 
@@ -475,10 +463,10 @@ class MCPGatewayManager:
 
     async def _disconnect(self):
         connection = self.connection
-        self.connection = None
         self.tools = {}
         if connection is not None:
             await connection.close()
+        self.connection = None
 
     async def _connect(self, auth_token: str):
         await self._disconnect()
@@ -491,7 +479,7 @@ class MCPGatewayManager:
         try:
             tools = await connection.connect()
         except TimeoutError as error:
-            raise DockerMCPGatewayError("Timeout connecting to gateway") from error
+            raise DockerMCPGatewayError("Timeout connecting to gateway or discovering its tools") from error
         self.connection = connection
         self.tools = {tool.name: tool for tool in tools}
         return tools
@@ -521,13 +509,7 @@ class MCPGatewayManager:
         if tool_name not in self.tools:
             raise ValueError(f"Unknown tool: {tool_name}. Available: {list(self.tools.keys())}")
 
-        # Bound the call so a wedged gateway/server can't hang the agent turn
-        # forever (F402); TimeoutError surfaces to the tool wrapper.
-        result = await asyncio.wait_for(
-            self.connection.call_tool(tool_name, arguments or {}),
-            timeout=CALL_TOOL_TIMEOUT,
-        )
-        return result
+        return await self.connection.call_tool(tool_name, arguments or {})
 
     def get_all_tools(self) -> List[Dict[str, Any]]:
         """Get all available tools."""
@@ -535,7 +517,8 @@ class MCPGatewayManager:
             {
                 "name": tool.name,
                 "description": tool.description,
-                "inputSchema": tool.input_schema
+                "inputSchema": tool.input_schema,
+                "protocol_version": self.connection.protocol_version if self.connection else None,
             }
             for tool in self.tools.values()
         ]
