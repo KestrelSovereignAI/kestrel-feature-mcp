@@ -32,7 +32,7 @@ async def mcp_http_server(request):
     class TestServer(MCPServer):
         async def _handle_list_tools(self, ctx, params):
             await asyncio.sleep(settings.get("list_delay", 0))
-            listed = await self.list_tools()
+            listed = [] if settings.get("empty_tools") else await self.list_tools()
             if settings.get("repeat_cursor"):
                 return types.ListToolsResult(tools=listed, next_cursor="repeated")
             if settings.get("paginate"):
@@ -118,4 +118,3 @@ async def mcp_http_server(request):
         server.should_exit = True
         await asyncio.wait_for(task, 5)
         sock.close()
-

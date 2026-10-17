@@ -48,6 +48,45 @@ def _feature(host=None, *, manager=None, gateway=None) -> MCPAgent:
     return feat
 
 
+def _native_container_feature(peer, image):
+    from tests.unit.test_mcp_connection import container_manager
+    from kestrel_feature_mcp.manager import container_name_for_image
+
+    manager = container_manager(peer.url, image=image)
+    manager._wait_for_container_ready = AsyncMock()
+    return _feature(manager=manager), manager, container_name_for_image(image, manager.owner_did)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"empty_tools": True}], indirect=True)
+async def test_empty_container_catalog_reports_no_tools_without_misdiagnosing_the_host(mcp_http_server):
+    feature, manager, name = _native_container_feature(mcp_http_server, "acme/empty:latest")
+    try:
+        result = await feature._load_via_container("acme/empty:latest")
+        assert manager.owned_containers[name]["connection"].is_connected
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "no tools" in result.confirmation.lower()
+        assert "host has no dynamic registry" not in result.confirmation
+        assert result.data["tools"] == []
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_container_unload_accepts_the_image_reference_used_to_load_it(mcp_http_server):
+    image = "acme/native:latest"
+    feature, manager, name = _native_container_feature(mcp_http_server, image)
+    try:
+        assert (await feature._load_via_container(image)).status is ToolResultStatus.OK
+        result = await feature.unload_tool(image)
+        assert result.status is ToolResultStatus.OK
+        assert result.data["container"] == name
+        assert manager.owned_containers == {}
+        assert feature.agent.registered == {}
+    finally:
+        await feature.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # Wrapper + schema
 # ---------------------------------------------------------------------------
@@ -379,6 +418,12 @@ async def test_failed_container_reload_withdraws_handles_and_retires_the_old_own
         assert owner not in host.registered
         assert manager.owned_containers[name]["container"] is container
         assert manager.get_all_tools() == []
+        inventory = await feature.list_tools()
+        assert inventory.status is ToolResultStatus.PARTIAL
+        assert inventory.data["containers"] == [{
+            "container": name, "catalog_ready": False,
+            "connected": False, "tool_count": None,
+        }]
         assert previous._task is None
         manager._wait_for_container_ready.side_effect = None
         mcp_http_server.settings["discover_delay"] = 0

@@ -71,10 +71,17 @@ rollout (Kestrel Sovereign epic #3679).
 
 Container identities bind the agent DID and image. New managers require
 `owner_did`; they reuse a process only when its ownership and image labels
-match. Each agent can reload or unload its own server independently. Saved
+match. Each agent can reload or unload its own server independently. MCP
+container ports bind only to host loopback. Listings retain failed containers'
+identifiers so they can be unloaded even when no tools were published. Saved
 container entries using the former global identifiers require explicit removal
 with `!mcp-unload <old-identifier>` and reconnection with `!mcp-load <image>`.
 An already absent container can report a no-op after clearing its saved entry.
 Shut down the old feature before upgrading to release the processes it owns.
+
+Container creation is recorded before Docker starts the process, so a rejected
+command still leaves an identifiable resource that unload can reclaim. Resource
+configuration transitions are serialized per agent; ordinary MCP tool calls
+remain concurrent and hold no configuration lock.
 
 Docker catalog discovery uses the current OCI catalog JSON API. Set `KESTREL_MCP_DOCKER_CATALOG` to select a catalog reference (default `mcp/docker-mcp-catalog`). Missing metadata is pulled into Docker's cache; unreadable catalogs return an error. Catalog counts describe available definitions, while gateway status reports this process's requested configuration and observed tools.

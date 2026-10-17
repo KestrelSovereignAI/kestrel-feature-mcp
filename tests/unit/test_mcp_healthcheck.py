@@ -85,8 +85,8 @@ class TestMCPHealthcheck:
                 result = await manager._wait_for_container_ready('test-container')
 
                 assert result is True
-                mock_port_check.assert_called_once_with('localhost', 32768)
-                mock_sse_check.assert_called_once_with('localhost', 32768)
+                mock_port_check.assert_called_once_with('127.0.0.1', 32768)
+                mock_sse_check.assert_called_once_with('127.0.0.1', 32768)
 
     @pytest.mark.asyncio
     async def test_wait_for_container_ready_with_retries(self, manager, mock_docker_client):

@@ -40,7 +40,7 @@ async def test_foreign_or_mismatched_container_is_never_adopted_restarted_or_rem
     container.restart.assert_not_called()
     container.stop.assert_not_called()
     container.remove.assert_not_called()
-    client.containers.run.assert_not_called()
+    client.containers.create.assert_not_called()
 
 
 @pytest.mark.parametrize("labels", [None, {}, {MCP_OWNER_LABEL: "did:test:other"}])
@@ -78,11 +78,11 @@ async def test_created_container_carries_agent_and_connection_identity():
     manager = MCPToolManager(owner_did="did:test:owner", docker_client=client)
     manager._wait_for_container_ready = AsyncMock()
     name = await manager.start_tool_container("image")
-    assert client.containers.run.call_args.kwargs["labels"] == {
+    assert client.containers.create.call_args.kwargs["labels"] == {
         MCP_OWNER_LABEL: manager.owner_did, MCP_IMAGE_LABEL: "image",
     }
     assert name == container_name_for_image("image", manager.owner_did)
-    assert manager.owned_containers[name]["container"] is client.containers.run.return_value
+    assert manager.owned_containers[name]["container"] is client.containers.create.return_value
     with pytest.raises(AttributeError):
         manager.owner_did = "did:test:other"
 
@@ -97,6 +97,26 @@ async def test_failed_ping_releases_client_and_preserves_unexpected_errors(failu
     with pytest.raises(error_type):
         await MCPToolManager.create(owner_did="did:test:owner")
     client.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_state", ["missing", "removed"])
+async def test_stale_resource_record_is_retired_before_a_new_image_pull_fails(prior_state):
+    from docker.errors import APIError
+
+    client = MagicMock()
+    container = MagicMock(status="exited", labels={MCP_OWNER_LABEL: "did:test:owner", MCP_IMAGE_LABEL: "image"})
+    old_connection = AsyncMock()
+    manager = MCPToolManager(owner_did="did:test:owner", docker_client=client)
+    manager.owned_containers["owned"] = {"container": container, "connection": old_connection, "tools": []}
+    client.containers.get.side_effect = NotFound("gone") if prior_state == "missing" else [container, NotFound("removed")]
+    client.images.get.side_effect = NotFound("pull required")
+    client.images.pull.side_effect = APIError("registry unavailable")
+    with pytest.raises(APIError, match="registry unavailable"):
+        await manager.start_tool_container("image", container_name="owned")
+    assert manager.owned_containers == {}
+    assert not await manager.stop_tool("owned")
+    old_connection.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -109,6 +109,17 @@ def test_default_container_name_is_stable_and_separates_agents(image):
     assert len(name) <= 255 and name.startswith("mcp-")
 
 
+@pytest.mark.parametrize("images", [
+    ("acme/native:v1", "acme/native:v2"),
+    ("acme/native:latest", "acme-native-latest"),
+    ("private.registry:5000/image:v2", "private.registry-5000-image-v2"),
+])
+def test_default_container_name_separates_connection_images(images):
+    from kestrel_feature_mcp.manager import container_name_for_image
+
+    assert container_name_for_image(images[0], "did:test:manager") != container_name_for_image(images[1], "did:test:manager")
+
+
 @pytest.mark.asyncio
 async def test_failed_retirement_unpublishes_tools_and_prevents_container_restart():
     manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
@@ -132,7 +143,7 @@ async def test_healthcheck_failure_keeps_the_container_owned_for_unload(initial_
     if initial_state == "new":
         # The second inspection retrieves logs after the failed healthcheck.
         manager.docker_client.containers.get.side_effect = [NotFound("absent"), container]
-        manager.docker_client.containers.run.return_value = container
+        manager.docker_client.containers.create.return_value = container
     manager._wait_for_container_ready = AsyncMock(side_effect=TimeoutError("healthcheck failed"))
     with pytest.raises(TimeoutError, match="healthcheck failed"):
         await manager.start_tool_container("image", container_name="owned")

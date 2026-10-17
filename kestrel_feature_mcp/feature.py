@@ -360,6 +360,16 @@ class MCPAgent(Feature):
                 container_name, "enabled",
                 metadata={"mode": "container", "image": image_name, "args": args},
             )
+            data = {
+                "container": container_name, "image": image_name,
+                "tools": tool_names, "mounted": mounted,
+            }
+            if not tool_names:
+                return ToolResult.partial(
+                    f"Connected to {image_name} as {container_name}; no tools were advertised.",
+                    "The server advertised an empty tool catalog.",
+                    data=data,
+                )
             mount_note = (
                 f" Mounted {mounted} as callable tools."
                 if mounted else
@@ -368,10 +378,7 @@ class MCPAgent(Feature):
             return ToolResult.ok(
                 f"Loaded {image_name} as {container_name}. Tools: {', '.join(tool_names)}."
                 + mount_note,
-                data={
-                    "container": container_name, "image": image_name,
-                    "tools": tool_names, "mounted": mounted,
-                },
+                data=data,
             )
         except (TimeoutError, RuntimeError, ValueError) as e:
             logger.error(f"Failed to load tool {image_name}: {e}")
@@ -488,13 +495,35 @@ class MCPAgent(Feature):
             for t in self.gateway_manager.get_all_tools():
                 tools.append({**t, "container": "gateway"})
 
+        containers = []
+        for name, info in self.manager.owned_containers.items():
+            connection = info["connection"]
+            catalog = info["tools"]
+            containers.append({
+                "container": name, "catalog_ready": catalog is not None,
+                "connected": bool(connection is not None and connection.is_connected),
+                "tool_count": len(catalog) if catalog is not None else None,
+            })
+        data = {"tools": tools, "containers": containers}
+        container_summary = "".join(
+            f"- [{item['container']}] "
+            f"{'connected' if item['connected'] else 'disconnected'}, "
+            f"{item['tool_count'] if item['catalog_ready'] else 'unknown'} tool(s)\n"
+            for item in containers
+        )
+
         if not tools:
-            return ToolResult.ok("No MCP tools loaded.", data={"tools": []})
+            if containers:
+                summary = "MCP containers:\n" + container_summary + "No tools are available."
+                if any(not item["connected"] or not item["catalog_ready"] for item in containers):
+                    return ToolResult.partial(summary, "An owned container is not ready for tool calls.", data=data)
+                return ToolResult.ok(summary, data=data)
+            return ToolResult.ok("No MCP tools loaded.", data=data)
 
         response = "Available MCP Tools:\n"
         for t in tools:
             response += f"- [{t.get('container', '?')}] {t['name']}: {t.get('description', '')}\n"
-        return ToolResult.ok(response, data={"tools": tools})
+        return ToolResult.ok(response + container_summary, data=data)
 
     @tool(
         name="mcp_unload_server",
@@ -511,8 +540,19 @@ class MCPAgent(Feature):
         if self.manager is None:
             return ToolResult.failed("MCP tools are not available (Docker not accessible)")
 
+        # Resolve the same image-to-resource identity used by load, and only
+        # select records this manager actually owns. Exact identifiers win.
+        if len(self.manager.owned_containers) and container_name not in self.manager.owned_containers:
+            from .manager import container_name_for_image
+
+            image = self._normalize_image_ref(container_name)
+            if image is not None:
+                candidate = container_name_for_image(image, self.manager.owner_did)
+                if candidate in self.manager.owned_containers:
+                    container_name = candidate
+
         gwm = self.gateway_manager
-        if gwm is not None and gwm.is_connected:
+        if container_name not in self.manager.owned_containers and gwm is not None and gwm.is_connected:
             enabled = getattr(getattr(gwm, "gateway", None), "requested_servers", set())
             # Accept the catalog name OR the same image alias the load accepted
             # (e.g. `mcp/time` -> `time`), so load/unload stay symmetric.

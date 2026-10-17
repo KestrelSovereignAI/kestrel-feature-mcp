@@ -19,6 +19,7 @@ import time
 import hashlib
 import json
 from contextlib import ExitStack
+from functools import wraps
 from typing import Dict, Any, List, Optional
 
 try:
@@ -41,6 +42,7 @@ from .constants import (
     CALL_TOOL_TIMEOUT,
     MCP_REMOVAL_ATTEMPTS,
     MCP_REMOVAL_RETRY_DELAY,
+    MCP_CONTAINER_BIND_HOST,
 )
 from .gateway import DockerMCPGateway, DockerMCPGatewayError, DockerMCPNotInstalledError
 
@@ -88,6 +90,19 @@ class ContainerOwnershipError(RuntimeError):
     """An existing Docker process does not belong to this agent/connection."""
 
 
+def _serialize_container_lifecycle(operation):
+    """One agent's resource mutations cannot replace each other's owners.
+
+    Ordinary tool calls stay concurrent and hold no configuration lock while
+    waiting on a server. These transitions perform only bounded setup/teardown.
+    """
+    @wraps(operation)
+    async def serialized(self, *args, **kwargs):
+        async with self._lifecycle_lock:
+            return await operation(self, *args, **kwargs)
+    return serialized
+
+
 class MCPToolManager:
     """
     Manages MCP tools running in Docker containers.
@@ -98,6 +113,7 @@ class MCPToolManager:
         self._owner_did = _require_owner_did(owner_did)
         self.owned_containers: Dict[str, Dict[str, Any]] = {}
         self.docker_client = docker_client
+        self._lifecycle_lock = asyncio.Lock()
 
     @property
     def owner_did(self) -> str:
@@ -197,8 +213,8 @@ class MCPToolManager:
 
                 host_port = int(ports[port_key][0]['HostPort'])
 
-                if await self._check_port_ready('localhost', host_port):
-                    if await self._check_mcp_ready('localhost', host_port):
+                if await self._check_port_ready(MCP_CONTAINER_BIND_HOST, host_port):
+                    if await self._check_mcp_ready(MCP_CONTAINER_BIND_HOST, host_port):
                         logger.info(
                             f"Container {container_name} ready after {attempt} attempts "
                             f"({elapsed:.1f}s)"
@@ -249,6 +265,7 @@ class MCPToolManager:
             ready = False
         return ready
 
+    @_serialize_container_lifecycle
     async def start_tool_container(self, image_name: str, container_name: str = None, command: List[str] = None, environment: Dict[str, str] = None, volumes: Dict[str, Dict[str, str]] = None) -> str:
         """Starts a Docker container for an MCP tool. Returns the container name."""
         if not container_name:
@@ -301,12 +318,12 @@ class MCPToolManager:
 
             logger.info(f"Starting container {container_name} from {image_name}...")
             container = await asyncio.to_thread(
-                lambda: self.docker_client.containers.run(
+                lambda: self.docker_client.containers.create(
                     image_name,
                     command=command,
                     name=container_name,
                     detach=True,
-                    ports={'8000/tcp': None},
+                    ports={'8000/tcp': (MCP_CONTAINER_BIND_HOST, None)},
                     environment=env,
                     volumes=volumes or {},
                     labels={MCP_OWNER_LABEL: self.owner_did, MCP_IMAGE_LABEL: image_name},
@@ -314,6 +331,7 @@ class MCPToolManager:
             )
 
             self._retain_container(container_name, container)
+            await asyncio.to_thread(container.start)
             await self._wait_for_container_ready(container_name, port=8000)
             await asyncio.to_thread(container.reload)
             return container_name
@@ -364,6 +382,7 @@ class MCPToolManager:
                 await connection.close()
             info["connection"] = None
 
+    @_serialize_container_lifecycle
     async def connect_to_tool(self, container_name: str):
         """Connect to a running container with native Streamable HTTP."""
         await self._drop_connection(container_name)
@@ -376,7 +395,7 @@ class MCPToolManager:
         host_port = ports["8000/tcp"][0]["HostPort"]
         record = self._retain_container(container_name, container)
         connection = MCPConnection(
-            f"http://localhost:{host_port}/mcp",
+            f"http://{MCP_CONTAINER_BIND_HOST}:{host_port}/mcp",
             connect_timeout=SESSION_CONNECT_TIMEOUT_SHORT,
             call_timeout=CALL_TOOL_TIMEOUT,
         )
@@ -401,6 +420,7 @@ class MCPToolManager:
                 await asyncio.sleep(MCP_REMOVAL_RETRY_DELAY)
         raise TimeoutError(f"MCP container {name!r} is still registered after removal")
 
+    @_serialize_container_lifecycle
     async def stop_tool(self, container_name: str) -> bool:
         """Stops a tool, closes connection, and stops container.
 
