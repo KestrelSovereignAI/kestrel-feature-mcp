@@ -109,3 +109,28 @@ configuration transitions are serialized per agent; ordinary MCP tool calls
 remain concurrent and hold no configuration lock.
 
 Docker catalog discovery uses the current OCI catalog JSON API. Set `KESTREL_MCP_DOCKER_CATALOG` to select a catalog reference (default `mcp/docker-mcp-catalog`). Missing metadata is pulled into Docker's cache; unreadable catalogs return an error. Catalog counts describe available definitions, while gateway status reports this process's requested configuration and observed tools.
+
+The installation CI matrix also runs the production connection through the
+official [MCP conformance harness](https://github.com/modelcontextprotocol/conformance),
+pinned to `0.2.0-alpha.12` with an npm integrity lock. It runs `tools_call` and
+`request-metadata` explicitly at `2026-07-28`, with no expected-failure baseline.
+These checks cover native tool exchange, wire schemas, per-request metadata and
+version negotiation retry. Optional client capabilities that Kestrel does not
+advertise are reported as skipped by the official scenario. The OAuth, input
+request and extension scenarios remain outside this initial CI profile; passing
+these two scenarios does not establish full client conformance (epic #3679 A7).
+
+To run the same profile locally with Python test dependencies and Node 24+:
+
+```bash
+npm ci --prefix tests/conformance --ignore-scripts --no-audit --no-fund
+for scenario in tools_call request-metadata; do
+  tests/conformance/node_modules/.bin/conformance client \
+    --command '.venv/bin/python tests/conformance/client.py' \
+    --scenario "$scenario" --spec-version 2026-07-28 --timeout 60000 \
+    --output-dir "tests/conformance/results/$scenario" || exit $?
+done
+```
+
+Update the pinned harness and lock together, rerun both scenarios, and review
+new required scenarios as the remaining host capabilities land.

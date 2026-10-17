@@ -19,6 +19,7 @@ class HTTPMCPServer:
     server: uvicorn.Server
     task: asyncio.Task
     settings: dict
+    mcp: MCPServer
 
     async def stop(self):
         self.server.should_exit = True
@@ -113,7 +114,7 @@ async def mcp_http_server(request):
 
     try:
         await asyncio.wait_for(ready(), 5)
-        yield HTTPMCPServer(f"http://127.0.0.1:{port}/mcp", requests, server, task, settings)
+        yield HTTPMCPServer(f"http://127.0.0.1:{port}/mcp", requests, server, task, settings, mcp)
     finally:
         server.should_exit = True
         await asyncio.wait_for(task, 5)
