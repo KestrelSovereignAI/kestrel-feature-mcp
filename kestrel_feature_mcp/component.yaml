@@ -4,10 +4,8 @@ version: 1.0.0
 entry_point: feature.py
 
 tools:
-  - mcp_call_tool
   - mcp_catalog
   - mcp_docker_catalog
-  - mcp_gateway_call
   - mcp_gateway_enable
   - mcp_gateway_start
   - mcp_gateway_stop
