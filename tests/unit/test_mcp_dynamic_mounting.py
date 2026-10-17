@@ -264,7 +264,7 @@ class TestMounting:
 @pytest.mark.asyncio
 async def test_shutdown_attempts_every_resource_and_propagates_cleanup_errors():
     manager = MagicMock()
-    manager.active_tools = {"a": {}, "b": {}}
+    manager.owned_containers = {"a": {}, "b": {}}
     manager.stop_tool = AsyncMock(side_effect=[TimeoutError("a close failed"), True])
     manager.aclose = AsyncMock()
     gateway = MagicMock()
@@ -332,3 +332,61 @@ async def test_failed_gateway_reconfiguration_unpublishes_tools(operation, monke
     assert result.status is ToolResultStatus.ERROR
     assert _GATEWAY_OWNER not in host.registered
     feature._persist_server.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"discover_delay": 0}], indirect=True)
+@pytest.mark.parametrize("failure", ["healthcheck", "handshake"])
+async def test_failed_container_reload_withdraws_handles_and_retires_the_old_owner(mcp_http_server, failure, monkeypatch):
+    from urllib.parse import urlsplit
+    from kestrel_feature_mcp.manager import MCPToolManager
+
+    monkeypatch.setattr("kestrel_feature_mcp.manager.SESSION_CONNECT_TIMEOUT_SHORT", 0.5)
+    host = _FakeHost()
+    manager = MCPToolManager(docker_client=MagicMock())
+    feature = _feature(host, manager=manager)
+    name = "mcp-acme-native-latest"
+    owner = _container_owner(name)
+    container = MagicMock()
+    container.status = "running"
+    container.ports = {"8000/tcp": [{"HostPort": str(urlsplit(mcp_http_server.url).port)}]}
+    manager.docker_client.containers.get.return_value = container
+    manager._wait_for_container_ready = AsyncMock()
+    first = await feature._load_via_container("acme/native:latest")
+    assert first.status is ToolResultStatus.OK
+    assert host.registered[owner]
+    previous = manager.owned_containers[name]["connection"]
+
+    def restarting():
+        assert owner not in host.registered
+        assert manager.owned_containers[name]["container"] is container
+        assert manager.owned_containers[name]["connection"] is None
+        assert manager.owned_containers[name]["tools"] is None
+        assert not previous.is_connected
+
+    container.restart.side_effect = restarting
+    if failure == "healthcheck":
+        manager._wait_for_container_ready.side_effect = TimeoutError("reload healthcheck failed")
+    else:
+        mcp_http_server.settings["discover_delay"] = 2
+    try:
+        result = await feature._load_via_container("acme/native:latest")
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data == {"container": name, "image": "acme/native:latest"}
+        expected_error = "healthcheck" if failure == "healthcheck" else "deadline"
+        assert expected_error in result.error
+        assert owner not in host.registered
+        assert manager.owned_containers[name]["container"] is container
+        assert manager.get_all_tools() == []
+        assert previous._task is None
+        manager._wait_for_container_ready.side_effect = None
+        mcp_http_server.settings["discover_delay"] = 0
+        recovered = await feature._load_via_container("acme/native:latest")
+        assert recovered.status is ToolResultStatus.OK
+        assert host.registered[owner]
+        assert (await manager.call_tool(name, "echo", {"text": "recovered"})).content[0].text == "recovered"
+    finally:
+        mcp_http_server.settings["discover_delay"] = 0
+        if name in manager.owned_containers:
+            await manager._drop_connection(name)
+        await manager.aclose()

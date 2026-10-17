@@ -162,7 +162,7 @@ async def test_container_reconnect_uses_native_client_and_retires_old_owner(mcp_
     manager = container_manager(url)
     try:
         await manager.connect_to_tool("test")
-        old = manager.active_tools["test"]["connection"]
+        old = manager.owned_containers["test"]["connection"]
         await manager.connect_to_tool("test")
         assert not old.is_connected
         assert old._task is None
@@ -211,7 +211,9 @@ async def test_list_timeout_never_publishes_a_dead_manager(monkeypatch, mcp_http
     with pytest.raises((TimeoutError, MCPError, DockerMCPGatewayError)):
         await call
     if kind == "container":
-        assert manager.active_tools == {}
+        assert manager.owned_containers["test"]["tools"] is None
+        assert not manager.owned_containers["test"]["connection"].is_connected
+        await manager._drop_connection("test")
     else:
         assert manager.connection is None
         assert manager.tools == {}
@@ -442,3 +444,23 @@ async def test_uncooperative_cleanup_has_a_finite_join_and_retains_ownership():
         await asyncio.wait({owner}, timeout=1)
         await connection.close()
     assert connection._task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"list_delay": 0.25}], indirect=True)
+async def test_container_retains_startup_owner_without_admitting_calls_before_discovery(mcp_http_server):
+    manager = container_manager(mcp_http_server.url)
+    startup = asyncio.create_task(manager.connect_to_tool("test"))
+    try:
+        async with asyncio.timeout(2):
+            while ("test" not in manager.owned_containers
+                   or not manager.owned_containers["test"]["connection"].is_connected):
+                await asyncio.sleep(0.001)
+        with pytest.raises(ValueError, match="not connected"):
+            await manager.call_tool("test", "echo", {"text": "premature"})
+        await startup
+        result = await manager.call_tool("test", "echo", {"text": "published"})
+        assert result.content[0].text == "published"
+    finally:
+        await asyncio.wait({startup}, timeout=2)
+        await manager._drop_connection("test")

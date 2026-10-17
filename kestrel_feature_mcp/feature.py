@@ -337,8 +337,15 @@ class MCPAgent(Feature):
 
     async def _load_via_container(self, image_name: str, args: List[str] = None) -> ToolResult:
         """Per-container load path for native-HTTP MCP images."""
+        from .manager import container_name_for_image
+
+        requested_name = container_name_for_image(image_name)
+        self._unmount_tools(_container_owner(requested_name))
+        failure_context = {"container": requested_name, "image": image_name}
         try:
-            container_name = await self.manager.start_tool_container(image_name, command=args)
+            container_name = await self.manager.start_tool_container(
+                image_name, container_name=requested_name, command=args,
+            )
             tools = await self.manager.connect_to_tool(container_name)
             # Mount the container's tools as first-class LLM tools. The caller
             # closure binds the container; the host registry routes the call
@@ -347,13 +354,7 @@ class MCPAgent(Feature):
                 t for t in (self.manager.get_all_tools() or [])
                 if t.get("container") == container_name
             ]
-            # connect_to_tool returns the tool objects; be defensive if a path
-            # ever yields None/empty by falling back to the authoritative mounted
-            # set (get_all_tools) so load never false-fails on name extraction.
-            if tools:
-                tool_names = [t.name for t in tools]
-            else:
-                tool_names = [t.get("name") for t in tool_dicts if t.get("name")]
+            tool_names = [tool.name for tool in tools]
             owner = _container_owner(container_name)
             mounted = self._mount_tools(
                 owner, container_name, tool_dicts,
@@ -379,10 +380,10 @@ class MCPAgent(Feature):
             )
         except (TimeoutError, RuntimeError, ValueError) as e:
             logger.error(f"Failed to load tool {image_name}: {e}")
-            return ToolResult.failed(f"Failed to load MCP tool: {str(e)}")
+            return ToolResult.failed(f"Failed to load MCP tool: {str(e)}", data=failure_context)
         except Exception as e:
             logger.error(f"Unexpected error loading tool {image_name}: {e}", exc_info=True)
-            return ToolResult.failed(f"Failed to load MCP tool: {str(e)}")
+            return ToolResult.failed(f"Failed to load MCP tool: {str(e)}", data=failure_context)
 
     async def _retire_gateway(self):
         """Retire an owned gateway even when its MCP transport already died."""
@@ -1059,6 +1060,6 @@ class MCPAgent(Feature):
         async with AsyncExitStack() as cleanup:
             if manager is not None:
                 cleanup.push_async_callback(manager.aclose)
-                for name in reversed(list(manager.active_tools)):
+                for name in reversed(list(manager.owned_containers)):
                     cleanup.push_async_callback(stop_container, name)
             cleanup.push_async_callback(self._retire_gateway)

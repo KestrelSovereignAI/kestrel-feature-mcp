@@ -16,10 +16,10 @@ async def test_call_timeout_uses_the_real_connection(kind, mcp_http_server):
     url = mcp_http_server.url
     connection = MCPConnection(url, call_timeout=0.05)
     try:
-        await connection.connect()
+        tools = await connection.connect()
         if kind == "container":
             manager = MCPToolManager(docker_client=MagicMock())
-            manager.active_tools["test"] = {"connection": connection}
+            manager.owned_containers["test"] = {"connection": connection, "tools": tools}
             call = manager.call_tool("test", "echo", {"text": "slow"})
         else:
             manager = MCPGatewayManager()

@@ -79,7 +79,7 @@ async def mcp_manager(docker_available):
     yield manager
 
     # Cleanup all active tools
-    active_containers = list(manager.active_tools.keys())
+    active_containers = list(manager.owned_containers.keys())
     for container in active_containers:
         try:
             await manager.stop_tool(container)
@@ -293,7 +293,7 @@ class TestMultipleServers:
             assert len(tools) >= 2
 
         # Verify all tracked
-        assert len(mcp_manager.active_tools) == len(containers)
+        assert len(mcp_manager.owned_containers) == len(containers)
 
         # Execute on each
         for i, name in enumerate(containers):
