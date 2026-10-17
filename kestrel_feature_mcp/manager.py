@@ -22,17 +22,9 @@ from contextlib import ExitStack
 from functools import wraps
 from typing import Dict, Any, List, Optional
 
-try:
-    import docker
-    from docker.models.containers import Container
-    from docker.errors import NotFound, DockerException, APIError, ImageNotFound
-except ImportError:
-    docker = None  # type: ignore[assignment]
-    Container = None  # type: ignore[assignment,misc]
-    NotFound = None  # type: ignore[assignment,misc]
-    DockerException = None  # type: ignore[assignment,misc]
-    APIError = None  # type: ignore[assignment,misc]
-    ImageNotFound = None  # type: ignore[assignment,misc]
+import docker
+from docker.models.containers import Container
+from docker.errors import NotFound, DockerException, APIError, ImageNotFound
 
 from .connection import MCPConnection, MCP_CONNECTION_ERRORS
 from .images import normalize_image_ref
@@ -91,6 +83,10 @@ class ContainerOwnershipError(RuntimeError):
     """An existing Docker process does not belong to this agent/connection."""
 
 
+class DockerDaemonUnavailableError(RuntimeError):
+    """The required Docker SDK cannot connect to the local daemon."""
+
+
 def _serialize_container_lifecycle(operation):
     """One agent's resource mutations cannot replace each other's owners.
 
@@ -129,11 +125,6 @@ class MCPToolManager:
         accepts only an already-open client through dependency injection.
         """
         _require_owner_did(owner_did)
-        if docker is None:
-            raise ImportError(
-                "docker package is required for MCPToolManager. "
-                "Install it with: pip install kestrel-feature-mcp"
-            )
 
         def _connect():
             with ExitStack() as pending:
@@ -147,7 +138,7 @@ class MCPToolManager:
             client = await asyncio.to_thread(_connect)
         except docker.errors.DockerException as e:
             logger.warning(f"Docker connection failed: {e}")
-            raise RuntimeError(f"Docker not available for MCP tools: {e}")
+            raise DockerDaemonUnavailableError(f"Docker not available for MCP tools: {e}") from e
         logger.info("MCPToolManager initialized with Docker connection")
         return cls(owner_did=owner_did, docker_client=client)
 

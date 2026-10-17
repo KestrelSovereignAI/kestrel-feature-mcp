@@ -80,6 +80,10 @@ container entries using the former global identifiers require explicit removal
 with `!mcp-unload <old-identifier>` and reconnection with `!mcp-load <image>`.
 An already absent container can report a no-op after clearing its saved entry.
 Shut down the old feature before upgrading to release the processes it owns.
+Hosts expose their agent DID through `agent_id`. Missing required Python
+dependencies, invalid identities and unexpected initialization failures stop
+startup. An unavailable local Docker daemon disables local Docker operations;
+it is handled separately from an invalid installation.
 
 Container creation is recorded before Docker starts the process, so a rejected
 command still leaves an identifiable resource that unload can reclaim. Resource

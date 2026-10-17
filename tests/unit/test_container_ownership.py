@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+import builtins
+import sys
 
 from docker.errors import DockerException, NotFound
 import pytest
@@ -82,19 +84,20 @@ async def test_created_container_carries_agent_and_connection_identity():
         MCP_OWNER_LABEL: manager.owner_did, MCP_IMAGE_LABEL: "image:latest",
     }
     assert client.containers.create.call_args.args[0] == "image:latest"
+    assert client.containers.create.call_args.kwargs["ports"] == {"8000/tcp": ("127.0.0.1", None)}
     assert name == container_name_for_image("image", manager.owner_did)
     assert manager.owned_containers[name]["container"] is client.containers.create.return_value
     with pytest.raises(AttributeError):
         manager.owner_did = "did:test:other"
 
 
-@pytest.mark.parametrize("failure", [DockerException("ping failed"), TypeError("bad client")])
+@pytest.mark.parametrize("failure", [DockerException("ping failed"), TypeError("bad client"), RuntimeError("bad implementation")])
 @pytest.mark.asyncio
 async def test_failed_ping_releases_client_and_preserves_unexpected_errors(failure, monkeypatch):
     client = MagicMock()
     client.ping.side_effect = failure
     monkeypatch.setattr(manager_module.docker, "from_env", MagicMock(return_value=client))
-    error_type = RuntimeError if isinstance(failure, DockerException) else TypeError
+    error_type = RuntimeError if isinstance(failure, DockerException) else type(failure)
     with pytest.raises(error_type):
         await MCPToolManager.create(owner_did="did:test:owner")
     client.close.assert_called_once()
@@ -129,6 +132,56 @@ async def test_feature_initialization_binds_the_hosts_agent_identity(monkeypatch
     await feature.initialize()
     create.assert_awaited_once_with(owner_did="did:test:host-agent")
     assert feature.manager is manager
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["acquire", "ping"])
+async def test_daemon_unavailability_disables_only_local_docker_tools(monkeypatch, caplog, failure_stage):
+    client = MagicMock()
+    acquire = MagicMock(return_value=client)
+    if failure_stage == "acquire":
+        acquire.side_effect = DockerException("daemon unavailable")
+    else:
+        client.ping.side_effect = DockerException("daemon unavailable")
+    monkeypatch.setattr(manager_module.docker, "from_env", acquire)
+    feature = MCPAgent(SimpleNamespace(agent_id="did:test:host-agent"))
+    await feature.initialize()
+    assert feature.manager is None and feature.gateway_manager is None
+    assert "daemon unavailable" in caplog.text
+    if failure_stage == "ping":
+        client.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_missing_required_python_dependency_fails_startup_clearly(monkeypatch):
+    original_import = builtins.__import__
+    failure = ModuleNotFoundError("required docker SDK is not installed")
+
+    def import_without_docker(name, *args, **kwargs):
+        if name == "docker":
+            raise failure
+        return original_import(name, *args, **kwargs)
+
+    feature = MCPAgent(SimpleNamespace(agent_id="did:test:host-agent"))
+    with monkeypatch.context() as isolated:
+        isolated.delitem(sys.modules, "kestrel_feature_mcp.manager")
+        isolated.setattr(builtins, "__import__", import_without_docker)
+        with pytest.raises(ModuleNotFoundError, match="required docker SDK") as caught:
+            await feature.initialize()
+        assert caught.value is failure
+
+
+@pytest.mark.asyncio
+async def test_unexpected_runtime_failure_is_not_classified_as_daemon_unavailability(monkeypatch):
+    client = MagicMock()
+    failure = RuntimeError("programming error in ping")
+    client.ping.side_effect = failure
+    monkeypatch.setattr(manager_module.docker, "from_env", MagicMock(return_value=client))
+    feature = MCPAgent(SimpleNamespace(agent_id="did:test:host-agent"))
+    with pytest.raises(RuntimeError, match="programming error in ping") as caught:
+        await feature.initialize()
+    assert caught.value is failure
+    client.close.assert_called_once()
 
 
 @pytest.mark.asyncio

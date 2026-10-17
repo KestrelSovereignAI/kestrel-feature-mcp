@@ -104,15 +104,22 @@ async def test_container_unload_accepts_the_image_reference_used_to_load_it(mcp_
 
 
 @pytest.mark.asyncio
-async def test_owned_container_identifier_takes_precedence_over_a_gateway_alias(mcp_http_server):
+@pytest.mark.parametrize("selector", ["identifier", "image"])
+async def test_owned_container_identifier_takes_precedence_over_a_gateway_alias(mcp_http_server, selector):
     feature, manager, name = _native_container_feature(mcp_http_server, "acme/native:latest")
     try:
         assert (await feature.load_tool("acme/native:latest")).status is ToolResultStatus.OK
         feature.gateway_manager = SimpleNamespace(is_connected=True, gateway=SimpleNamespace(requested_servers={name}))
-        feature._resolve_load_route = AsyncMock(side_effect=AssertionError("owned identifier consulted another route"))
+        if selector == "identifier":
+            feature._resolve_load_route = AsyncMock(side_effect=AssertionError("owned identifier consulted another route"))
+        else:
+            feature._resolve_load_route = AsyncMock(wraps=feature._resolve_load_route)
         feature._unload_via_gateway = AsyncMock(side_effect=AssertionError("owned container was sent to gateway unload"))
-        assert (await feature.unload_tool(name)).status is ToolResultStatus.OK
-        feature._resolve_load_route.assert_not_awaited()
+        assert (await feature.unload_tool(name if selector == "identifier" else "acme/native:latest")).status is ToolResultStatus.OK
+        if selector == "identifier":
+            feature._resolve_load_route.assert_not_awaited()
+        else:
+            feature._resolve_load_route.assert_awaited_once_with("acme/native:latest")
         feature._unload_via_gateway.assert_not_awaited()
         assert manager.owned_containers == {}
     finally:
@@ -134,6 +141,53 @@ async def test_unowned_image_alias_preserves_the_requested_identifier():
     manager.stop_tool.assert_awaited_once_with("acme/not-loaded")
     feature._forget_server.assert_awaited_once_with("acme/not-loaded")
     assert manager.owned_containers == {"another-owned-resource": {}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["load", "unload"])
+@pytest.mark.parametrize("selector", [None, "", "  ", 123])
+async def test_invalid_selector_returns_an_error_before_catalog_or_resource_io(operation, selector):
+    feature = _feature(manager=SimpleNamespace())
+    feature._resolve_load_route = AsyncMock(side_effect=AssertionError("invalid selector reached catalog I/O"))
+    feature._forget_server = AsyncMock(side_effect=AssertionError("invalid selector cleared desired state"))
+    result = await feature.load_tool(selector) if operation == "load" else await feature.unload_tool(selector)
+    assert result.status is ToolResultStatus.ERROR
+    assert "non-empty string" in result.error
+    feature._resolve_load_route.assert_not_awaited()
+    feature._forget_server.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unload_resolves_an_unowned_alias_only_once(mcp_http_server):
+    feature, manager, name = _native_container_feature(mcp_http_server, "acme/native:latest")
+    try:
+        assert (await feature.load_tool("acme/native:latest")).status is ToolResultStatus.OK
+        feature.gateway_manager = SimpleNamespace(is_connected=True, gateway=SimpleNamespace(requested_servers={"time"}))
+        feature._known_catalog_servers = AsyncMock(return_value={"time"})
+        result = await feature.unload_tool("unknown-native")
+        assert result.status is ToolResultStatus.ERROR
+        feature._known_catalog_servers.assert_awaited_once()
+        assert name in manager.owned_containers
+    finally:
+        feature.gateway_manager = None
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_selector_cannot_select_a_same_named_owned_image(mcp_http_server):
+    feature, manager, name = _native_container_feature(mcp_http_server, "time:latest")
+    try:
+        assert (await feature._load_via_container("time:latest")).status is ToolResultStatus.OK
+        feature.gateway_manager = SimpleNamespace(is_connected=True, gateway=SimpleNamespace(requested_servers={"time"}))
+        feature._unload_via_gateway = AsyncMock(return_value=ToolResult.ok("removed gateway server"))
+        result = await feature.unload_tool("time")
+        assert result.status is ToolResultStatus.OK
+        feature._unload_via_gateway.assert_awaited_once_with("time")
+        assert name in manager.owned_containers
+        assert manager.owned_containers[name]["connection"].is_connected
+    finally:
+        feature.gateway_manager = None
+        await feature.shutdown()
 
 
 # ---------------------------------------------------------------------------

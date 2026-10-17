@@ -49,6 +49,12 @@ def _container_owner(container_name: str) -> str:
     return f"mcp:container:{container_name}"
 
 
+def _selector_failure(selector: str) -> Optional[ToolResult]:
+    if not isinstance(selector, str) or not selector.strip():
+        return ToolResult.failed("An MCP server selector must be a non-empty string")
+    return None
+
+
 class MCPAgent(Feature):
     """
     A Feature Agent that manages Model Context Protocol (MCP) tools.
@@ -64,21 +70,19 @@ class MCPAgent(Feature):
         )
 
     async def initialize(self):
+        self.manager = None
+        self.gateway_manager: Optional["MCPGatewayManager"] = None
+        # A broken required Python dependency must fail startup clearly.
+        from .manager import MCPToolManager, DockerDaemonUnavailableError
+
         try:
-            # Lazy import to avoid loading MCP/anyio at module import time
-            from .manager import MCPToolManager, MCPGatewayManager
             # Connect the Docker client off the event loop (F397) — the sync
             # from_env()/ping() in the constructor would stall every agent on
             # the host until the daemon socket responds.
             self.manager = await MCPToolManager.create(owner_did=self.agent.agent_id)
-            self.gateway_manager: Optional["MCPGatewayManager"] = None
             logger.info("MCPAgent initialized.")
-        except RuntimeError as e:
-            # Docker not available - expected in some environments
-            logger.warning(f"MCPAgent initialization failed (likely Docker unavailable): {e}")
-            logger.info("MCPAgent disabled - Docker tools will not be available")
-            self.manager = None
-            self.gateway_manager = None
+        except DockerDaemonUnavailableError as e:
+            logger.warning("Local Docker daemon unavailable; Docker MCP tools are disabled: %s", e)
 
     # =========================================================================
     # Dynamic tool mounting — make a server's tools first-class LLM tools
@@ -314,6 +318,9 @@ class MCPAgent(Feature):
         native-HTTP images through the per-container path; see _gateway_target.
         Returns a success message with the available tools.
         """
+        invalid = _selector_failure(server)
+        if invalid is not None:
+            return invalid
         if self.manager is None:
             return ToolResult.failed("MCP tools are not available (Docker not accessible)")
 
@@ -529,34 +536,32 @@ class MCPAgent(Feature):
         Symmetric with load: a server currently enabled on the gateway is
         disabled there; otherwise the per-container path stops the container.
         """
+        invalid = _selector_failure(container_name)
+        if invalid is not None:
+            return invalid
         if self.manager is None:
             return ToolResult.failed("MCP tools are not available (Docker not accessible)")
 
         # Resolve the same image-to-resource identity used by load, and only
         # select records this manager actually owns. Exact identifiers win.
-        if len(self.manager.owned_containers) and container_name not in self.manager.owned_containers:
-            from .manager import container_name_for_image
+        if container_name not in self.manager.owned_containers:
+            gwm = self.gateway_manager
+            if len(self.manager.owned_containers) or (gwm is not None and gwm.is_connected):
+                route, resolved = await self._resolve_load_route(container_name)
+                if route == "container" and len(self.manager.owned_containers):
+                    from .manager import container_name_for_image
 
-            route, image = await self._resolve_load_route(container_name)
-            if route == "container":
-                candidate = container_name_for_image(image, self.manager.owner_did)
-                if candidate in self.manager.owned_containers:
-                    container_name = candidate
+                    candidate = container_name_for_image(resolved, self.manager.owner_did)
+                    if candidate in self.manager.owned_containers:
+                        container_name = candidate
 
-        gwm = self.gateway_manager
-        if container_name not in self.manager.owned_containers and gwm is not None and gwm.is_connected:
-            enabled = getattr(getattr(gwm, "gateway", None), "requested_servers", set())
-            # Accept the catalog name OR the same image alias the load accepted
-            # (e.g. `mcp/time` -> `time`), so load/unload stay symmetric.
-            route, resolved = await self._resolve_load_route(container_name)
-            gw_name = resolved if route == "gateway" else None
-            target = (
-                container_name if container_name in enabled
-                else gw_name if gw_name in enabled
-                else None
-            )
-            if target is not None:
-                return await self._unload_via_gateway(target)
+                gwm = self.gateway_manager
+                if container_name not in self.manager.owned_containers and gwm is not None and gwm.is_connected:
+                    enabled = getattr(getattr(gwm, "gateway", None), "requested_servers", set())
+                    gw_name = resolved if route == "gateway" else None
+                    target = container_name if container_name in enabled else gw_name if gw_name in enabled else None
+                    if target is not None:
+                        return await self._unload_via_gateway(target)
 
         # Withdraw callable handles and desired configuration before teardown;
         # a failed close must never advertise a destroyed container's tools.
