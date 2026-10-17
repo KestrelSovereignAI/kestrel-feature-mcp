@@ -276,3 +276,59 @@ async def test_shutdown_attempts_every_resource_and_propagates_cleanup_errors():
     assert [call.args[0] for call in manager.stop_tool.await_args_list] == ["a", "b"]
     manager.aclose.assert_awaited_once()
     gateway.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_container_unload_unpublishes_and_forgets_before_stopping():
+    host = _FakeHost()
+    owner = _container_owner("mcp_failed")
+    host.registered[owner] = ["stale"]
+    manager = MagicMock()
+    feature = _feature(host, manager=manager)
+    feature._forget_server = AsyncMock()
+
+    async def fail_stop(name):
+        assert owner not in host.registered
+        feature._forget_server.assert_awaited_once_with(name)
+        raise TimeoutError("close deadline exceeded")
+
+    manager.stop_tool = AsyncMock(side_effect=fail_stop)
+    result = await feature.unload_tool("mcp_failed")
+    assert result.status is ToolResultStatus.ERROR
+    assert "close deadline" in result.error
+    assert owner not in host.registered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["load", "enable", "unload"])
+async def test_failed_gateway_reconfiguration_unpublishes_tools(operation, monkeypatch):
+    monkeypatch.setattr("kestrel_feature_mcp.feature.check_docker_mcp_available", lambda: True)
+    host = _FakeHost()
+    host.registered[_GATEWAY_OWNER] = ["stale"]
+    gateway = MagicMock()
+    gateway.is_connected = True
+    gateway.tools = {"fetch": object()}
+    gateway.gateway = SimpleNamespace(requested_servers={"fetch", "time"})
+    feature = _feature(host, manager=MagicMock(), gateway=gateway)
+    feature._reject_unknown_servers = AsyncMock(return_value=None)
+    feature._forget_server = AsyncMock()
+    feature._persist_server = AsyncMock()
+
+    async def fail_reconnect(name):
+        assert _GATEWAY_OWNER not in host.registered
+        if operation == "unload":
+            feature._forget_server.assert_awaited_once_with(name)
+        gateway.is_connected = False
+        raise TimeoutError("reconnect deadline exceeded")
+
+    gateway.enable_server = AsyncMock(side_effect=fail_reconnect)
+    gateway.disable_server = AsyncMock(side_effect=fail_reconnect)
+    if operation == "load":
+        result = await feature._load_via_gateway("sqlite")
+    elif operation == "enable":
+        result = await feature.gateway_enable("sqlite")
+    else:
+        result = await feature.unload_tool("time")
+    assert result.status is ToolResultStatus.ERROR
+    assert _GATEWAY_OWNER not in host.registered
+    feature._persist_server.assert_not_awaited()

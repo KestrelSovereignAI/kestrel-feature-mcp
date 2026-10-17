@@ -20,14 +20,12 @@ from kestrel_feature_mcp.gateway import (
     DockerMCPGateway,
     DockerMCPGatewayError,
     DockerMCPNotInstalledError,
-    list_available_servers,
 )
 from kestrel_feature_mcp.manager import MCPGatewayManager
 from kestrel_feature_mcp.registry import (
     check_docker_mcp_available,
     list_docker_catalog_servers,
     search_docker_catalog,
-    format_docker_catalog_summary,
 )
 
 # Configure logging
@@ -59,12 +57,6 @@ class TestDockerMCPAvailability:
         # This should return True or False, not raise
         assert isinstance(result, bool)
 
-    def test_format_docker_catalog_summary(self):
-        """Test catalog summary formatting."""
-        summary = format_docker_catalog_summary()
-        assert isinstance(summary, str)
-        # Should either show server count or indicate not installed
-        assert "Docker MCP" in summary or "not installed" in summary.lower()
 
 
 class TestDockerMCPCatalog:

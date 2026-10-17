@@ -86,8 +86,14 @@ async def mcp_http_server(request):
             body.extend(message.get("body", b""))
             return message
 
+        async def write(message):
+            await send(message)
+            if (message["type"] == "http.response.start" and body
+                    and b'"initialize"' in body):
+                await asyncio.sleep(settings.get("initialize_body_delay", 0))
+
         try:
-            await app(scope, read, send)
+            await app(scope, read, write)
         finally:
             requests.append((scope, bytes(body)))
 

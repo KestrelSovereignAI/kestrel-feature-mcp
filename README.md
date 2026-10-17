@@ -58,11 +58,14 @@ prove readiness of every requested server.
 Tool discovery follows pagination and fails on repeated cursors. Negotiation
 uses the connection deadline, then discovery uses the whole-call deadline.
 Cancelled startup joins its transport owner before returning. Shutdown has its
-own finite deadline (`KESTREL_MCP_CLOSE_TIMEOUT`, default 15 seconds), including
-session termination on handshake-era connections. Cancelling shutdown propagates
-to its caller and preserves the owner for a later cleanup attempt.
+own graceful deadline (`KESTREL_MCP_CLOSE_TIMEOUT`, default 15 seconds), including
+session termination and partially completed SDK entry. Forced cleanup gets one
+further budget of the same length. The owner timer survives caller cancellation;
+failures propagate and any unfinished owner is retained for a cleanup retry.
 
 Upgrade the MCP feature before upgrading a host with the Phoenix 20/Pydantic AI
 2 dependency set. Feature 0.4's `mcp<2` requirement cannot resolve with that set.
 The host dependency lock must be regenerated and verified as part of the same
 rollout (Kestrel Sovereign epic #3679).
+
+Docker catalog discovery uses the current OCI catalog JSON API. Set `KESTREL_MCP_DOCKER_CATALOG` to select a catalog reference (default `mcp/docker-mcp-catalog`). Missing metadata is pulled into Docker's cache; unreadable catalogs return an error. Catalog counts describe available definitions, while gateway status reports this process's requested configuration and observed tools.

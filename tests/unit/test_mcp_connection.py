@@ -364,3 +364,81 @@ async def test_readiness_cleanup_uses_its_own_budget_and_reports_failure(mcp_htt
     port = int(mcp_http_server.url.split(":")[-1].split("/")[0])
     assert not await manager._check_mcp_ready("127.0.0.1", port, timeout=0.1)
     assert not [task for task in asyncio.all_tasks() if task.get_name() == "mcp-connection"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{
+    "legacy": True, "initialize_body_delay": 2, "delete_delay": 2,
+}], indirect=True)
+@pytest.mark.parametrize("close_timeout", [0.1, 15])
+async def test_shutdown_deadline_covers_cleanup_of_a_partial_sdk_entry(mcp_http_server, close_timeout):
+    connection = MCPConnection(mcp_http_server.url, connect_timeout=0.5, close_timeout=close_timeout)
+    try:
+        with pytest.raises(TimeoutError, match="MCP connection deadline"):
+            await asyncio.wait_for(connection.connect(), 3.5)
+    finally:
+        owner = connection._task
+        if owner is not None:
+            await asyncio.wait({owner}, timeout=3)
+        await connection.close()
+    assert connection._task is None
+    assert any(scope["method"] == "DELETE" for scope, _ in mcp_http_server.requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{
+    "legacy": True, "initialize_body_delay": 2, "delete_delay": 2,
+}], indirect=True)
+async def test_abandoned_partial_entry_still_has_an_owned_shutdown_deadline(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url, connect_timeout=0.5, close_timeout=0.5)
+    caller = asyncio.create_task(connection.connect())
+    try:
+        async with asyncio.timeout(1.5):
+            while not any(scope["method"] == "DELETE" for scope, _ in mcp_http_server.requests):
+                await asyncio.sleep(0.001)
+        owner = connection._task
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        done, _ = await asyncio.wait({owner}, timeout=0.8)
+        assert owner in done, "abandoning the caller must not abandon SDK-entry cleanup"
+    finally:
+        retained = connection._task
+        if retained is not None:
+            await asyncio.wait({retained}, timeout=3)
+        await connection.close()
+    assert connection._task is None
+
+
+@pytest.mark.asyncio
+async def test_uncooperative_cleanup_has_a_finite_join_and_retains_ownership():
+    connection = MCPConnection("http://127.0.0.1:1/mcp", close_timeout=0.05)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resistant_owner():
+        try:
+            entered.set()
+            await asyncio.Future()
+        finally:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+    owner = asyncio.create_task(resistant_owner())
+    connection._task = owner
+    owner.add_done_callback(connection._owner_finished)
+    await entered.wait()
+    try:
+        with pytest.raises(TimeoutError, match="MCP shutdown deadline"):
+            await asyncio.wait_for(connection.close(), 1)
+        assert connection._task is owner
+        assert not owner.done()
+        assert not connection.is_connected
+    finally:
+        release.set()
+        await asyncio.wait({owner}, timeout=1)
+        await connection.close()
+    assert connection._task is None

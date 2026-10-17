@@ -15,9 +15,6 @@ all MCP servers regardless of their native transport.
 
 import logging
 import asyncio
-import httpx2
-from mcp.shared.exceptions import MCPError
-from pydantic import ValidationError
 import time
 from typing import Dict, Any, List, Optional
 
@@ -33,14 +30,14 @@ except ImportError:
     APIError = None  # type: ignore[assignment,misc]
     ImageNotFound = None  # type: ignore[assignment,misc]
 
-from .connection import MCPConnection
+from .connection import MCPConnection, MCP_CONNECTION_ERRORS
 
 from .constants import (
     SESSION_CONNECT_TIMEOUT_SHORT,
     SESSION_CONNECT_TIMEOUT_DEFAULT,
     CALL_TOOL_TIMEOUT,
-    MCP_MAX_CONNECTION_ATTEMPTS,
-    MCP_CONNECTION_RETRY_DELAY,
+    MCP_REMOVAL_ATTEMPTS,
+    MCP_REMOVAL_RETRY_DELAY,
 )
 from .gateway import DockerMCPGateway, DockerMCPGatewayError, DockerMCPNotInstalledError
 
@@ -236,7 +233,7 @@ class MCPToolManager:
                 await connection.connect()
             finally:
                 await connection.close()
-        except* (MCPError, httpx2.HTTPError, TimeoutError, OSError, ValidationError):
+        except* MCP_CONNECTION_ERRORS:
             ready = False
         return ready
 
@@ -359,13 +356,13 @@ class MCPToolManager:
             await asyncio.to_thread(container.remove, force=True)
         except NotFound:
             return
-        for attempt in range(MCP_MAX_CONNECTION_ATTEMPTS):
+        for attempt in range(MCP_REMOVAL_ATTEMPTS):
             try:
                 await asyncio.to_thread(self.docker_client.containers.get, name)
             except NotFound:
                 return
-            if attempt + 1 < MCP_MAX_CONNECTION_ATTEMPTS:
-                await asyncio.sleep(MCP_CONNECTION_RETRY_DELAY)
+            if attempt + 1 < MCP_REMOVAL_ATTEMPTS:
+                await asyncio.sleep(MCP_REMOVAL_RETRY_DELAY)
         raise TimeoutError(f"MCP container {name!r} is still registered after removal")
 
     async def stop_tool(self, container_name: str) -> bool:

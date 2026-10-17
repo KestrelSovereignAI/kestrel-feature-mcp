@@ -81,8 +81,8 @@ async def test_failed_gateway_disconnect_retains_owner_for_cleanup_retry():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("removed", [False, True])
 async def test_removal_is_confirmed_before_reporting_unload(monkeypatch, removed):
-    monkeypatch.setattr("kestrel_feature_mcp.manager.MCP_MAX_CONNECTION_ATTEMPTS", 2)
-    monkeypatch.setattr("kestrel_feature_mcp.manager.MCP_CONNECTION_RETRY_DELAY", 0)
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCP_REMOVAL_ATTEMPTS", 2)
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCP_REMOVAL_RETRY_DELAY", 0)
     manager = MCPToolManager(docker_client=MagicMock())
     container = MagicMock()
     manager.active_tools["test"] = {"connection": AsyncMock(), "container": container, "tools": []}

@@ -9,6 +9,9 @@ from collections.abc import Mapping
 from contextlib import AsyncExitStack
 
 import httpx2
+from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
+from pydantic import ValidationError
+from mcp.shared.exceptions import MCPError
 from mcp import Client, types
 from mcp.client.streamable_http import streamable_http_client
 
@@ -16,6 +19,11 @@ from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSI
 
 
 logger = logging.getLogger(__name__)
+
+MCP_CONNECTION_ERRORS = (
+    MCPError, httpx2.HTTPError, TimeoutError, OSError, ValidationError,
+    BrokenResourceError, ClosedResourceError, EndOfStream,
+)
 
 
 class _ConnectionResources(AsyncExitStack):
@@ -28,6 +36,24 @@ class _ConnectionResources(AsyncExitStack):
     async def __aexit__(self, exc_type, exc_value, traceback):
         async with asyncio.timeout(self._timeout):
             return await super().__aexit__(exc_type, exc_value, traceback)
+
+
+class _ShutdownDeadline:
+    """A graceful deadline that outlives a cancelled shutdown caller."""
+
+    def __init__(self, task: asyncio.Task, timeout: float):
+        self.expired = False
+        self._task = task
+        self._timer = asyncio.get_running_loop().call_later(timeout, self._expire)
+
+    def _expire(self):
+        if not self._task.done():
+            self.expired = True
+            logger.warning("MCP graceful shutdown deadline expired; cancelling SDK cleanup")
+            self._task.cancel()
+
+    def cancel(self):
+        self._timer.cancel()
 
 
 class MCPConnection:
@@ -60,6 +86,7 @@ class MCPConnection:
         self._client: Client | None = None
         self._task: asyncio.Task[None] | None = None
         self._ready: asyncio.Future[Client] | None = None
+        self._shutdown: _ShutdownDeadline | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -68,6 +95,7 @@ class MCPConnection:
             and self._task is not None
             and not self._task.done()
             and not self._task.cancelling()
+            and self._shutdown is None
         )
 
     @property
@@ -79,6 +107,8 @@ class MCPConnection:
         # Always observe the task outcome, including a failure after startup.
         # Deliver startup failures to connect immediately instead of waiting
         # for the connection timeout and hiding the original error.
+        if self._shutdown is not None:
+            self._shutdown.cancel()
         error = None if task.cancelled() else task.exception()
         if error is not None:
             logger.warning("MCP connection owner failed", exc_info=error)
@@ -112,22 +142,34 @@ class MCPConnection:
         finally:
             self._client = None
 
+    async def _close_failed_startup(self, exc_type, exc_value, traceback):
+        if exc_type is not None and issubclass(exc_type, (TimeoutError, asyncio.CancelledError)):
+            try:
+                await self.close()
+            except* MCP_CONNECTION_ERRORS as cleanup_error:
+                # Preserve the operation deadline/caller cancellation. A late
+                # SDK write into a closed transport is secondary cleanup evidence.
+                logger.warning("MCP startup cleanup also failed", exc_info=cleanup_error)
+        else:
+            await self.close()
+        return False
+
     async def connect(self) -> list[types.Tool]:
         if self._task is not None:
             raise RuntimeError("MCP connection already started; close it before reconnecting")
         self._ready = asyncio.get_running_loop().create_future()
         self._task = asyncio.create_task(self._run(), name="mcp-connection")
         self._task.add_done_callback(self._owner_finished)
-        published = False
-        try:
-            async with asyncio.timeout(self._connect_timeout):
-                await self._ready
+        async with AsyncExitStack() as startup:
+            startup.push_async_exit(self._close_failed_startup)
+            try:
+                async with asyncio.timeout(self._connect_timeout):
+                    await self._ready
+            except TimeoutError as error:
+                raise TimeoutError("MCP connection deadline exceeded") from error
             tools = await self.list_tools()
-            published = True
+            startup.pop_all()
             return tools
-        finally:
-            if not published:
-                await self.close()
 
     def _require_client(self) -> Client:
         if not self.is_connected or self._client is None:
@@ -162,19 +204,36 @@ class MCPConnection:
         if task is None:
             return
         already_done = task.done()
-        if not task.cancelling():
+        if not already_done and self._shutdown is None:
+            # Task.cancelling() also counts SDK/AnyIO cancellation. Track OUR
+            # shutdown explicitly, so its cleanup is never mistaken for ours.
+            self._shutdown = _ShutdownDeadline(task, self._close_timeout)
             task.cancel()
         try:
-            # Waiting observes completion without confusing owner cancellation
-            # with cancellation of this caller. A cancelled caller retains the
-            # owner so shutdown can be rejoined; the owner bounds its cleanup.
-            await asyncio.wait({task})
-            # A historical transport failure is already observed/logged by
-            # the owner callback. It must not masquerade as a new close error.
+            # A partially-entered SDK client can clean up inside __aenter__,
+            # before our resource stack's __aexit__ starts. The independent
+            # graceful timer interrupts that cleanup even if this caller
+            # abandons the join. Forced cleanup gets one further bounded budget.
+            await asyncio.wait(
+                {task}, timeout=self._close_timeout + self._close_timeout,
+            )
+            expired = self._shutdown is not None and self._shutdown.expired
+            if not task.done() or (expired and not already_done):
+                error = TimeoutError(
+                    "MCP shutdown deadline exceeded while closing SDK resources"
+                )
+                if task.done() and not task.cancelled():
+                    raise error from task.exception()
+                raise error
+            # A historical transport failure is observed by the owner callback,
+            # rather than masquerading as a new cleanup error.
             if not task.cancelled() and not already_done:
                 task.result()
         finally:
             if task.done():
+                if self._shutdown is not None:
+                    self._shutdown.cancel()
+                self._shutdown = None
                 self._task = None
                 self._ready = None
                 self._client = None

@@ -178,26 +178,6 @@ async def test_call_tool_routes_gateway_owner_to_gateway():
 
 
 @pytest.mark.asyncio
-async def test_load_via_gateway_does_not_persist_failed_enable(monkeypatch):
-    # enable_server reconnects to prior servers (returns their tools) but the
-    # requested server never lands in requested_servers -> must fail, not persist.
-    monkeypatch.setattr("kestrel_feature_mcp.feature.check_docker_mcp_available", lambda: True)
-    gw = MagicMock()
-    gw.is_connected = True
-    gw.tools = {"fetch": object()}
-    gw.gateway = SimpleNamespace(requested_servers={"fetch"})  # 'broken' never added
-    gw.enable_server = AsyncMock(return_value=[SimpleNamespace(name="fetch")])
-    gw.get_all_tools = MagicMock(return_value=[{"name": "fetch", "description": "", "inputSchema": {}}])
-    feat = _feature(manager=MagicMock(), gateway=gw)
-    feat._reject_unknown_servers = AsyncMock(return_value=None)
-    feat._persist_server = AsyncMock()
-
-    res = await feat._load_via_gateway("broken")
-    assert res.status is ToolResultStatus.ERROR
-    feat._persist_server.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_unload_accepts_image_alias_for_gateway_server():
     # Loaded as `mcp/time` (-> catalog `time`); unloading by the same image
     # alias must hit the gateway server, not fall through to container unload.

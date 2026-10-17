@@ -21,9 +21,7 @@ import asyncio
 import contextlib
 import logging
 import os
-import re
 import secrets
-import shutil
 import socket
 import subprocess
 import threading
@@ -480,27 +478,3 @@ class DockerMCPGateway:
     def is_running(self) -> bool:
         """Check if the gateway is running."""
         return self.process is not None and self.process.poll() is None
-
-
-async def list_available_servers() -> List[str]:
-    """List all available servers from Docker MCP catalog."""
-    try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            ["docker", "mcp", "catalog", "show", "docker-mcp"],
-            capture_output=True,
-            text=True,
-            timeout=SSH_COMMAND_TIMEOUT_DEFAULT
-        )
-        if result.returncode != 0:
-            return []
-
-        servers = []
-        for line in result.stdout.split('\n'):
-            match = re.search(r'\*\*([a-zA-Z0-9_-]+)\*\*', line)
-            if match:
-                servers.append(match.group(1))
-
-        return servers
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return []

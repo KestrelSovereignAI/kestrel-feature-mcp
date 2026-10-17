@@ -15,13 +15,15 @@ private server definitions.
 
 import asyncio
 import logging
-import re
+import os
 import subprocess
 import tomllib
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import List, Optional, Dict, Any
+
+from pydantic import BaseModel, Field, ValidationError
 
 from .constants import (
     SSH_COMMAND_TIMEOUT_SHORT,
@@ -271,150 +273,63 @@ def check_docker_mcp_available() -> bool:
         return False
 
 
+class DockerCatalogError(RuntimeError):
+    """The Docker catalog could not be read or validated."""
+
+
+class _DockerCatalogServer(BaseModel):
+    name: str = Field(min_length=1)
+    description: str = ""
+
+
+class _DockerCatalogSnapshot(BaseModel):
+    server: _DockerCatalogServer
+
+
+class _DockerCatalogEntry(BaseModel):
+    snapshot: _DockerCatalogSnapshot
+
+
+class _DockerCatalog(BaseModel):
+    servers: list[_DockerCatalogEntry]
+
+
 async def list_docker_catalog_servers() -> List[Dict[str, str]]:
-    """List all servers from Docker MCP catalog."""
+    """Read Docker's OCI catalog through its structured CLI, or fail clearly.
+
+    This is discovery metadata, not evidence that a server is configured or
+    running in any gateway/profile. Pulling a missing catalog only caches its
+    metadata; it does not enable servers or modify profiles.
+    """
+    reference = os.environ.get("KESTREL_MCP_DOCKER_CATALOG", "mcp/docker-mcp-catalog")
     try:
         result = await asyncio.to_thread(
             subprocess.run,
-            ["docker", "mcp", "catalog", "show", "docker-mcp"],
+            ["docker", "mcp", "catalog", "show", reference,
+             "--format", "json", "--pull", "missing"],
             capture_output=True,
             text=True,
-            timeout=SSH_COMMAND_TIMEOUT_DEFAULT
+            timeout=SSH_COMMAND_TIMEOUT_DEFAULT,
         )
-        if result.returncode != 0:
-            logger.warning(f"Failed to list Docker MCP catalog: {result.stderr}")
-            return []
-
-        servers = []
-        current_name = None
-        current_desc_lines = []
-
-        ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
-        clean_output = ansi_escape.sub('', result.stdout)
-
-        for line in clean_output.split('\n'):
-            stripped = line.strip()
-
-            if not stripped or stripped.startswith('\u2500') or 'servers available' in stripped.lower():
-                continue
-            if stripped == 'MCP Server Directory':
-                continue
-
-            original_indent = len(line) - len(line.lstrip())
-
-            if stripped and original_indent <= 3 and not stripped.startswith('\u2022'):
-                if current_name:
-                    servers.append({
-                        'name': current_name,
-                        'description': ' '.join(current_desc_lines).strip()[:200]
-                    })
-                current_name = stripped
-                current_desc_lines = []
-            elif current_name and stripped:
-                current_desc_lines.append(stripped)
-
-        if current_name:
-            servers.append({
-                'name': current_name,
-                'description': ' '.join(current_desc_lines).strip()[:200]
-            })
-
-        return servers
-
-    except subprocess.TimeoutExpired as e:
-        logger.warning(f"Timeout listing Docker MCP catalog: {e}")
-        return []
-    except FileNotFoundError as e:
-        logger.warning(f"Docker command not found: {e}")
-        return []
-    except OSError as e:
-        logger.warning(f"OS error listing Docker MCP catalog: {e}")
-        return []
-    except Exception as e:
-        logger.warning(f"Unexpected error listing Docker MCP catalog: {e}", exc_info=True)
-        return []
-
-
-async def list_enabled_docker_servers() -> List[str]:
-    """List currently enabled servers in Docker MCP."""
+    except (subprocess.TimeoutExpired, OSError) as error:
+        raise DockerCatalogError(f"Could not read Docker MCP catalog {reference}: {error}") from error
+    if result.returncode != 0:
+        raise DockerCatalogError(
+            f"Could not read Docker MCP catalog {reference}: {result.stderr.strip()}"
+        )
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            ["docker", "mcp", "server", "ls"],
-            capture_output=True,
-            text=True,
-            timeout=SSH_COMMAND_TIMEOUT_DEFAULT
-        )
-        if result.returncode != 0:
-            return []
-
-        servers = []
-        in_table = False
-        for line in result.stdout.split('\n'):
-            if 'NAME' in line and 'DESCRIPTION' in line:
-                in_table = True
-                continue
-            if in_table and line.strip() and not line.startswith('-'):
-                parts = line.split()
-                if parts:
-                    servers.append(parts[0])
-
-        return servers
-
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return []
-    except Exception as e:
-        logger.debug(f"Unexpected error listing enabled Docker servers: {e}", exc_info=True)
-        return []
+        catalog = _DockerCatalog.model_validate_json(result.stdout)
+    except ValidationError as error:
+        raise DockerCatalogError(f"Invalid Docker MCP catalog {reference}: {error}") from error
+    return [entry.snapshot.server.model_dump() for entry in catalog.servers]
 
 
 async def search_docker_catalog(query: str) -> List[Dict[str, str]]:
-    """Search the Docker MCP catalog for servers matching a query."""
+    """Search an available catalog; unreadable metadata is never an empty match."""
     all_servers = await list_docker_catalog_servers()
     query_lower = query.lower()
-
     return [
-        s for s in all_servers
-        if query_lower in s['name'].lower() or query_lower in s.get('description', '').lower()
+        server for server in all_servers
+        if query_lower in server["name"].lower()
+        or query_lower in server["description"].lower()
     ]
-
-
-def format_docker_catalog_summary() -> str:
-    """Format a summary of Docker MCP catalog status."""
-    if not check_docker_mcp_available():
-        return "Docker MCP Toolkit not installed. Install Docker Desktop 29+ with MCP Toolkit."
-
-    try:
-        result = subprocess.run(
-            ["docker", "mcp", "catalog", "show", "docker-mcp"],
-            capture_output=True,
-            text=True,
-            timeout=SSH_COMMAND_TIMEOUT_DEFAULT
-        )
-
-        if result.returncode != 0:
-            return "Docker MCP catalog unavailable."
-
-        server_count = len(re.findall(r'\*\*[a-zA-Z0-9_-]+\*\*', result.stdout))
-
-        enabled_result = subprocess.run(
-            ["docker", "mcp", "server", "ls"],
-            capture_output=True,
-            text=True,
-            timeout=SSH_COMMAND_TIMEOUT_DEFAULT
-        )
-
-        enabled_count = 0
-        if enabled_result.returncode == 0:
-            lines = [l for l in enabled_result.stdout.split('\n')
-                     if l.strip() and not l.startswith('-') and 'NAME' not in l and 'enabled' not in l.lower()]
-            enabled_count = len(lines)
-
-        return f"Docker MCP: {server_count} servers available, {enabled_count} enabled"
-
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        logger.warning(f"Error getting Docker MCP summary: {e}")
-        return "Docker MCP status unknown"
-    except Exception as e:
-        logger.warning(f"Unexpected error getting Docker MCP summary: {e}", exc_info=True)
-        return "Docker MCP status unknown"
