@@ -1,6 +1,6 @@
 # kestrel-feature-mcp
 
-Model Context Protocol (MCP) server management and tool bridging for Kestrel Sovereign. Provides unified access to 311+ MCP servers via Docker MCP Toolkit, direct container management for custom servers, and a searchable catalog of available tools.
+Model Context Protocol (MCP) server management and tool bridging for Kestrel Sovereign. Discover servers in the official MCP Registry, Docker's catalog, or the bundled local catalog. Run Docker MCP gateways and custom container servers through the native MCP client.
 
 ## Installation
 
@@ -10,13 +10,13 @@ uv pip install kestrel-feature-mcp
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk`
+- `kestrel-sovereign-sdk[httpx2]>=0.39.1`
 - `docker>=7.1.0`
 - `mcp>=2.3,<3`
-- `httpx2>=2.10`
 - `requests>=2.34.2`
 - `anyio>=4.7,<5`
 - `pydantic>=2.12,<3`
+- `jsonschema>=4.26,<5`
 
 ## Usage
 
@@ -29,8 +29,10 @@ Once installed, the `MCPAgent` feature is automatically discovered by kestrel-so
 - `!mcp-load <image>` — Load MCP server from Docker image
 - `!mcp-unload <container>` — Unload a container and remove its saved connection
 - `!mcp-list` — List running MCP servers
-- `!mcp-search <query>` — Search MCP catalog
-- `!mcp-catalog` — List all available servers
+- `!mcp-search <query>` — Search official registry server names
+- `!mcp-catalog` — List one page of the official registry
+- `!mcp-info <name>` — Inspect an official namespaced server and version
+- `!mcp-docker-catalog <query>` — Search Docker's catalog
 
 ## Calling tools
 
@@ -50,6 +52,41 @@ waiting for approval. A fresh handle and approval are required after reload.
 | Variable | Description |
 |----------|-------------|
 | `DOCKER_HOST` | Docker daemon socket (optional, defaults to local) |
+| `KESTREL_MCP_REGISTRY_URL` | HTTPS Registry API base, default `https://registry.modelcontextprotocol.io/v0.1` |
+| `KESTREL_MCP_REGISTRY_TIMEOUT` | Request deadline including decoding and schema validation, in seconds; default `30` |
+| `KESTREL_MCP_REGISTRY_MAX_BYTES` | Maximum response body size, default `2097152` bytes |
+
+### Discovery sources
+
+`mcp_search`, `mcp_catalog` and `mcp_server_info` default to `source="official"`.
+Select `source="local"` explicitly to search or inspect bundled entries by
+capability/category. Docker discovery retains the separate `mcp_docker_catalog`
+tool. A local entry never overrides an official entry with the same name, and
+an official registry error never becomes a successful local result.
+
+Official catalog and search requests return one page, with `limit` from 1 to 100
+(default 20). Pass the exact `result.metadata.nextCursor` back as `cursor` for
+the next page. Detail lookup accepts the namespaced server name and an exact
+`version`, or `latest`; results retain the actual version, remote endpoint
+templates, package definitions and registry metadata. Search results are
+discovery metadata: they do not install packages, connect to remote endpoints or
+send credentials. SSE definitions remain visible with an unsupported-transport
+label. These discovery tools work without Docker.
+
+Registry HTTPS requests use the SDK's canonical URL policy and pinned transport,
+with native TLS verification, no redirects and no proxy-environment routing.
+Private registry addresses, malformed responses, failed pagination and HTTP
+errors fail explicitly. The request deadline and byte limit also apply to
+custom registry bases.
+
+The bundled `registry_openapi_2025_12_01.json` is an unmodified JSON conversion of
+the official [Registry API contract](https://github.com/modelcontextprotocol/registry/blob/11b7b0e274d518b6f449c5ee3518a6151d9848b9/docs/reference/api/openapi.yaml),
+commit `11b7b0e274d518b6f449c5ee3518a6151d9848b9`. Its upstream YAML SHA-256 is
+`3ed9ca429754087f2c7de81aa845c1cab3286c33941ac48482f923bbd6f1442d`;
+the converted JSON SHA-256 is
+`69a092a20321d6616d0e83933b1de39916bd0fa87975d7931ef3b92f825c7edc`.
+The upstream license is included alongside it as `registry_contract_LICENSE.txt`.
+This Registry API/schema revision is independent of the MCP wire revision.
 
 ## Development
 

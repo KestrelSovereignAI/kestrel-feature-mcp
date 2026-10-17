@@ -15,6 +15,7 @@ of their native transport protocol.
 
 import asyncio
 from contextlib import AsyncExitStack
+from functools import cached_property
 import logging
 import json
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
@@ -67,6 +68,25 @@ def _loaded_tool_result(confirmation: str, *, data: dict) -> ToolResult:
     return ToolResult.ok(confirmation, data=data)
 
 
+def _format_official_records(records: list[dict[str, Any]]) -> str:
+    lines = ["Official MCP Registry results:"]
+    for record in records:
+        server = record["server"]
+        status = record.get("_meta", {}).get("io.modelcontextprotocol.registry/official", {}).get("status", "unspecified")
+        lines.extend([
+            f"- {server['name']} @ {server['version']} ({status})",
+            f"  {server['description']}",
+        ])
+        for remote in server.get("remotes", []):
+            support = " (unsupported transport)" if remote["type"] != "streamable-http" else ""
+            lines.append(f"  {remote['type']}{support}: {remote['url']}")
+        for package in server.get("packages", []):
+            lines.append(f"  Package: {package['registryType']} / {package['identifier']}")
+    if not records:
+        lines.append("No servers were returned for this page.")
+    return "\n".join(lines)
+
+
 class MCPAgent(Feature):
     """
     A Feature Agent that manages Model Context Protocol (MCP) tools.
@@ -77,7 +97,8 @@ class MCPAgent(Feature):
     @property
     def tool_description(self) -> str:
         return (
-            "Manage Model Context Protocol (MCP) servers - load MCP tools from Docker images, "
+            "Discover MCP servers in the official Registry, Docker and local catalogs; "
+            "load MCP tools from Docker images, "
             "list available tools, call tools on running servers, and unload servers"
         )
 
@@ -641,29 +662,61 @@ class MCPAgent(Feature):
             logger.error(f"Failed to unload gateway server {server_name}: {e}", exc_info=True)
             return ToolResult.failed(f"Failed to unload {server_name}: {str(e)}")
 
+    @cached_property
+    def _official_registry(self):
+        from .official_registry import OfficialRegistryClient
+
+        return OfficialRegistryClient()
+
+    async def _official_registry_page(
+        self, query: str | None, *, cursor: str | None, limit: int,
+    ) -> ToolResult:
+        from .official_registry import OfficialRegistryError
+
+        try:
+            page = await self._official_registry.search(query, cursor=cursor, limit=limit)
+        except OfficialRegistryError as error:
+            return ToolResult.failed(str(error), data={"source": "official"})
+        text = _format_official_records(page.servers)
+        if page.next_cursor is not None:
+            text += "\nNext cursor: " + json.dumps(page.next_cursor, ensure_ascii=True)
+        return ToolResult.ok(text, data={
+            "source": "official", "registry_url": page.registry_url, "result": page.payload,
+        })
+
     @tool(
         name="mcp_search",
-        description="Search available MCP servers by capability, name, or category.",
+        description="Search the official MCP Registry by server name, or select source='local' for bundled capability/category search.",
         category=ToolCategory.SYSTEM,
         command_prefix="!mcp-search"
     )
-    async def search_servers(self, query: str) -> ToolResult:
+    async def search_servers(
+        self, query: str, source: str = "official",
+        cursor: str | None = None, limit: int = 20,
+    ) -> ToolResult:
         """
         Search the MCP server catalog for servers matching a query.
 
         Args:
-            query: Search term - matches against name, description, tools, and categories
+            query: Official server-name substring, or local capability/category
+            source: Explicit catalog; entries never override another source
+            cursor: Official registry's opaque next-page cursor
+            limit: Official registry page size (1 to 100)
 
         Returns:
             List of matching MCP servers with their details.
         """
+        if source == "official":
+            return await self._official_registry_page(query, cursor=cursor, limit=limit)
+        if source != "local" or cursor is not None:
+            return ToolResult.failed("Select source='official' or source='local'; only the official source accepts a cursor.")
         registry = get_registry()
         matches = registry.search(query)
 
         if not matches:
             return ToolResult.ok(
                 f"No MCP servers found matching '{query}'.\n\nTip: Use `!mcp-catalog` to see all available servers.",
-                data={"query": query, "matches": []},
+                data={"source": "local", "query": query, "matches": []},
             )
 
         lines = [f"**MCP servers matching '{query}':**\n"]
@@ -683,44 +736,69 @@ class MCPAgent(Feature):
 
         return ToolResult.ok(
             "\n".join(lines),
-            data={"query": query, "matches": [s.name for s in matches]},
+            data={"source": "local", "query": query, "matches": [s.name for s in matches]},
         )
 
     @tool(
         name="mcp_catalog",
-        description="List all available MCP servers in the catalog.",
+        description="List a page of the official MCP Registry, or select source='local' for the bundled catalog.",
         category=ToolCategory.SYSTEM,
         command_prefix="!mcp-catalog"
     )
-    async def show_catalog(self) -> ToolResult:
+    async def show_catalog(
+        self, source: str = "official",
+        cursor: str | None = None, limit: int = 20,
+    ) -> ToolResult:
         """
-        Display the full MCP server catalog.
+        Display a page of the official registry, or the full local catalog.
 
         Returns:
             Formatted list of all available MCP servers.
         """
+        if source == "official":
+            return await self._official_registry_page(None, cursor=cursor, limit=limit)
+        if source != "local" or cursor is not None:
+            return ToolResult.failed("Select source='official' or source='local'; only the official source accepts a cursor.")
         registry = get_registry()
         return ToolResult.ok(
             registry.format_catalog(),
-            data={"servers": [s.name for s in registry.list_all()]},
+            data={"source": "local", "servers": [s.name for s in registry.list_all()]},
         )
 
     @tool(
         name="mcp_server_info",
-        description="Get detailed information about a specific MCP server.",
+        description="Get an official MCP Registry server by namespaced name and version, or select source='local' for a bundled entry.",
         category=ToolCategory.SYSTEM,
         command_prefix="!mcp-info"
     )
-    async def server_info(self, server_name: str) -> ToolResult:
+    async def server_info(
+        self, server_name: str, source: str = "official",
+        version: str = "latest",
+    ) -> ToolResult:
         """
         Get detailed information about a specific MCP server.
 
         Args:
-            server_name: Name of the server (e.g., "postgres", "fetch")
+            server_name: Official namespaced name, or a local catalog name
+            source: Explicit catalog; there is no cross-source name fallback
+            version: Official version, or 'latest' to resolve the current version
 
         Returns:
             Detailed server information including tools and requirements.
         """
+        if source == "official":
+            from .official_registry import OfficialRegistryError
+
+            try:
+                record = await self._official_registry.get(server_name, version=version)
+            except OfficialRegistryError as error:
+                return ToolResult.failed(str(error), data={"source": "official"})
+            return ToolResult.ok(_format_official_records([record]), data={
+                "source": "official", "registry_url": self._official_registry.settings.api_url.rstrip("/"),
+                "result": record,
+            })
+        if source != "local" or version != "latest":
+            return ToolResult.failed("Select source='official' or source='local'; only the official source accepts a version.")
         registry = get_registry()
         server = registry.get(server_name)
 
@@ -737,7 +815,7 @@ class MCPAgent(Feature):
 
         return ToolResult.ok(
             registry.format_server_info(server),
-            data={"server": server.name},
+            data={"source": "local", "server": server.name},
         )
 
     # =========================================================================

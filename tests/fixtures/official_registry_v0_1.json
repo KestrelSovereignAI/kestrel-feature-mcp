@@ -1,0 +1,28 @@
+{
+  "servers": [
+    {
+      "server": {
+        "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+        "name": "com.example/notes",
+        "description": "Search a workspace and manage notes",
+        "version": "1.2.3",
+        "remotes": [
+          {
+            "type": "streamable-http",
+            "url": "https://notes.example/{workspace}/mcp",
+            "variables": {"workspace": {"description": "Workspace name", "isRequired": true}},
+            "headers": [{"name": "Authorization", "isSecret": true, "value": "Bearer {token}"}]
+          }
+        ],
+        "_meta": {"com.example/extension": {"enabled": true, "empty": {}}}
+      },
+      "_meta": {
+        "io.modelcontextprotocol.registry/official": {
+          "status": "active", "isLatest": true,
+          "publishedAt": "2026-10-17T00:00:00Z"
+        }
+      }
+    }
+  ],
+  "metadata": {"nextCursor": "com.example/notes:1.2.3+opaque /?&=", "count": 1}
+}
