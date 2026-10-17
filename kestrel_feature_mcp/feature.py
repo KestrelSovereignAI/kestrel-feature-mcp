@@ -69,17 +69,12 @@ class MCPAgent(Feature):
             # Connect the Docker client off the event loop (F397) — the sync
             # from_env()/ping() in the constructor would stall every agent on
             # the host until the daemon socket responds.
-            self.manager = await MCPToolManager.create()
+            self.manager = await MCPToolManager.create(owner_did=self.agent.agent_id)
             self.gateway_manager: Optional["MCPGatewayManager"] = None
             logger.info("MCPAgent initialized.")
         except RuntimeError as e:
             # Docker not available - expected in some environments
             logger.warning(f"MCPAgent initialization failed (likely Docker unavailable): {e}")
-            logger.info("MCPAgent disabled - Docker tools will not be available")
-            self.manager = None
-            self.gateway_manager = None
-        except Exception as e:
-            logger.warning(f"Unexpected error initializing MCPAgent: {e}", exc_info=True)
             logger.info("MCPAgent disabled - Docker tools will not be available")
             self.manager = None
             self.gateway_manager = None
@@ -339,7 +334,7 @@ class MCPAgent(Feature):
         """Per-container load path for native-HTTP MCP images."""
         from .manager import container_name_for_image
 
-        requested_name = container_name_for_image(image_name)
+        requested_name = container_name_for_image(image_name, self.manager.owner_did)
         self._unmount_tools(_container_owner(requested_name))
         failure_context = {"container": requested_name, "image": image_name}
         try:
@@ -1041,6 +1036,14 @@ class MCPAgent(Feature):
             if not image:
                 continue
             try:
+                from .manager import container_name_for_image
+
+                expected_name = container_name_for_image(image, self.agent.agent_id)
+                if d["name"] != expected_name:
+                    raise ValueError(
+                        "Stored MCP connection identifier does not match this agent's ownership. "
+                        "Remove that saved connection and reconnect it explicitly."
+                    )
                 await self.load_tool(image, (d.get("metadata") or {}).get("args"))
                 logger.info("Restored persisted MCP container from image %s", image)
             except Exception as e:  # noqa: BLE001

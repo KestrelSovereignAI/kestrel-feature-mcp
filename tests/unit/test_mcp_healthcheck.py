@@ -29,7 +29,7 @@ class TestMCPHealthcheck:
         with patch('kestrel_feature_mcp.manager.docker') as mock_docker:
             mock_docker.from_env.return_value = mock_docker_client
             from kestrel_feature_mcp.manager import MCPToolManager
-            return MCPToolManager()
+            return MCPToolManager(owner_did="did:test:manager", docker_client=mock_docker_client)
 
     @pytest.mark.asyncio
     async def test_check_port_ready_success(self, manager):

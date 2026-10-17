@@ -37,7 +37,7 @@ async def test_create_runs_connect_off_the_event_loop():
 
     with patch("kestrel_feature_mcp.manager.docker") as mock_docker:
         mock_docker.from_env.side_effect = fake_from_env
-        manager = await MCPToolManager.create()
+        manager = await MCPToolManager.create(owner_did="did:test:manager")
 
     assert manager.docker_client is not None
     # from_env ran in a worker thread (asyncio.to_thread), not the loop thread.
@@ -57,7 +57,7 @@ async def test_create_raises_runtimeerror_on_docker_failure():
         mock_docker.errors.DockerException = _DockerException
         mock_docker.from_env.side_effect = _DockerException("no daemon")
         with pytest.raises(RuntimeError):
-            await MCPToolManager.create()
+            await MCPToolManager.create(owner_did="did:test:manager")
 
 
 @pytest.mark.asyncio
@@ -72,19 +72,18 @@ async def test_aclose_runs_off_the_event_loop():
     client = MagicMock()
     client.close.side_effect = fake_close
     with patch("kestrel_feature_mcp.manager.docker"):
-        manager = MCPToolManager(docker_client=client)
+        manager = MCPToolManager(owner_did="did:test:manager", docker_client=client)
         await manager.aclose()
 
     assert seen["thread"] is not main_thread
     assert manager.docker_client is None
 
 
-def test_close_stays_synchronous_for_back_compat():
-    """The original ``close()`` API remains synchronous so existing direct
-    callers keep working (codex P2)."""
+def test_close_closes_the_injected_client():
+    """The synchronous close is the canonical operation behind aclose."""
     client = MagicMock()
     with patch("kestrel_feature_mcp.manager.docker"):
-        manager = MCPToolManager(docker_client=client)
+        manager = MCPToolManager(owner_did="did:test:manager", docker_client=client)
         result = manager.close()  # no await
     assert result is None
     client.close.assert_called_once()

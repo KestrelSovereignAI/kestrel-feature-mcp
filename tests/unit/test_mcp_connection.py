@@ -151,9 +151,10 @@ def container_manager(url):
     port = url.split(":")[-1].split("/")[0]
     container = MagicMock()
     container.ports = {"8000/tcp": [{"HostPort": port}]}
+    container.labels = {"io.kestrel.mcp.agent-did": "did:test:manager"}
     docker_client = MagicMock()
     docker_client.containers.get.return_value = container
-    return MCPToolManager(docker_client=docker_client)
+    return MCPToolManager(owner_did="did:test:manager", docker_client=docker_client)
 
 
 @pytest.mark.asyncio
@@ -301,7 +302,7 @@ async def test_initial_discovery_uses_the_call_budget_after_connecting(mcp_http_
 async def test_readiness_refuses_real_transport_exception_groups():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
-        manager = MCPToolManager(docker_client=MagicMock())
+        manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
         assert not await manager._check_mcp_ready("127.0.0.1", sock.getsockname()[1])
     assert not [task for task in asyncio.all_tasks() if task.get_name() == "mcp-connection"]
 
@@ -311,7 +312,7 @@ async def test_readiness_does_not_hide_unexpected_group_members(monkeypatch):
     error = ExceptionGroup("unexpected", [ValueError("programming defect")])
     connection = SimpleNamespace(connect=AsyncMock(side_effect=error), close=AsyncMock())
     monkeypatch.setattr("kestrel_feature_mcp.manager.MCPConnection", lambda *a, **kw: connection)
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     with pytest.raises(ExceptionGroup) as caught:
         await manager._check_mcp_ready("127.0.0.1", 1)
     assert caught.value.exceptions == error.exceptions
@@ -362,7 +363,7 @@ async def test_close_of_a_dead_transport_does_not_rethrow_its_historical_failure
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mcp_http_server", [{"legacy": True, "delete_delay": 0.5}], indirect=True)
 async def test_readiness_cleanup_uses_its_own_budget_and_reports_failure(mcp_http_server):
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     port = int(mcp_http_server.url.split(":")[-1].split("/")[0])
     assert not await manager._check_mcp_ready("127.0.0.1", port, timeout=0.1)
     assert not [task for task in asyncio.all_tasks() if task.get_name() == "mcp-connection"]

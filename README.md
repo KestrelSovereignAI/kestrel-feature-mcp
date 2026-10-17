@@ -25,6 +25,7 @@ Once installed, the `MCPAgent` feature is automatically discovered by kestrel-so
 - `!mcp-gateway-stop` — Stop gateway
 - `!mcp-gateway-call <tool> <args>` — Call tool through gateway
 - `!mcp-load <image>` — Load MCP server from Docker image
+- `!mcp-unload <container>` — Unload a container and remove its saved connection
 - `!mcp-list` — List running MCP servers
 - `!mcp-search <query>` — Search MCP catalog
 - `!mcp-catalog` — List all available servers
@@ -67,5 +68,13 @@ Upgrade the MCP feature before upgrading a host with the Phoenix 20/Pydantic AI
 2 dependency set. Feature 0.4's `mcp<2` requirement cannot resolve with that set.
 The host dependency lock must be regenerated and verified as part of the same
 rollout (Kestrel Sovereign epic #3679).
+
+Container identities bind the agent DID and image. New managers require
+`owner_did`; they reuse a process only when its ownership and image labels
+match. Each agent can reload or unload its own server independently. Saved
+container entries using the former global identifiers require explicit removal
+with `!mcp-unload <old-identifier>` and reconnection with `!mcp-load <image>`.
+An already absent container can report a no-op after clearing its saved entry.
+Shut down the old feature before upgrading to release the processes it owns.
 
 Docker catalog discovery uses the current OCI catalog JSON API. Set `KESTREL_MCP_DOCKER_CATALOG` to select a catalog reference (default `mcp/docker-mcp-catalog`). Missing metadata is pulled into Docker's cache; unreadable catalogs return an error. Catalog counts describe available definitions, while gateway status reports this process's requested configuration and observed tools.

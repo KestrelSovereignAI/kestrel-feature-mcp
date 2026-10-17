@@ -16,6 +16,9 @@ all MCP servers regardless of their native transport.
 import logging
 import asyncio
 import time
+import hashlib
+import json
+from contextlib import ExitStack
 from typing import Dict, Any, List, Optional
 
 try:
@@ -65,9 +68,24 @@ DOCKER_CLIENT_TIMEOUT = 120
 IMAGE_PULL_TIMEOUT = 600.0
 
 
-def container_name_for_image(image_name: str) -> str:
-    """The canonical container name used by load and lifecycle management."""
-    return f"mcp-{image_name.replace('/', '-').replace(':', '-')}"
+MCP_OWNER_LABEL = "io.kestrel.mcp.agent-did"
+MCP_IMAGE_LABEL = "io.kestrel.mcp.image"
+
+
+def _require_owner_did(owner_did: str) -> str:
+    if not isinstance(owner_did, str) or not owner_did.startswith("did:") or not owner_did[4:]:
+        raise ValueError("An agent DID is required for MCP container ownership")
+    return owner_did
+
+
+def container_name_for_image(image_name: str, owner_did: str) -> str:
+    """Stable resource identity shared by load, restore and manager startup."""
+    identity = json.dumps([_require_owner_did(owner_did), image_name], separators=(",", ":"))
+    return f"mcp-{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+class ContainerOwnershipError(RuntimeError):
+    """An existing Docker process does not belong to this agent/connection."""
 
 
 class MCPToolManager:
@@ -76,43 +94,24 @@ class MCPToolManager:
     Handles container lifecycle and MCP connections.
     """
 
-    def __init__(self, docker_client=None):
-        if docker is None:
-            raise ImportError(
-                "docker package is required for MCPToolManager. "
-                "Install it with: pip install kestrel-feature-mcp"
-            )
+    def __init__(self, *, owner_did: str, docker_client):
+        self._owner_did = _require_owner_did(owner_did)
         self.owned_containers: Dict[str, Dict[str, Any]] = {}
-        if docker_client is not None:
-            # Pre-built client (async ``create`` path, or a test double).
-            self.docker_client = docker_client
-            return
-        # Back-compat/legacy synchronous construction. ``docker.from_env()``
-        # and ``ping()`` are BLOCKING socket ops — running them here on the
-        # event loop stalls every agent on the host (F397). Async callers must
-        # use :meth:`create` instead; this branch remains only for direct
-        # instantiation off the loop (and for tests that patch ``docker``).
-        try:
-            self.docker_client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
-            self.docker_client.ping()
-            logger.info("MCPToolManager initialized with Docker connection")
-        except docker.errors.DockerException as e:
-            logger.warning(f"Docker connection failed: {e}")
-            raise RuntimeError(f"Docker not available for MCP tools: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error initializing Docker: {e}", exc_info=True)
-            raise RuntimeError(f"Docker not available for MCP tools: {e}")
+        self.docker_client = docker_client
+
+    @property
+    def owner_did(self) -> str:
+        return self._owner_did
 
     @classmethod
-    async def create(cls) -> "MCPToolManager":
+    async def create(cls, *, owner_did: str) -> "MCPToolManager":
         """Build the manager with its Docker client connected OFF the loop.
 
         ``docker.from_env()`` and ``ping()`` block on the Docker daemon socket;
-        doing them in ``__init__`` on the event loop freezes every agent on a
-        multi-agent host until they return (F397). This factory runs them in a
-        worker thread. Async callers (e.g. the feature's ``initialize``) must
-        use this rather than ``MCPToolManager()``.
+        this factory runs them in a worker thread (F397). The constructor
+        accepts only an already-open client through dependency injection.
         """
+        _require_owner_did(owner_did)
         if docker is None:
             raise ImportError(
                 "docker package is required for MCPToolManager. "
@@ -120,20 +119,27 @@ class MCPToolManager:
             )
 
         def _connect():
-            client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
-            client.ping()
-            return client
+            with ExitStack() as pending:
+                client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
+                pending.callback(client.close)
+                client.ping()
+                pending.pop_all()
+                return client
 
         try:
             client = await asyncio.to_thread(_connect)
         except docker.errors.DockerException as e:
             logger.warning(f"Docker connection failed: {e}")
             raise RuntimeError(f"Docker not available for MCP tools: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error initializing Docker: {e}", exc_info=True)
-            raise RuntimeError(f"Docker not available for MCP tools: {e}")
         logger.info("MCPToolManager initialized with Docker connection")
-        return cls(docker_client=client)
+        return cls(owner_did=owner_did, docker_client=client)
+
+    def _assert_container_owner(self, container, *, image_name: str | None = None) -> None:
+        labels = container.labels
+        if not isinstance(labels, dict) or labels.get(MCP_OWNER_LABEL) != self.owner_did:
+            raise ContainerOwnershipError("Refusing an MCP container without this agent's ownership label")
+        if image_name is not None and labels.get(MCP_IMAGE_LABEL) != image_name:
+            raise ContainerOwnershipError("Refusing an MCP container with a different connection image")
 
     async def _wait_for_container_ready(
         self,
@@ -246,7 +252,7 @@ class MCPToolManager:
     async def start_tool_container(self, image_name: str, container_name: str = None, command: List[str] = None, environment: Dict[str, str] = None, volumes: Dict[str, Dict[str, str]] = None) -> str:
         """Starts a Docker container for an MCP tool. Returns the container name."""
         if not container_name:
-            container_name = container_name_for_image(image_name)
+            container_name = container_name_for_image(image_name, self.owner_did)
         # Retire the old transport before Docker restarts/replaces its process.
         # A failed healthcheck must not leave an earlier connection published.
         await self._drop_connection(container_name)
@@ -256,6 +262,7 @@ class MCPToolManager:
                 container = await asyncio.to_thread(
                     self.docker_client.containers.get, container_name
                 )
+                self._assert_container_owner(container, image_name=image_name)
                 self._retain_container(container_name, container)
                 if container.status == 'running':
                     logger.info(f"Container {container_name} exists and running. Restarting for clean state...")
@@ -301,7 +308,8 @@ class MCPToolManager:
                     detach=True,
                     ports={'8000/tcp': None},
                     environment=env,
-                    volumes=volumes or {}
+                    volumes=volumes or {},
+                    labels={MCP_OWNER_LABEL: self.owner_did, MCP_IMAGE_LABEL: image_name},
                 )
             )
 
@@ -361,6 +369,7 @@ class MCPToolManager:
         await self._drop_connection(container_name)
         container = await asyncio.to_thread(self.docker_client.containers.get, container_name)
         await asyncio.to_thread(container.reload)
+        self._assert_container_owner(container)
         ports = container.ports
         if not ports or not ports.get("8000/tcp"):
             raise ValueError(f"Container {container_name} does not expose port 8000")

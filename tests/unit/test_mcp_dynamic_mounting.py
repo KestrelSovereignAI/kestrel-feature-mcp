@@ -339,16 +339,17 @@ async def test_failed_gateway_reconfiguration_unpublishes_tools(operation, monke
 @pytest.mark.parametrize("failure", ["healthcheck", "handshake"])
 async def test_failed_container_reload_withdraws_handles_and_retires_the_old_owner(mcp_http_server, failure, monkeypatch):
     from urllib.parse import urlsplit
-    from kestrel_feature_mcp.manager import MCPToolManager
+    from kestrel_feature_mcp.manager import MCPToolManager, container_name_for_image
 
     monkeypatch.setattr("kestrel_feature_mcp.manager.SESSION_CONNECT_TIMEOUT_SHORT", 0.5)
     host = _FakeHost()
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     feature = _feature(host, manager=manager)
-    name = "mcp-acme-native-latest"
+    name = container_name_for_image("acme/native:latest", manager.owner_did)
     owner = _container_owner(name)
     container = MagicMock()
     container.status = "running"
+    container.labels = {"io.kestrel.mcp.agent-did": manager.owner_did, "io.kestrel.mcp.image": "acme/native:latest"}
     container.ports = {"8000/tcp": [{"HostPort": str(urlsplit(mcp_http_server.url).port)}]}
     manager.docker_client.containers.get.return_value = container
     manager._wait_for_container_ready = AsyncMock()
