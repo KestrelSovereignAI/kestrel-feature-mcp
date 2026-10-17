@@ -145,7 +145,7 @@ async def test_unowned_image_alias_preserves_the_requested_identifier():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["load", "unload"])
-@pytest.mark.parametrize("selector", [None, "", "  ", 123])
+@pytest.mark.parametrize("selector", [None, "", "  ", 123, " acme/native", "acme/native "])
 async def test_invalid_selector_returns_an_error_before_catalog_or_resource_io(operation, selector):
     feature = _feature(manager=SimpleNamespace())
     feature._resolve_load_route = AsyncMock(side_effect=AssertionError("invalid selector reached catalog I/O"))
@@ -187,6 +187,33 @@ async def test_a_gateway_selector_cannot_select_a_same_named_owned_image(mcp_htt
         assert manager.owned_containers[name]["connection"].is_connected
     finally:
         feature.gateway_manager = None
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_saved_container_mode_never_reenters_environment_dependent_routing(mcp_http_server):
+    image = "time:latest"
+    feature, manager, name = _native_container_feature(mcp_http_server, image)
+    feature.agent.get_enablement_deltas = AsyncMock(return_value=[{
+        "name": name, "state": "enabled",
+        "metadata": {"mode": "container", "image": image, "args": ["serve"]},
+    }])
+    feature.agent.persist_feature_enablement = AsyncMock()
+    feature._resolve_load_route = AsyncMock(side_effect=AssertionError("saved container mode consulted catalog routing"))
+    try:
+        await feature.post_all_features_loaded(feature.agent)
+        feature._resolve_load_route.assert_not_awaited()
+        assert manager.owned_containers[name]["connection"].is_connected
+        assert {t.name for t in manager.owned_containers[name]["tools"]} == {"echo", "fail"}
+        manager.docker_client.containers.get.return_value.restart.assert_called_once()
+        feature.agent.persist_feature_enablement.assert_awaited_once_with(
+            "mcp_server", name, "enabled", actor="agent",
+            metadata={"mode": "container", "image": image, "args": ["serve"]},
+        )
+        wrapper = next(w for w in feature.agent.registered[_container_owner(name)] if w.name.endswith("__echo"))
+        result = await wrapper.execute(text="restored container mode")
+        assert result["status"] == "ok" and "restored container mode" in result["confirmation"]
+    finally:
         await feature.shutdown()
 
 

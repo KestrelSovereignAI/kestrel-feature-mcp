@@ -78,12 +78,18 @@ container ports bind only to host loopback. Listings retain failed containers'
 identifiers so they can be unloaded even when no tools were published. Saved
 container entries using the former global identifiers require explicit removal
 with `!mcp-unload <old-identifier>` and reconnection with `!mcp-load <image>`.
-An already absent container can report a no-op after clearing its saved entry.
+The current unload result does not distinguish saved-configuration removal
+from live-process removal; outcome reporting is tracked in
+[#26](https://github.com/KestrelSovereignAI/kestrel-feature-mcp/issues/26).
 Shut down the old feature before upgrading to release the processes it owns.
 Hosts expose their agent DID through `agent_id`. Missing required Python
 dependencies, invalid identities and unexpected initialization failures stop
 startup. An unavailable local Docker daemon disables local Docker operations;
-it is handled separately from an invalid installation.
+it is handled separately from an invalid installation. This includes Docker SDK
+errors and its Requests transport failures during connection or ping. Other
+implementation errors still fail startup. Saved container connections retain
+their container mode when restored, even if the Docker catalog changes. Server
+selectors and image references reject surrounding whitespace before routing.
 
 Container creation is recorded before Docker starts the process, so a rejected
 command still leaves an identifiable resource that unload can reclaim. Resource

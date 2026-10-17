@@ -8,6 +8,7 @@ requires-python = ">=3.11,<3.15"
 dependencies = [
     "kestrel-sovereign-sdk>=0.10,<1",
     "docker>=7.1.0",
+    "requests>=2.34.2",
     "mcp>=2.3,<3",
     "httpx2>=2.10",
     "anyio>=4.7,<5",

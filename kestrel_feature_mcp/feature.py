@@ -50,8 +50,8 @@ def _container_owner(container_name: str) -> str:
 
 
 def _selector_failure(selector: str) -> Optional[ToolResult]:
-    if not isinstance(selector, str) or not selector.strip():
-        return ToolResult.failed("An MCP server selector must be a non-empty string")
+    if not isinstance(selector, str) or not selector or selector != selector.strip():
+        return ToolResult.failed("An MCP server selector must be a non-empty string without surrounding whitespace")
     return None
 
 
@@ -1085,7 +1085,7 @@ class MCPAgent(Feature):
                         "Stored MCP connection identifier does not match this agent's ownership. "
                         "Remove that saved connection and reconnect it explicitly."
                     )
-                await self.load_tool(image, (d.get("metadata") or {}).get("args"))
+                await self._load_via_container(image, (d.get("metadata") or {}).get("args"))
                 logger.info("Restored persisted MCP container from image %s", image)
             except Exception as e:  # noqa: BLE001
                 logger.warning("Failed to restore MCP container %s: %s", image, e)

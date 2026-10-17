@@ -12,12 +12,20 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import socket
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import pytest_asyncio
+from requests.exceptions import ConnectionError as RequestsConnectionError, ReadTimeout
+
+from kestrel_feature_mcp import manager as manager_module
+from kestrel_feature_mcp.feature import MCPAgent
 
 from kestrel_feature_mcp.gateway import DockerMCPGateway
-from kestrel_feature_mcp.manager import DOCKER_CLIENT_TIMEOUT, MCPToolManager
+from kestrel_feature_mcp.manager import DOCKER_CLIENT_TIMEOUT, DockerDaemonUnavailableError, MCPToolManager
 
 
 # --- F397: connect off the event loop ---------------------------------------
@@ -43,6 +51,7 @@ async def test_create_runs_connect_off_the_event_loop():
     # from_env ran in a worker thread (asyncio.to_thread), not the loop thread.
     assert seen["thread"] is not main_thread
     manager.docker_client.ping.assert_called_once()
+    manager.docker_client.close.assert_not_called()
     # Client is built with an explicit socket-read timeout so a hung daemon
     # can't leave a worker thread blocked forever (F397).
     mock_docker.from_env.assert_called_once_with(timeout=DOCKER_CLIENT_TIMEOUT)
@@ -88,6 +97,72 @@ def test_close_closes_the_injected_client():
     assert result is None
     client.close.assert_called_once()
     assert manager.docker_client is None
+
+
+@pytest_asyncio.fixture
+async def failing_docker_http(request, monkeypatch):
+    """Real docker-py/Requests I/O; a loopback HTTP daemon fails only ping."""
+    release_ping = threading.Event()
+    observed = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            observed.append(self.path)
+            if self.path == "/version":
+                body = b'{"ApiVersion": "1.45"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/v1.45/_ping":
+                if request.param == "timeout":
+                    release_ping.wait(5)
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+            else:
+                self.send_error(404)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    monkeypatch.setenv("DOCKER_HOST", f"tcp://127.0.0.1:{server.server_port}")
+    for name in ("DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                 "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    monkeypatch.setattr(manager_module, "DOCKER_CLIENT_TIMEOUT", 1)
+    thread.start()
+    try:
+        yield observed
+    finally:
+        release_ping.set()
+        await asyncio.to_thread(server.shutdown)
+        await asyncio.to_thread(server.server_close)
+        await asyncio.to_thread(thread.join, 5)
+        assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("failing_docker_http,error_type", [
+    ("disconnect", RequestsConnectionError), ("timeout", ReadTimeout),
+], indirect=["failing_docker_http"])
+async def test_real_docker_ping_transport_failure_is_a_typed_daemon_error(failing_docker_http, error_type):
+    with pytest.raises(DockerDaemonUnavailableError) as caught:
+        await MCPToolManager.create(owner_did="did:test:loopback-daemon")
+    assert isinstance(caught.value.__cause__, error_type)
+    assert failing_docker_http == ["/version", "/v1.45/_ping"]
+
+
+@pytest.mark.parametrize("failing_docker_http", ["disconnect", "timeout"], indirect=True)
+async def test_feature_survives_real_daemon_ping_transport_failure(failing_docker_http, caplog):
+    feature = MCPAgent(SimpleNamespace(agent_id="did:test:loopback-daemon"))
+    await feature.initialize()
+    assert feature.manager is None and feature.gateway_manager is None
+    assert "Local Docker daemon unavailable" in caplog.text
+    assert failing_docker_http == ["/version", "/v1.45/_ping"]
 
 
 # --- F398: gateway stdout drained for the process's whole life --------------

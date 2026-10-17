@@ -23,8 +23,8 @@ from functools import wraps
 from typing import Dict, Any, List, Optional
 
 import docker
-from docker.models.containers import Container
-from docker.errors import NotFound, DockerException, APIError, ImageNotFound
+from docker.errors import NotFound
+from requests.exceptions import RequestException
 
 from .connection import MCPConnection, MCP_CONNECTION_ERRORS
 from .images import normalize_image_ref
@@ -136,7 +136,7 @@ class MCPToolManager:
 
         try:
             client = await asyncio.to_thread(_connect)
-        except docker.errors.DockerException as e:
+        except (docker.errors.DockerException, RequestException) as e:
             logger.warning(f"Docker connection failed: {e}")
             raise DockerDaemonUnavailableError(f"Docker not available for MCP tools: {e}") from e
         logger.info("MCPToolManager initialized with Docker connection")

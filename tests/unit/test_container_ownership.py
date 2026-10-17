@@ -6,6 +6,7 @@ import builtins
 import sys
 
 from docker.errors import DockerException, NotFound
+from requests.exceptions import ConnectionError as RequestsConnectionError, ReadTimeout, ChunkedEncodingError
 import pytest
 
 from kestrel_feature_mcp import manager as manager_module
@@ -136,13 +137,14 @@ async def test_feature_initialization_binds_the_hosts_agent_identity(monkeypatch
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_stage", ["acquire", "ping"])
-async def test_daemon_unavailability_disables_only_local_docker_tools(monkeypatch, caplog, failure_stage):
+@pytest.mark.parametrize("failure_type", [DockerException, RequestsConnectionError, ReadTimeout, ChunkedEncodingError])
+async def test_daemon_unavailability_disables_only_local_docker_tools(monkeypatch, caplog, failure_stage, failure_type):
     client = MagicMock()
     acquire = MagicMock(return_value=client)
     if failure_stage == "acquire":
-        acquire.side_effect = DockerException("daemon unavailable")
+        acquire.side_effect = failure_type("daemon unavailable")
     else:
-        client.ping.side_effect = DockerException("daemon unavailable")
+        client.ping.side_effect = failure_type("daemon unavailable")
     monkeypatch.setattr(manager_module.docker, "from_env", acquire)
     feature = MCPAgent(SimpleNamespace(agent_id="did:test:host-agent"))
     await feature.initialize()

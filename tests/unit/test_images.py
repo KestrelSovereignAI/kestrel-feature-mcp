@@ -19,7 +19,7 @@ def test_docker_image_tag_semantics_are_idempotent(reference, expected):
     assert container_name_for_image(reference, "did:test:owner") == container_name_for_image(expected, "did:test:owner")
 
 
-@pytest.mark.parametrize("reference", [None, "", 1, True])
+@pytest.mark.parametrize("reference", [None, "", 1, True, "  ", " acme/native", "acme/native "])
 def test_invalid_image_reference_fails_before_resource_planning(reference):
     with pytest.raises(ValueError, match="image reference"):
         normalize_image_ref(reference)
