@@ -87,14 +87,14 @@ async def test_bare_name_unknown_to_catalog_routes_to_container():
     # be misrouted to the gateway (codex P2).
     feat = _feature()
     feat._known_catalog_servers = AsyncMock(return_value={"postgres"})
-    assert await feat._resolve_load_route("my-native-mcp") == ("container", "my-native-mcp")
+    assert await feat._resolve_load_route("my-native-mcp") == ("container", "my-native-mcp:latest")
 
 
 @pytest.mark.asyncio
 async def test_bare_name_unverifiable_catalog_defaults_to_container():
     feat = _feature()
     feat._known_catalog_servers = AsyncMock(return_value=None)  # offline / unverifiable
-    assert await feat._resolve_load_route("anything") == ("container", "anything")
+    assert await feat._resolve_load_route("anything") == ("container", "anything:latest")
 
 
 # --- load delegation --------------------------------------------------------

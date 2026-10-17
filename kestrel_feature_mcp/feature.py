@@ -22,6 +22,7 @@ from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from .dynamic_tools import build_wrappers, extract_mcp_result as _extract_mcp_result
+from .images import normalize_image_ref
 from .registry import (
     get_registry,
     MCPRegistry,
@@ -251,15 +252,6 @@ class MCPAgent(Feature):
             lambda name, arguments: self.gateway_manager.call_tool(name, arguments),
         )
 
-    @staticmethod
-    def _normalize_image_ref(ref: Optional[str]) -> Optional[str]:
-        """Add the implicit ``:latest`` tag so ``mcp/time`` and ``mcp/time:latest``
-        compare equal (Docker treats an untagged ref as ``:latest``)."""
-        if not ref:
-            return ref
-        last = ref.rsplit("/", 1)[-1]
-        return ref if ":" in last else f"{ref}:latest"
-
     async def _resolve_load_route(self, server: str) -> tuple[str, str]:
         """Resolve ``server`` to ``("gateway", catalog_name)`` or
         ``("container", image_ref)``.
@@ -275,7 +267,7 @@ class MCPAgent(Feature):
           (so a catalog name like ``test-server`` runs its real image, not the
           name).
         - An image reference (contains ``/`` or ``:``) not matching a registry
-          entry is a raw native-HTTP container, used as-is.
+          entry is a native-HTTP container, with the implicit tag made explicit.
         - A bare name not in the local registry is a Docker-catalog server only
           if the Docker catalog actually knows it; otherwise it is treated as a
           local/custom image (preserving direct-container loads). When the
@@ -285,11 +277,11 @@ class MCPAgent(Feature):
         registry = get_registry()
         entry = registry.get(server)
         if entry is None and ("/" in server or ":" in server):
-            target = self._normalize_image_ref(server)
+            target = normalize_image_ref(server)
             for candidate in registry.list_all():
                 refs = {
-                    self._normalize_image_ref(candidate.image),
-                    self._normalize_image_ref(candidate.full_image),
+                    normalize_image_ref(ref)
+                    for ref in (candidate.image, candidate.full_image) if ref
                 }
                 if target in refs:
                     entry = candidate
@@ -297,13 +289,13 @@ class MCPAgent(Feature):
         if entry is not None:
             if entry.requires_wrapper:
                 return ("gateway", entry.name)
-            return ("container", entry.full_image or entry.image or server)
+            return ("container", normalize_image_ref(entry.full_image or entry.image or server))
         if "/" in server or ":" in server:
-            return ("container", server)  # raw native-HTTP image, as given
+            return ("container", normalize_image_ref(server))
         known = await self._known_catalog_servers()
         if known is not None and server in known:
             return ("gateway", server)  # bare name the Docker catalog knows
-        return ("container", server)  # bare name -> local/custom image
+        return ("container", normalize_image_ref(server))
 
     @tool(
         name="mcp_load_server",
@@ -523,7 +515,7 @@ class MCPAgent(Feature):
         response = "Available MCP Tools:\n"
         for t in tools:
             response += f"- [{t.get('container', '?')}] {t['name']}: {t.get('description', '')}\n"
-        return ToolResult.ok(response + container_summary, data=data)
+        return ToolResult.ok(response + ("\nMCP containers:\n" + container_summary if containers else ""), data=data)
 
     @tool(
         name="mcp_unload_server",
@@ -545,8 +537,8 @@ class MCPAgent(Feature):
         if len(self.manager.owned_containers) and container_name not in self.manager.owned_containers:
             from .manager import container_name_for_image
 
-            image = self._normalize_image_ref(container_name)
-            if image is not None:
+            route, image = await self._resolve_load_route(container_name)
+            if route == "container":
                 candidate = container_name_for_image(image, self.manager.owner_did)
                 if candidate in self.manager.owned_containers:
                     container_name = candidate
@@ -1071,6 +1063,10 @@ class MCPAgent(Feature):
                 logger.warning("Failed to restore MCP gateway servers %s: %s",
                                gateway_servers, e)
 
+        if containers and self.manager is None:
+            logger.warning("Cannot restore MCP containers: agent-bound container manager is unavailable")
+            return
+
         for d in containers:
             image = (d.get("metadata") or {}).get("image")
             if not image:
@@ -1078,7 +1074,7 @@ class MCPAgent(Feature):
             try:
                 from .manager import container_name_for_image
 
-                expected_name = container_name_for_image(image, self.agent.agent_id)
+                expected_name = container_name_for_image(image, self.manager.owner_did)
                 if d["name"] != expected_name:
                     raise ValueError(
                         "Stored MCP connection identifier does not match this agent's ownership. "

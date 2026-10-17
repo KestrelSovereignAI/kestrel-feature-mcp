@@ -107,7 +107,7 @@ class TestRestoreOnStartup:
             {"name": container_name_for_image("org/img:1", host.agent_id), "state": "enabled",
              "metadata": {"mode": "container", "image": "org/img:1", "args": None}},
         ])
-        feat = _feature(host)
+        feat = _feature(host, manager=SimpleNamespace(owner_did=host.agent_id))
         feat.load_tool = AsyncMock()
         await feat.post_all_features_loaded(host)
         feat.load_tool.assert_awaited_once_with("org/img:1", None)
@@ -119,12 +119,40 @@ class TestRestoreOnStartup:
         host.get_enablement_deltas.return_value = [
             {"name": saved_name, "state": "enabled", "metadata": {"mode": "container", "image": "org/img:1"}},
         ]
-        feat = _feature(host)
+        feat = _feature(host, manager=SimpleNamespace(owner_did=host.agent_id))
         feat.load_tool = AsyncMock()
         await feat.post_all_features_loaded(host)
         feat.load_tool.assert_not_awaited()
         host.persist_feature_enablement.assert_not_awaited()
         assert "connection identifier does not match this agent" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_restore_uses_the_initialized_managers_identity(self):
+        from kestrel_feature_mcp.manager import container_name_for_image
+
+        host = _host()
+        manager = SimpleNamespace(owner_did="did:test:bound-manager")
+        host.get_enablement_deltas.return_value = [{
+            "name": container_name_for_image("org/img:1", manager.owner_did),
+            "state": "enabled", "metadata": {"mode": "container", "image": "org/img:1"},
+        }]
+        feature = _feature(host, manager=manager)
+        feature.load_tool = AsyncMock()
+        await feature.post_all_features_loaded(host)
+        feature.load_tool.assert_awaited_once_with("org/img:1", None)
+
+    @pytest.mark.asyncio
+    async def test_restore_reports_an_unavailable_container_manager(self, caplog):
+        host = _host()
+        host.get_enablement_deltas.return_value = [{
+            "name": "saved-container", "state": "enabled",
+            "metadata": {"mode": "container", "image": "org/img:1"},
+        }]
+        feature = _feature(host)
+        feature.load_tool = AsyncMock()
+        await feature.post_all_features_loaded(host)
+        feature.load_tool.assert_not_awaited()
+        assert "agent-bound container manager is unavailable" in caplog.text
 
     @pytest.mark.asyncio
     async def test_restore_noop_when_no_deltas(self):

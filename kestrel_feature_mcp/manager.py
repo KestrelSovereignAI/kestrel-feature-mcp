@@ -35,6 +35,7 @@ except ImportError:
     ImageNotFound = None  # type: ignore[assignment,misc]
 
 from .connection import MCPConnection, MCP_CONNECTION_ERRORS
+from .images import normalize_image_ref
 
 from .constants import (
     SESSION_CONNECT_TIMEOUT_SHORT,
@@ -82,7 +83,7 @@ def _require_owner_did(owner_did: str) -> str:
 
 def container_name_for_image(image_name: str, owner_did: str) -> str:
     """Stable resource identity shared by load, restore and manager startup."""
-    identity = json.dumps([_require_owner_did(owner_did), image_name], separators=(",", ":"))
+    identity = json.dumps([_require_owner_did(owner_did), normalize_image_ref(image_name)], separators=(",", ":"))
     return f"mcp-{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
 
 
@@ -268,6 +269,7 @@ class MCPToolManager:
     @_serialize_container_lifecycle
     async def start_tool_container(self, image_name: str, container_name: str = None, command: List[str] = None, environment: Dict[str, str] = None, volumes: Dict[str, Dict[str, str]] = None) -> str:
         """Starts a Docker container for an MCP tool. Returns the container name."""
+        image_name = normalize_image_ref(image_name)
         if not container_name:
             container_name = container_name_for_image(image_name, self.owner_did)
         # Retire the old transport before Docker restarts/replaces its process.

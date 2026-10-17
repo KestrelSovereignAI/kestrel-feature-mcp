@@ -138,7 +138,7 @@ async def test_failed_retirement_unpublishes_tools_and_prevents_container_restar
 async def test_healthcheck_failure_keeps_the_container_owned_for_unload(initial_state):
     manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     container = MagicMock(status="running")
-    container.labels = {"io.kestrel.mcp.agent-did": "did:test:manager", "io.kestrel.mcp.image": "image"}
+    container.labels = {"io.kestrel.mcp.agent-did": "did:test:manager", "io.kestrel.mcp.image": "image:latest"}
     manager.docker_client.containers.get.return_value = container
     if initial_state == "new":
         # The second inspection retrieves logs after the failed healthcheck.

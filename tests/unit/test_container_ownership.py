@@ -60,7 +60,7 @@ async def test_connect_cannot_acquire_another_agents_container(labels, monkeypat
 @pytest.mark.asyncio
 async def test_same_agent_new_manager_adopts_its_labeled_connection():
     client = MagicMock()
-    container = MagicMock(status="running", labels={MCP_OWNER_LABEL: "did:test:owner", MCP_IMAGE_LABEL: "image"})
+    container = MagicMock(status="running", labels={MCP_OWNER_LABEL: "did:test:owner", MCP_IMAGE_LABEL: "image:latest"})
     client.containers.get.return_value = container
     manager = MCPToolManager(owner_did="did:test:owner", docker_client=client)
     manager._wait_for_container_ready = AsyncMock()
@@ -79,8 +79,9 @@ async def test_created_container_carries_agent_and_connection_identity():
     manager._wait_for_container_ready = AsyncMock()
     name = await manager.start_tool_container("image")
     assert client.containers.create.call_args.kwargs["labels"] == {
-        MCP_OWNER_LABEL: manager.owner_did, MCP_IMAGE_LABEL: "image",
+        MCP_OWNER_LABEL: manager.owner_did, MCP_IMAGE_LABEL: "image:latest",
     }
+    assert client.containers.create.call_args.args[0] == "image:latest"
     assert name == container_name_for_image("image", manager.owner_did)
     assert manager.owned_containers[name]["container"] is client.containers.create.return_value
     with pytest.raises(AttributeError):
@@ -105,7 +106,7 @@ async def test_stale_resource_record_is_retired_before_a_new_image_pull_fails(pr
     from docker.errors import APIError
 
     client = MagicMock()
-    container = MagicMock(status="exited", labels={MCP_OWNER_LABEL: "did:test:owner", MCP_IMAGE_LABEL: "image"})
+    container = MagicMock(status="exited", labels={MCP_OWNER_LABEL: "did:test:owner", MCP_IMAGE_LABEL: "image:latest"})
     old_connection = AsyncMock()
     manager = MCPToolManager(owner_did="did:test:owner", docker_client=client)
     manager.owned_containers["owned"] = {"container": container, "connection": old_connection, "tools": []}

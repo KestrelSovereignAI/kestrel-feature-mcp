@@ -69,7 +69,9 @@ Upgrade the MCP feature before upgrading a host with the Phoenix 20/Pydantic AI
 The host dependency lock must be regenerated and verified as part of the same
 rollout (Kestrel Sovereign epic #3679).
 
-Container identities bind the agent DID and image. New managers require
+Container identities bind the agent DID and image, with Docker's implicit
+`:latest` tag made explicit by the same planner used for routing and unload.
+Catalog names resolve to their container image through the load route. New managers require
 `owner_did`; they reuse a process only when its ownership and image labels
 match. Each agent can reload or unload its own server independently. MCP
 container ports bind only to host loopback. Listings retain failed containers'

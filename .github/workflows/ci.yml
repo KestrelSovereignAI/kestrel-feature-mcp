@@ -92,6 +92,7 @@ jobs:
               'kestrel_feature_mcp/feature.py',
               'kestrel_feature_mcp/gateway.py',
               'kestrel_feature_mcp/manager.py',
+              'kestrel_feature_mcp/images.py',
               'kestrel_feature_mcp/registry.py',
               'kestrel_feature_mcp/catalog.toml',
               'kestrel_feature_mcp/component.yaml',
