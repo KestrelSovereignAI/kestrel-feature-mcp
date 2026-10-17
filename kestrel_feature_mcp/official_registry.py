@@ -71,14 +71,55 @@ class RegistrySettings:
 class RegistryPage:
     registry_url: str
     payload: dict[str, Any]
+    problems: tuple[RegistryProblem, ...] = ()
 
     @property
     def servers(self) -> list[dict[str, Any]]:
-        return self.payload["servers"]
+        rejected = {problem.record_index for problem in self.problems}
+        return [record for index, record in enumerate(self.payload["servers"]) if index not in rejected]
+
+    @property
+    def rejected_records(self) -> list[dict[str, Any]]:
+        rejected = []
+        for index in sorted({problem.record_index for problem in self.problems}):
+            record = self.payload["servers"][index]
+            server = record.get("server") if isinstance(record, dict) else None
+            name = server.get("name") if isinstance(server, dict) else None
+            rejected.append({
+                "index": index, "name": name if isinstance(name, str) else None,
+                "problems": [p.to_dict() for p in self.problems if p.record_index == index],
+            })
+        return rejected
 
     @property
     def next_cursor(self) -> str | None:
         return self.payload.get("metadata", {}).get("nextCursor") or None
+
+
+@dataclass(frozen=True)
+class RegistryProblem:
+    record_index: int
+    path: str
+    keyword: str
+    detail: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"path": self.path, "keyword": self.keyword, "detail": self.detail}
+
+
+@dataclass
+class RegistryRecord:
+    registry_url: str
+    payload: dict[str, Any]
+    problems: tuple[RegistryProblem, ...] = ()
+
+    def require_valid(self) -> dict[str, Any]:
+        """Refuse a record rejected during this inspection."""
+        if self.problems:
+            raise OfficialRegistryError("MCP Registry schema error: " + json.dumps(
+                [problem.to_dict() for problem in self.problems], ensure_ascii=True,
+            ))
+        return self.payload
 
 
 class OfficialRegistryClient:
@@ -96,18 +137,33 @@ class OfficialRegistryClient:
             contract = json.load(stream)
         self._components = contract["components"]
         self._schemas = self._components["schemas"]
+        self._validators = {
+            component: Draft202012Validator({
+                "$ref": f"#/components/schemas/{component}", "components": self._components,
+            })
+            for component in ("ServerList", "ServerResponse")
+        }
+        self._validators.update({
+            field: Draft202012Validator(self._schemas["ServerDetail"]["properties"][field])
+            for field in ("name", "version")
+        })
 
-    def _validate(self, payload: Any, component: str) -> None:
-        schema = {"$ref": f"#/components/schemas/{component}", "components": self._components}
-        error = next(Draft202012Validator(schema).iter_errors(payload), None)
-        if error is not None:
-            raise OfficialRegistryError(
-                f"MCP Registry schema error at {error.json_path} ({error.validator})"
-            )
+    def _validate(self, payload: Any, component: str) -> tuple[RegistryProblem, ...]:
+        problems = []
+        for error in self._validators[component].iter_errors(payload):
+            path = tuple(error.absolute_path)
+            index = 0
+            if component == "ServerList":
+                if len(path) < 2 or path[0] != "servers" or type(path[1]) is not int:
+                    raise OfficialRegistryError(
+                        f"MCP Registry schema error at {error.json_path} ({error.validator})"
+                    )
+                index = path[1]
+            problems.append(RegistryProblem(index, error.json_path, error.validator, error.message))
+        return tuple(problems)
 
     def _segment(self, value: str, field: str) -> str:
-        schema = self._schemas["ServerDetail"]["properties"][field]
-        error = next(Draft202012Validator(schema).iter_errors(value), None)
+        error = next(self._validators[field].iter_errors(value), None)
         if error is not None or not value:
             raise OfficialRegistryError(f"Invalid MCP Registry server {field}")
         try:
@@ -117,7 +173,10 @@ class OfficialRegistryClient:
         # Literal dot segments are normalized by HTTP clients before sending.
         return "%2E" * len(encoded) if encoded in (".", "..") else encoded
 
-    async def _get(self, path: str, *, component: str, params: dict[str, Any] | None = None) -> Any:
+    async def _get(
+        self, path: str, *, component: str, params: dict[str, Any] | None = None,
+        max_records: int | None = None,
+    ) -> tuple[Any, tuple[RegistryProblem, ...]]:
         url = self.settings.api_url.rstrip("/") + path
         try:
             async with asyncio.timeout(self.settings.timeout):
@@ -136,8 +195,12 @@ class OfficialRegistryClient:
                             if len(body) > self.settings.max_response_bytes:
                                 raise OfficialRegistryError("MCP Registry response exceeds its byte limit")
                 payload = await asyncio.to_thread(json.loads, body, parse_constant=_reject_json_constant)
-                await asyncio.to_thread(self._validate, payload, component)
-                return payload
+                if (max_records is not None and isinstance(payload, dict)
+                        and isinstance(payload.get("servers"), list)
+                        and len(payload["servers"]) > max_records):
+                    raise OfficialRegistryError("MCP Registry exceeded the requested page size")
+                problems = await asyncio.to_thread(self._validate, payload, component)
+                return payload, problems
         except TimeoutError as error:
             raise OfficialRegistryError("MCP Registry request exceeded its deadline") from error
         except (SSRFError, httpx2.HTTPError, httpx2.InvalidURL, UnicodeError, json.JSONDecodeError, RecursionError) as error:
@@ -157,23 +220,23 @@ class OfficialRegistryClient:
             params["search"] = query
         if cursor is not None:
             params["cursor"] = cursor
-        payload = await self._get("/servers", component="ServerList", params=params)
+        payload, problems = await self._get("/servers", component="ServerList", params=params, max_records=limit)
         count = len(payload["servers"])
-        if count > limit:
-            raise OfficialRegistryError("MCP Registry exceeded the requested page size")
         if payload.get("metadata", {}).get("count", count) != count:
             raise OfficialRegistryError("MCP Registry page count does not match its records")
         next_cursor = payload.get("metadata", {}).get("nextCursor")
         if cursor is not None and next_cursor == cursor:
             raise OfficialRegistryError("MCP Registry repeated its pagination cursor")
-        return RegistryPage(self.settings.api_url.rstrip("/"), payload)
+        return RegistryPage(self.settings.api_url.rstrip("/"), payload, problems)
 
-    async def get(self, server_name: str, *, version: str = "latest") -> dict[str, Any]:
+    async def get(self, server_name: str, *, version: str = "latest") -> RegistryRecord:
         name_segment = self._segment(server_name, "name")
         version_segment = self._segment(version, "version")
-        payload = await self._get(f"/servers/{name_segment}/versions/{version_segment}", component="ServerResponse")
-        if payload["server"]["name"] != server_name:
+        payload, problems = await self._get(f"/servers/{name_segment}/versions/{version_segment}", component="ServerResponse")
+        if not isinstance(payload, dict) or not isinstance(payload.get("server"), dict):
+            raise OfficialRegistryError("MCP Registry returned an invalid server response")
+        if payload["server"].get("name") != server_name:
             raise OfficialRegistryError("MCP Registry returned a different server identity")
-        if version != "latest" and payload["server"]["version"] != version:
+        if version != "latest" and payload["server"].get("version") != version:
             raise OfficialRegistryError("MCP Registry returned a different server version")
-        return payload
+        return RegistryRecord(self.settings.api_url.rstrip("/"), payload, problems)

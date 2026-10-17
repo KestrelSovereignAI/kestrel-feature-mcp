@@ -74,16 +74,21 @@ def _format_official_records(records: list[dict[str, Any]]) -> str:
         server = record["server"]
         status = record.get("_meta", {}).get("io.modelcontextprotocol.registry/official", {}).get("status", "unspecified")
         lines.extend([
-            f"- {server['name']} @ {server['version']} ({status})",
-            f"  {server['description']}",
+            f"- server: {json.dumps(server['name'], ensure_ascii=True)}; "
+            f"version: {json.dumps(server['version'], ensure_ascii=True)}; "
+            f"status: {json.dumps(status, ensure_ascii=True)}",
+            f"  description: {json.dumps(server['description'], ensure_ascii=True)}",
         ])
         for remote in server.get("remotes", []):
             support = " (unsupported transport)" if remote["type"] != "streamable-http" else ""
-            lines.append(f"  {remote['type']}{support}: {remote['url']}")
+            lines.append(f"  {remote['type']}{support}: {json.dumps(remote['url'], ensure_ascii=True)}")
         for package in server.get("packages", []):
-            lines.append(f"  Package: {package['registryType']} / {package['identifier']}")
+            lines.append(
+                f"  Package: {json.dumps(package['registryType'], ensure_ascii=True)} / "
+                f"{json.dumps(package['identifier'], ensure_ascii=True)}"
+            )
     if not records:
-        lines.append("No servers were returned for this page.")
+        lines.append("No conforming server records are available on this page.")
     return "\n".join(lines)
 
 
@@ -680,9 +685,18 @@ class MCPAgent(Feature):
         text = _format_official_records(page.servers)
         if page.next_cursor is not None:
             text += "\nNext cursor: " + json.dumps(page.next_cursor, ensure_ascii=True)
-        return ToolResult.ok(text, data={
+        data = {
             "source": "official", "registry_url": page.registry_url, "result": page.payload,
-        })
+        }
+        rejected = page.rejected_records
+        if rejected:
+            data["rejected_records"] = rejected
+            text += "\nRejected records: " + json.dumps(
+                [{"index": item["index"], "name": item["name"]} for item in rejected],
+                ensure_ascii=True,
+            )
+            return ToolResult.partial(text, "MCP Registry schema errors: " + json.dumps(rejected, ensure_ascii=True), data=data)
+        return ToolResult.ok(text, data=data)
 
     @tool(
         name="mcp_search",
@@ -752,6 +766,11 @@ class MCPAgent(Feature):
         """
         Display a page of the official registry, or the full local catalog.
 
+        Args:
+            source: Explicit official or local catalog
+            cursor: Exact opaque next-page cursor returned by the official registry
+            limit: Official registry page size, from 1 to 100
+
         Returns:
             Formatted list of all available MCP servers.
         """
@@ -793,10 +812,17 @@ class MCPAgent(Feature):
                 record = await self._official_registry.get(server_name, version=version)
             except OfficialRegistryError as error:
                 return ToolResult.failed(str(error), data={"source": "official"})
-            return ToolResult.ok(_format_official_records([record]), data={
-                "source": "official", "registry_url": self._official_registry.settings.api_url.rstrip("/"),
-                "result": record,
-            })
+            data = {
+                "source": "official", "registry_url": record.registry_url, "result": record.payload,
+            }
+            if record.problems:
+                problems = [problem.to_dict() for problem in record.problems]
+                data["problems"] = problems
+                return ToolResult.partial(
+                    f"Registry record {json.dumps(server_name, ensure_ascii=True)} was rejected by the published schema; its metadata is available for inspection.",
+                    "MCP Registry schema errors: " + json.dumps(problems, ensure_ascii=True), data=data,
+                )
+            return ToolResult.ok(_format_official_records([record.require_valid()]), data=data)
         if source != "local" or version != "latest":
             return ToolResult.failed("Select source='official' or source='local'; only the official source accepts a version.")
         registry = get_registry()

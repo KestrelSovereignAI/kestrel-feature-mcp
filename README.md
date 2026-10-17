@@ -75,9 +75,16 @@ label. These discovery tools work without Docker.
 
 Registry HTTPS requests use the SDK's canonical URL policy and pinned transport,
 with native TLS verification, no redirects and no proxy-environment routing.
-Private registry addresses, malformed responses, failed pagination and HTTP
-errors fail explicitly. The request deadline and byte limit also apply to
-custom registry bases.
+Private registry addresses, malformed page envelopes, failed pagination and
+HTTP errors fail explicitly. Individual records that violate the published
+schema are rejected with visible diagnostics and a `partial` result; the exact
+next cursor remains available. `result` retains the unmodified response,
+including rejected records, and `rejected_records` identifies their indices,
+names and schema problems. Only conforming records are displayed as catalog
+entries. A rejected detail lookup is inspectable with its schema problems;
+`RegistryRecord.require_valid()` refuses it. Publisher text is quoted and
+control characters are escaped in the human-readable rendering. The request
+deadline and byte limit also apply to custom registry bases.
 
 The bundled `registry_openapi_2025_12_01.json` is an unmodified JSON conversion of
 the official [Registry API contract](https://github.com/modelcontextprotocol/registry/blob/11b7b0e274d518b6f449c5ee3518a6151d9848b9/docs/reference/api/openapi.yaml),
@@ -87,6 +94,12 @@ the converted JSON SHA-256 is
 `69a092a20321d6616d0e83933b1de39916bd0fa87975d7931ef3b92f825c7edc`.
 The upstream license is included alongside it as `registry_contract_LICENSE.txt`.
 This Registry API/schema revision is independent of the MCP wire revision.
+
+`tests/fixtures/official_registry_rejected_repository.json` was captured from
+the official registry on 2026-10-17 for `ai.agentrapay/agentra` version `1.0.0`.
+Its `repository: {}` violates the published required-field contract. The
+fixture proves visible rejection and continued pagination; the schema is not
+relaxed to accept it.
 
 ## Development
 
