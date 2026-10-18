@@ -75,7 +75,7 @@ async def build_test_image(docker_available):
 @pytest_asyncio.fixture
 async def mcp_manager(docker_available):
     """MCPToolManager instance with cleanup."""
-    manager = await MCPToolManager.create()
+    manager = await MCPToolManager.create(owner_did="did:test:manager")
     yield manager
 
     # Cleanup all active tools
@@ -318,7 +318,7 @@ class TestContainerCleanup:
         import docker
         client = docker.from_env()
 
-        manager = await MCPToolManager.create()
+        manager = await MCPToolManager.create(owner_did="did:test:manager")
         container_name = "test-cleanup-verify"
 
         try:

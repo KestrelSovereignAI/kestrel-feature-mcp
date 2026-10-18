@@ -48,9 +48,215 @@ def _feature(host=None, *, manager=None, gateway=None) -> MCPAgent:
     return feat
 
 
+def _native_container_feature(peer, image):
+    from tests.unit.test_mcp_connection import container_manager
+    from kestrel_feature_mcp.manager import container_name_for_image
+
+    manager = container_manager(peer.url, image=image)
+    manager._wait_for_container_ready = AsyncMock()
+    return _feature(manager=manager), manager, container_name_for_image(image, manager.owner_did)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"empty_tools": True}], indirect=True)
+async def test_empty_container_catalog_reports_no_tools_without_misdiagnosing_the_host(mcp_http_server):
+    feature, manager, name = _native_container_feature(mcp_http_server, "acme/empty:latest")
+    try:
+        result = await feature._load_via_container("acme/empty:latest")
+        assert manager.owned_containers[name]["connection"].is_connected
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "no tools" in result.confirmation.lower()
+        assert "host has no dynamic registry" not in result.confirmation
+        assert result.data["tools"] == []
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector,image,unload_alias", [
+    ("acme/native", "acme/native:latest", "acme/native"),
+    ("acme/native:latest", "acme/native:latest", "acme/native"),
+    ("test-server", "kestrel-mcp-test-server:latest", "test-server"),
+    ("private.registry:5000/native:v2", "private.registry:5000/native:v2", "private.registry:5000/native:v2"),
+])
+async def test_container_unload_accepts_the_image_reference_used_to_load_it(mcp_http_server, selector, image, unload_alias):
+    feature, manager, name = _native_container_feature(mcp_http_server, image)
+    feature.agent.persist_feature_enablement = AsyncMock()
+    feature.agent.clear_feature_enablement = AsyncMock()
+    try:
+        loaded = await feature.load_tool(selector)
+        assert loaded.status is ToolResultStatus.OK
+        assert loaded.data["image"] == image
+        assert loaded.data["container"] == name
+        assert "\nMCP containers:\n" in (await feature.list_tools()).confirmation
+        feature.agent.persist_feature_enablement.assert_awaited_once_with(
+            "mcp_server", name, "enabled", actor="agent",
+            metadata={"mode": "container", "image": image, "args": None},
+        )
+        result = await feature.unload_tool(unload_alias)
+        assert result.status is ToolResultStatus.OK
+        assert result.data["container"] == name
+        assert manager.owned_containers == {}
+        assert feature.agent.registered == {}
+        feature.agent.clear_feature_enablement.assert_awaited_once_with("mcp_server", name)
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector", ["identifier", "image"])
+async def test_owned_container_identifier_takes_precedence_over_a_gateway_alias(mcp_http_server, selector):
+    feature, manager, name = _native_container_feature(mcp_http_server, "acme/native:latest")
+    try:
+        assert (await feature.load_tool("acme/native:latest")).status is ToolResultStatus.OK
+        feature.gateway_manager = SimpleNamespace(is_connected=True, gateway=SimpleNamespace(requested_servers={name}))
+        if selector == "identifier":
+            feature._resolve_load_route = AsyncMock(side_effect=AssertionError("owned identifier consulted another route"))
+        else:
+            feature._resolve_load_route = AsyncMock(wraps=feature._resolve_load_route)
+        feature._unload_via_gateway = AsyncMock(side_effect=AssertionError("owned container was sent to gateway unload"))
+        assert (await feature.unload_tool(name if selector == "identifier" else "acme/native:latest")).status is ToolResultStatus.OK
+        if selector == "identifier":
+            feature._resolve_load_route.assert_not_awaited()
+        else:
+            feature._resolve_load_route.assert_awaited_once_with("acme/native:latest")
+        feature._unload_via_gateway.assert_not_awaited()
+        assert manager.owned_containers == {}
+    finally:
+        feature.gateway_manager = None
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_unowned_image_alias_preserves_the_requested_identifier():
+    manager = SimpleNamespace(
+        owner_did="did:test:owner", owned_containers={"another-owned-resource": {}},
+        stop_tool=AsyncMock(return_value=False),
+    )
+    feature = _feature(manager=manager)
+    feature._forget_server = AsyncMock()
+    result = await feature.unload_tool("acme/not-loaded")
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["container"] == "acme/not-loaded"
+    manager.stop_tool.assert_awaited_once_with("acme/not-loaded")
+    feature._forget_server.assert_awaited_once_with("acme/not-loaded")
+    assert manager.owned_containers == {"another-owned-resource": {}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["load", "unload"])
+@pytest.mark.parametrize("selector", [None, "", "  ", 123, " acme/native", "acme/native "])
+async def test_invalid_selector_returns_an_error_before_catalog_or_resource_io(operation, selector):
+    feature = _feature(manager=SimpleNamespace())
+    feature._resolve_load_route = AsyncMock(side_effect=AssertionError("invalid selector reached catalog I/O"))
+    feature._forget_server = AsyncMock(side_effect=AssertionError("invalid selector cleared desired state"))
+    result = await feature.load_tool(selector) if operation == "load" else await feature.unload_tool(selector)
+    assert result.status is ToolResultStatus.ERROR
+    assert "non-empty string" in result.error
+    feature._resolve_load_route.assert_not_awaited()
+    feature._forget_server.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unload_resolves_an_unowned_alias_only_once(mcp_http_server):
+    feature, manager, name = _native_container_feature(mcp_http_server, "acme/native:latest")
+    try:
+        assert (await feature.load_tool("acme/native:latest")).status is ToolResultStatus.OK
+        feature.gateway_manager = SimpleNamespace(is_connected=True, gateway=SimpleNamespace(requested_servers={"time"}))
+        feature._known_catalog_servers = AsyncMock(return_value={"time"})
+        result = await feature.unload_tool("unknown-native")
+        assert result.status is ToolResultStatus.ERROR
+        feature._known_catalog_servers.assert_awaited_once()
+        assert name in manager.owned_containers
+    finally:
+        feature.gateway_manager = None
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_selector_cannot_select_a_same_named_owned_image(mcp_http_server):
+    feature, manager, name = _native_container_feature(mcp_http_server, "time:latest")
+    try:
+        assert (await feature._load_via_container("time:latest")).status is ToolResultStatus.OK
+        feature.gateway_manager = SimpleNamespace(is_connected=True, gateway=SimpleNamespace(requested_servers={"time"}))
+        feature._unload_via_gateway = AsyncMock(return_value=ToolResult.ok("removed gateway server"))
+        result = await feature.unload_tool("time")
+        assert result.status is ToolResultStatus.OK
+        feature._unload_via_gateway.assert_awaited_once_with("time")
+        assert name in manager.owned_containers
+        assert manager.owned_containers[name]["connection"].is_connected
+    finally:
+        feature.gateway_manager = None
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_saved_container_mode_never_reenters_environment_dependent_routing(mcp_http_server):
+    image = "time:latest"
+    feature, manager, name = _native_container_feature(mcp_http_server, image)
+    feature.agent.get_enablement_deltas = AsyncMock(return_value=[{
+        "name": name, "state": "enabled",
+        "metadata": {"mode": "container", "image": image, "args": ["serve"]},
+    }])
+    feature.agent.persist_feature_enablement = AsyncMock()
+    feature._resolve_load_route = AsyncMock(side_effect=AssertionError("saved container mode consulted catalog routing"))
+    try:
+        await feature.post_all_features_loaded(feature.agent)
+        feature._resolve_load_route.assert_not_awaited()
+        assert manager.owned_containers[name]["connection"].is_connected
+        assert {t.name for t in manager.owned_containers[name]["tools"]} == {"echo", "fail"}
+        manager.docker_client.containers.get.return_value.restart.assert_called_once()
+        feature.agent.persist_feature_enablement.assert_awaited_once_with(
+            "mcp_server", name, "enabled", actor="agent",
+            metadata={"mode": "container", "image": image, "args": ["serve"]},
+        )
+        wrapper = next(w for w in feature.agent.registered[_container_owner(name)] if w.name.endswith("__echo"))
+        result = await wrapper.execute(text="restored container mode")
+        assert result["status"] == "ok" and "restored container mode" in result["confirmation"]
+    finally:
+        await feature.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # Wrapper + schema
 # ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_container_mount_keeps_the_connection_that_advertised_its_schema(mcp_http_server):
+    feature, manager, name = _native_container_feature(mcp_http_server, "acme/native:latest")
+    owner = _container_owner(name)
+    try:
+        assert (await feature.load_tool("acme/native:latest")).status is ToolResultStatus.OK
+        original = next(tool for tool in feature.agent.registered[owner] if tool._real_name == "echo")
+        assert (await original.execute(text="original"))["status"] == "ok"
+        assert (await feature.load_tool("acme/native:latest")).status is ToolResultStatus.OK
+        assert (await original.execute(text="stale"))["status"] == "error"
+        current = next(tool for tool in feature.agent.registered[owner] if tool._real_name == "echo")
+        assert (await current.execute(text="current"))["confirmation"] == "current"
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_gateway_mount_keeps_the_connection_that_advertised_its_schema(mcp_http_server):
+    from kestrel_feature_mcp.manager import MCPGatewayManager
+
+    manager = MCPGatewayManager()
+    manager.gateway = SimpleNamespace(endpoint_url=mcp_http_server.url, is_running=True)
+    feature = _feature(gateway=manager)
+    try:
+        await manager._connect("test")
+        feature._mount_gateway_tools()
+        original = next(tool for tool in feature.agent.registered[_GATEWAY_OWNER] if tool._real_name == "echo")
+        assert (await original.execute(text="original"))["status"] == "ok"
+        await manager._connect("test")
+        feature._mount_gateway_tools()
+        assert (await original.execute(text="stale"))["status"] == "error"
+        current = next(tool for tool in feature.agent.registered[_GATEWAY_OWNER] if tool._real_name == "echo")
+        assert (await current.execute(text="current"))["confirmation"] == "current"
+    finally:
+        await manager._disconnect()
+
+
 class TestWrapper:
     @pytest.mark.asyncio
     async def test_execute_returns_dict_envelope_ok(self):
@@ -106,14 +312,56 @@ class TestWrapper:
         assert ws[0]._real_name == "fetch"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained", [0, 1])
+async def test_container_load_reports_tools_evicted_by_host_capacity(mcp_http_server, retained):
+    feature, manager, name = _native_container_feature(mcp_http_server, "acme/native:latest")
+
+    def limited_register(owner, tools):
+        feature.agent.registered[owner] = list(tools)[:retained]
+        return len(feature.agent.registered[owner])
+
+    feature.agent.register_dynamic_tools = limited_register
+    try:
+        result = await feature.load_tool("acme/native:latest")
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["mounted"] == retained
+        assert len(result.data["tools"]) == 2
+        assert f"retained {retained} of 2" in result.error
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["load", "start"])
+async def test_gateway_load_reports_tools_evicted_by_host_capacity(monkeypatch, operation):
+    gateway = MagicMock()
+    tools = [SimpleNamespace(name="echo"), SimpleNamespace(name="fail")]
+    gateway.tools = {}
+    gateway.is_connected = True
+    gateway.start = AsyncMock(return_value=tools)
+    gateway.enable_server = AsyncMock(return_value=tools)
+    feature = _feature(manager=MagicMock(), gateway=gateway if operation == "load" else None)
+    feature._mount_gateway_tools = lambda: 0
+    feature._reject_unknown_servers = AsyncMock(return_value=None)
+    monkeypatch.setattr("kestrel_feature_mcp.feature.check_docker_mcp_available", lambda: True)
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", lambda: gateway)
+    result = await feature.load_tool("time") if operation == "load" else await feature.gateway_start("time")
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["mounted"] == 0
+    assert len(result.data["tools"]) == 2
+    assert "retained 0 of 2" in result.error
+
+
 # ---------------------------------------------------------------------------
 # Mount / unmount wiring
 # ---------------------------------------------------------------------------
 class TestMounting:
-    def test_host_without_registry_degrades(self):
+    def test_host_without_registry_is_refused(self):
         feat = _feature(MagicMock(spec=[]))  # no register_dynamic_tools attr
         assert feat._host_supports_dynamic_tools() is False
-        assert feat._mount_tools("mcp:x", "x", [{"name": "t"}], AsyncMock()) == 0
+        with pytest.raises(RuntimeError, match="dynamic tool registry"):
+            feat._mount_tools("mcp:x", "x", [{"name": "t"}], AsyncMock())
 
     def test_mount_refreshes_then_registers(self):
         host = _FakeHost()
@@ -131,6 +379,7 @@ class TestMounting:
         gw.is_connected = True
         gw.get_all_tools.return_value = [{"name": "fetch", "description": "d", "inputSchema": {}}]
         gw.call_tool = AsyncMock(return_value=_result("page"))
+        gw.tool_caller.return_value = gw.call_tool
         feat = _feature(host, gateway=gw)
 
         mounted = feat._mount_gateway_tools()
@@ -223,7 +472,9 @@ class TestMounting:
         gw.enable_server = AsyncMock(return_value=[
             SimpleNamespace(name="fetch"), SimpleNamespace(name="sqlite_query"),
         ])
-        gw.get_all_tools = MagicMock(return_value=[])
+        gw.get_all_tools = MagicMock(return_value=[
+            {"name": "fetch", "inputSchema": {}}, {"name": "sqlite_query", "inputSchema": {}},
+        ])
         feat = _feature(gateway=gw)
 
         async def _known():
@@ -339,16 +590,17 @@ async def test_failed_gateway_reconfiguration_unpublishes_tools(operation, monke
 @pytest.mark.parametrize("failure", ["healthcheck", "handshake"])
 async def test_failed_container_reload_withdraws_handles_and_retires_the_old_owner(mcp_http_server, failure, monkeypatch):
     from urllib.parse import urlsplit
-    from kestrel_feature_mcp.manager import MCPToolManager
+    from kestrel_feature_mcp.manager import MCPToolManager, container_name_for_image
 
     monkeypatch.setattr("kestrel_feature_mcp.manager.SESSION_CONNECT_TIMEOUT_SHORT", 0.5)
     host = _FakeHost()
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     feature = _feature(host, manager=manager)
-    name = "mcp-acme-native-latest"
+    name = container_name_for_image("acme/native:latest", manager.owner_did)
     owner = _container_owner(name)
     container = MagicMock()
     container.status = "running"
+    container.labels = {"io.kestrel.mcp.agent-did": manager.owner_did, "io.kestrel.mcp.image": "acme/native:latest"}
     container.ports = {"8000/tcp": [{"HostPort": str(urlsplit(mcp_http_server.url).port)}]}
     manager.docker_client.containers.get.return_value = container
     manager._wait_for_container_ready = AsyncMock()
@@ -378,6 +630,12 @@ async def test_failed_container_reload_withdraws_handles_and_retires_the_old_own
         assert owner not in host.registered
         assert manager.owned_containers[name]["container"] is container
         assert manager.get_all_tools() == []
+        inventory = await feature.list_tools()
+        assert inventory.status is ToolResultStatus.PARTIAL
+        assert inventory.data["containers"] == [{
+            "container": name, "catalog_ready": False,
+            "connected": False, "tool_count": None,
+        }]
         assert previous._task is None
         manager._wait_for_container_ready.side_effect = None
         mcp_http_server.settings["discover_delay"] = 0
@@ -390,3 +648,17 @@ async def test_failed_container_reload_withdraws_handles_and_retires_the_old_own
         if name in manager.owned_containers:
             await manager._drop_connection(name)
         await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tool_handles_use_semantic_image_prefix_without_changing_resource_owner(mcp_http_server):
+    feature, manager, name = _native_container_feature(mcp_http_server, "acme/native:latest")
+    feature._mount_tools = MagicMock(wraps=feature._mount_tools)
+    try:
+        assert (await feature.load_tool("acme/native")).status is ToolResultStatus.OK
+        args = feature._mount_tools.call_args.args
+        assert args[0] == _container_owner(name)
+        assert args[1] == "acme/native:latest"
+        assert {tool["container"] for tool in args[2]} == {name}
+    finally:
+        await feature.shutdown()

@@ -147,13 +147,90 @@ async def test_repeated_cursor_fails_without_leaking_owner(mcp_http_server):
     assert connection._task is None
 
 
-def container_manager(url):
+def container_manager(url, *, image="image"):
     port = url.split(":")[-1].split("/")[0]
     container = MagicMock()
+    container.status = "running"
     container.ports = {"8000/tcp": [{"HostPort": port}]}
+    container.labels = {"io.kestrel.mcp.agent-did": "did:test:manager", "io.kestrel.mcp.image": image}
     docker_client = MagicMock()
     docker_client.containers.get.return_value = container
-    return MCPToolManager(docker_client=docker_client)
+    def removed(**kwargs):
+        from docker.errors import NotFound
+        docker_client.containers.get.side_effect = NotFound("removed")
+    container.remove.side_effect = removed
+    return MCPToolManager(owner_did="did:test:manager", docker_client=docker_client)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"list_delay": 0.05}], indirect=True)
+async def test_concurrent_reconnects_retire_every_superseded_native_owner(mcp_http_server, monkeypatch):
+    from kestrel_feature_mcp import manager as manager_module
+
+    connections = []
+    original = manager_module.MCPConnection
+
+    def tracked_connection(*args, **kwargs):
+        connection = original(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(manager_module, "MCPConnection", tracked_connection)
+    manager = container_manager(mcp_http_server.url)
+    try:
+        await asyncio.gather(manager.connect_to_tool("test"), manager.connect_to_tool("test"))
+        assert len(connections) == 2
+        assert sum(connection.is_connected for connection in connections) == 1
+        assert connections[0]._task is None
+        assert manager.owned_containers["test"]["connection"] is connections[1]
+        assert (await manager.call_tool("test", "echo", {"text": "current"})).content[0].text == "current"
+    finally:
+        for connection in connections:
+            await connection.close()
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"list_delay": 0.15}], indirect=True)
+async def test_cancelled_configuration_waiter_never_retires_the_active_owner(mcp_http_server):
+    manager = container_manager(mcp_http_server.url)
+    connecting = asyncio.create_task(manager.connect_to_tool("test"))
+    try:
+        async with asyncio.timeout(2):
+            while ("test" not in manager.owned_containers
+                   or not manager.owned_containers["test"]["connection"].is_connected):
+                await asyncio.sleep(0.001)
+        first = manager.owned_containers["test"]["connection"]
+        waiter = asyncio.create_task(manager.stop_tool("test"))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        await connecting
+        assert first.is_connected
+        manager.docker_client.containers.get.return_value.stop.assert_not_called()
+        await manager.connect_to_tool("test")
+        assert first._task is None
+        assert manager.owned_containers["test"]["connection"].is_connected
+    finally:
+        if not connecting.done():
+            connecting.cancel()
+        await asyncio.gather(connecting, return_exceptions=True)
+        await manager._drop_connection("test")
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tool_call_does_not_hold_or_wait_for_the_configuration_lock(mcp_http_server):
+    manager = container_manager(mcp_http_server.url)
+    try:
+        await manager.connect_to_tool("test")
+        async with manager._container_lifecycle("test"):
+            result = await asyncio.wait_for(manager.call_tool("test", "echo", {"text": "concurrent"}), 1)
+        assert result.content[0].text == "concurrent"
+    finally:
+        await manager._drop_connection("test")
+        await manager.aclose()
 
 
 @pytest.mark.asyncio
@@ -193,6 +270,67 @@ async def test_gateway_uses_same_native_client_with_its_bearer_token(mcp_http_se
     assert manager.tools == {}
     assert all(dict(scope["headers"])[b"authorization"] == b"Bearer gateway-token"
                for scope, _ in requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["record", "connection", "catalog"])
+async def test_bound_container_caller_rejects_withdrawn_identity_before_io(mcp_http_server, change):
+    manager = container_manager(mcp_http_server.url)
+    replacement = MCPConnection(mcp_http_server.url)
+    original = None
+    try:
+        await manager.connect_to_tool("test")
+        info = manager.owned_containers["test"]
+        original = info["connection"]
+        bound = manager.tool_caller("test")
+        assert (await bound("echo", {"text": "original"})).content[0].text == "original"
+        if change == "record":
+            manager.owned_containers["test"] = dict(info)
+        elif change == "connection":
+            await replacement.connect()
+            info["connection"] = replacement
+        else:
+            info["tools"] = None
+        count = len(mcp_http_server.requests)
+        assert original.is_connected  # Publication, rather than a dead socket, must refuse it.
+        with pytest.raises(ValueError, match="changed; rediscover"):
+            await bound("echo", {"text": "stale"})
+        assert len(mcp_http_server.requests) == count
+    finally:
+        await replacement.close()
+        if original is not None:
+            await original.close()
+        await manager._drop_connection("test")
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["disconnect", "connection"])
+async def test_bound_gateway_caller_does_not_follow_a_replacement(mcp_http_server, change):
+    manager = MCPGatewayManager()
+    manager.gateway = SimpleNamespace(endpoint_url=mcp_http_server.url, is_running=True)
+    replacement = MCPConnection(mcp_http_server.url)
+    original = None
+    try:
+        await manager._connect("test")
+        original = manager.connection
+        bound = manager.tool_caller()
+        assert (await bound("echo", {"text": "original"})).content[0].text == "original"
+        if change == "connection":
+            await replacement.connect()
+            manager.connection = replacement
+        else:
+            manager.connection = None
+        count = len(mcp_http_server.requests)
+        assert original.is_connected
+        with pytest.raises(ValueError, match="changed; rediscover"):
+            await bound("echo", {"text": "stale"})
+        assert len(mcp_http_server.requests) == count
+    finally:
+        await replacement.close()
+        if original is not None:
+            await original.close()
+        await manager._disconnect()
 
 
 @pytest.mark.asyncio
@@ -301,7 +439,7 @@ async def test_initial_discovery_uses_the_call_budget_after_connecting(mcp_http_
 async def test_readiness_refuses_real_transport_exception_groups():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
-        manager = MCPToolManager(docker_client=MagicMock())
+        manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
         assert not await manager._check_mcp_ready("127.0.0.1", sock.getsockname()[1])
     assert not [task for task in asyncio.all_tasks() if task.get_name() == "mcp-connection"]
 
@@ -311,7 +449,7 @@ async def test_readiness_does_not_hide_unexpected_group_members(monkeypatch):
     error = ExceptionGroup("unexpected", [ValueError("programming defect")])
     connection = SimpleNamespace(connect=AsyncMock(side_effect=error), close=AsyncMock())
     monkeypatch.setattr("kestrel_feature_mcp.manager.MCPConnection", lambda *a, **kw: connection)
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     with pytest.raises(ExceptionGroup) as caught:
         await manager._check_mcp_ready("127.0.0.1", 1)
     assert caught.value.exceptions == error.exceptions
@@ -362,7 +500,7 @@ async def test_close_of_a_dead_transport_does_not_rethrow_its_historical_failure
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mcp_http_server", [{"legacy": True, "delete_delay": 0.5}], indirect=True)
 async def test_readiness_cleanup_uses_its_own_budget_and_reports_failure(mcp_http_server):
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     port = int(mcp_http_server.url.split(":")[-1].split("/")[0])
     assert not await manager._check_mcp_ready("127.0.0.1", port, timeout=0.1)
     assert not [task for task in asyncio.all_tasks() if task.get_name() == "mcp-connection"]

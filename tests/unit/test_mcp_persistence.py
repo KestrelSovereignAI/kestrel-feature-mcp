@@ -16,6 +16,7 @@ from kestrel_feature_mcp.feature import MCPAgent
 
 def _host(*, with_persistence=True):
     host = MagicMock()
+    host.agent_id = "did:test:manager"
     if with_persistence:
         host.persist_feature_enablement = AsyncMock()
         host.clear_feature_enablement = AsyncMock()
@@ -98,16 +99,60 @@ class TestRestoreOnStartup:
 
     @pytest.mark.asyncio
     async def test_restore_container_servers(self, monkeypatch):
+        from kestrel_feature_mcp.manager import container_name_for_image
+
         monkeypatch.setattr(feat_mod, "check_docker_mcp_available", lambda: False)
         host = _host()
         host.get_enablement_deltas = AsyncMock(return_value=[
-            {"name": "c1", "state": "enabled",
+            {"name": container_name_for_image("org/img:1", host.agent_id), "state": "enabled",
              "metadata": {"mode": "container", "image": "org/img:1", "args": None}},
         ])
-        feat = _feature(host)
-        feat.load_tool = AsyncMock()
+        feat = _feature(host, manager=SimpleNamespace(owner_did=host.agent_id))
+        feat._load_via_container = AsyncMock()
         await feat.post_all_features_loaded(host)
-        feat.load_tool.assert_awaited_once_with("org/img:1", None)
+        feat._load_via_container.assert_awaited_once_with("org/img:1", None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("saved_name", ["mcp-org-img-1", "another-agents-resource"])
+    async def test_restore_refuses_an_identifier_outside_the_agents_namespace(self, saved_name, caplog):
+        host = _host()
+        host.get_enablement_deltas.return_value = [
+            {"name": saved_name, "state": "enabled", "metadata": {"mode": "container", "image": "org/img:1"}},
+        ]
+        feat = _feature(host, manager=SimpleNamespace(owner_did=host.agent_id))
+        feat._load_via_container = AsyncMock()
+        await feat.post_all_features_loaded(host)
+        feat._load_via_container.assert_not_awaited()
+        host.persist_feature_enablement.assert_not_awaited()
+        assert "connection identifier does not match this agent" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_restore_uses_the_initialized_managers_identity(self):
+        from kestrel_feature_mcp.manager import container_name_for_image
+
+        host = _host()
+        manager = SimpleNamespace(owner_did="did:test:bound-manager")
+        host.get_enablement_deltas.return_value = [{
+            "name": container_name_for_image("org/img:1", manager.owner_did),
+            "state": "enabled", "metadata": {"mode": "container", "image": "org/img:1"},
+        }]
+        feature = _feature(host, manager=manager)
+        feature._load_via_container = AsyncMock()
+        await feature.post_all_features_loaded(host)
+        feature._load_via_container.assert_awaited_once_with("org/img:1", None)
+
+    @pytest.mark.asyncio
+    async def test_restore_reports_an_unavailable_container_manager(self, caplog):
+        host = _host()
+        host.get_enablement_deltas.return_value = [{
+            "name": "saved-container", "state": "enabled",
+            "metadata": {"mode": "container", "image": "org/img:1"},
+        }]
+        feature = _feature(host)
+        feature._load_via_container = AsyncMock()
+        await feature.post_all_features_loaded(host)
+        feature._load_via_container.assert_not_awaited()
+        assert "agent-bound container manager is unavailable" in caplog.text
 
     @pytest.mark.asyncio
     async def test_restore_noop_when_no_deltas(self):
@@ -115,10 +160,10 @@ class TestRestoreOnStartup:
         host.get_enablement_deltas = AsyncMock(return_value=[])
         feat = _feature(host)
         feat.gateway_start = AsyncMock()
-        feat.load_tool = AsyncMock()
+        feat._load_via_container = AsyncMock()
         await feat.post_all_features_loaded(host)
         feat.gateway_start.assert_not_awaited()
-        feat.load_tool.assert_not_awaited()
+        feat._load_via_container.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_restore_noop_without_persistence(self):

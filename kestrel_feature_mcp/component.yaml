@@ -4,15 +4,28 @@ version: 1.0.0
 entry_point: feature.py
 
 tools:
-  - start_mcp_gateway
-  - stop_mcp_gateway
-  - search_mcp_servers
-  - call_mcp_tool
-  - load_mcp_server
-  - unload_mcp_server
+  - mcp_catalog
+  - mcp_docker_catalog
+  - mcp_gateway_enable
+  - mcp_gateway_start
+  - mcp_gateway_stop
+  - mcp_gateway_tools
+  - mcp_list_servers
+  - mcp_load_server
+  - mcp_search
+  - mcp_server_info
+  - mcp_unload_server
 
 files:
+  - __init__.py
+  - catalog.toml
+  - connection.py
+  - constants.py
+  - dynamic_tools.py
   - feature.py
+  - gateway.py
+  - images.py
+  - manager.py
   - registry.py
 
 dependencies:

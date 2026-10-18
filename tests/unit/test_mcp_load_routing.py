@@ -87,14 +87,14 @@ async def test_bare_name_unknown_to_catalog_routes_to_container():
     # be misrouted to the gateway (codex P2).
     feat = _feature()
     feat._known_catalog_servers = AsyncMock(return_value={"postgres"})
-    assert await feat._resolve_load_route("my-native-mcp") == ("container", "my-native-mcp")
+    assert await feat._resolve_load_route("my-native-mcp") == ("container", "my-native-mcp:latest")
 
 
 @pytest.mark.asyncio
 async def test_bare_name_unverifiable_catalog_defaults_to_container():
     feat = _feature()
     feat._known_catalog_servers = AsyncMock(return_value=None)  # offline / unverifiable
-    assert await feat._resolve_load_route("anything") == ("container", "anything")
+    assert await feat._resolve_load_route("anything") == ("container", "anything:latest")
 
 
 # --- load delegation --------------------------------------------------------
@@ -124,6 +124,11 @@ async def test_load_stdio_server_delegates_to_gateway(monkeypatch):
                 {"name": "get_current_time", "description": "d", "inputSchema": {}},
                 {"name": "convert_time", "description": "d", "inputSchema": {}},
             ]
+
+        def tool_caller(self):
+            async def unexpected_call(*args):
+                raise AssertionError("The routing fixture must not execute remote tools")
+            return unexpected_call
 
     monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", _FakeGatewayMgr)
 
@@ -162,19 +167,6 @@ async def test_unload_routes_gateway_server_to_gateway_disable():
     assert res.status is ToolResultStatus.OK
     gw.disable_server.assert_awaited_once_with("time")
     feat._forget_server.assert_awaited_once_with("time")
-
-
-@pytest.mark.asyncio
-async def test_call_tool_routes_gateway_owner_to_gateway():
-    # Tools listed as container="gateway" must be callable via mcp_call_tool.
-    gw = MagicMock()
-    gw.is_connected = True
-    gw.call_tool = AsyncMock(return_value=SimpleNamespace(
-        content=[SimpleNamespace(text="17:24 UTC")], is_error=False))
-    feat = _feature(manager=MagicMock(), gateway=gw)
-    res = await feat.call_tool("gateway", "get_current_time", {"timezone": "UTC"})
-    assert res.status is ToolResultStatus.OK
-    gw.call_tool.assert_awaited_once_with("get_current_time", {"timezone": "UTC"})
 
 
 @pytest.mark.asyncio

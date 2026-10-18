@@ -10,7 +10,7 @@ from docker.errors import APIError, NotFound
 
 @pytest.mark.asyncio
 async def test_drop_connection_closes_owner_and_retains_container_custody():
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     connection = AsyncMock()
     container = object()
     manager.owned_containers = {"old": {"container": container, "connection": connection}, "other": {}}
@@ -23,14 +23,14 @@ async def test_drop_connection_closes_owner_and_retains_container_custody():
 
 @pytest.mark.asyncio
 async def test_drop_connection_is_noop_when_not_connected():
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     await manager._drop_connection("missing")
     assert manager.owned_containers == {}
 
 
 @pytest.mark.asyncio
 async def test_failed_teardown_preserves_entry_for_retry():
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     connection = AsyncMock()
     connection.close.side_effect = OSError("close failed")
     manager.owned_containers["old"] = {"connection": connection}
@@ -41,7 +41,7 @@ async def test_failed_teardown_preserves_entry_for_retry():
 
 @pytest.mark.asyncio
 async def test_stop_still_reclaims_container_when_connection_teardown_fails():
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     connection = AsyncMock()
     connection.close.side_effect = OSError("close failed")
     container = MagicMock()
@@ -56,7 +56,7 @@ async def test_stop_still_reclaims_container_when_connection_teardown_fails():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["stop", "remove"])
 async def test_docker_cleanup_failure_is_explicit_and_preserves_retry(operation):
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     connection = AsyncMock()
     container = MagicMock()
     getattr(container, operation).side_effect = APIError("daemon refused cleanup")
@@ -86,7 +86,7 @@ async def test_failed_gateway_disconnect_retains_owner_for_cleanup_retry():
 async def test_removal_is_confirmed_before_reporting_unload(monkeypatch, removed):
     monkeypatch.setattr("kestrel_feature_mcp.manager.MCP_REMOVAL_ATTEMPTS", 2)
     monkeypatch.setattr("kestrel_feature_mcp.manager.MCP_REMOVAL_RETRY_DELAY", 0)
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     container = MagicMock()
     manager.owned_containers["test"] = {"connection": AsyncMock(), "container": container, "tools": []}
     manager.docker_client.containers.get.side_effect = [container, NotFound("removed")] if removed else [container, container]
@@ -100,15 +100,29 @@ async def test_removal_is_confirmed_before_reporting_unload(monkeypatch, removed
     assert manager.docker_client.containers.get.call_count == 2
 
 
-@pytest.mark.parametrize("image,name", [("acme/native:latest", "mcp-acme-native-latest"), ("private.registry:5000/image:v2", "mcp-private.registry-5000-image-v2")])
-def test_default_container_name_is_shared_with_load_planning(image, name):
+@pytest.mark.parametrize("image", ["acme/native:latest", "private.registry:5000/image:v2"])
+def test_default_container_name_is_stable_and_separates_agents(image):
     from kestrel_feature_mcp.manager import container_name_for_image
-    assert container_name_for_image(image) == name
+    name = container_name_for_image(image, "did:test:manager")
+    assert name == container_name_for_image(image, "did:test:manager")
+    assert name != container_name_for_image(image, "did:test:other")
+    assert len(name) <= 255 and name.startswith("mcp-")
+
+
+@pytest.mark.parametrize("images", [
+    ("acme/native:v1", "acme/native:v2"),
+    ("acme/native:latest", "acme-native-latest"),
+    ("private.registry:5000/image:v2", "private.registry-5000-image-v2"),
+])
+def test_default_container_name_separates_connection_images(images):
+    from kestrel_feature_mcp.manager import container_name_for_image
+
+    assert container_name_for_image(images[0], "did:test:manager") != container_name_for_image(images[1], "did:test:manager")
 
 
 @pytest.mark.asyncio
 async def test_failed_retirement_unpublishes_tools_and_prevents_container_restart():
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     connection = AsyncMock()
     connection.close.side_effect = TimeoutError("retirement deadline exceeded")
     manager.owned_containers["owned"] = {"connection": connection, "tools": [object()]}
@@ -122,13 +136,14 @@ async def test_failed_retirement_unpublishes_tools_and_prevents_container_restar
 @pytest.mark.asyncio
 @pytest.mark.parametrize("initial_state", ["existing", "new"])
 async def test_healthcheck_failure_keeps_the_container_owned_for_unload(initial_state):
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     container = MagicMock(status="running")
+    container.labels = {"io.kestrel.mcp.agent-did": "did:test:manager", "io.kestrel.mcp.image": "image:latest"}
     manager.docker_client.containers.get.return_value = container
     if initial_state == "new":
         # The second inspection retrieves logs after the failed healthcheck.
         manager.docker_client.containers.get.side_effect = [NotFound("absent"), container]
-        manager.docker_client.containers.run.return_value = container
+        manager.docker_client.containers.create.return_value = container
     manager._wait_for_container_ready = AsyncMock(side_effect=TimeoutError("healthcheck failed"))
     with pytest.raises(TimeoutError, match="healthcheck failed"):
         await manager.start_tool_container("image", container_name="owned")
@@ -143,7 +158,7 @@ async def test_healthcheck_failure_keeps_the_container_owned_for_unload(initial_
 
 @pytest.mark.asyncio
 async def test_docker_inspection_failure_does_not_lose_prior_container_custody():
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     connection = AsyncMock()
     container = MagicMock()
     manager.owned_containers["owned"] = {"container": container, "connection": connection, "tools": []}
@@ -157,7 +172,7 @@ async def test_docker_inspection_failure_does_not_lose_prior_container_custody()
 
 @pytest.mark.asyncio
 async def test_container_without_a_connection_is_not_callable_but_can_be_stopped():
-    manager = MCPToolManager(docker_client=MagicMock())
+    manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
     container = MagicMock()
     manager.owned_containers["owned"] = {"container": container, "connection": None, "tools": []}
     with pytest.raises(ValueError, match="not connected"):

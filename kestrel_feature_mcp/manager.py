@@ -16,21 +16,20 @@ all MCP servers regardless of their native transport.
 import logging
 import asyncio
 import time
-from typing import Dict, Any, List, Optional
+import hashlib
+import json
+import inspect
+from contextlib import ExitStack, asynccontextmanager
+from functools import wraps
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional, Awaitable, Callable
 
-try:
-    import docker
-    from docker.models.containers import Container
-    from docker.errors import NotFound, DockerException, APIError, ImageNotFound
-except ImportError:
-    docker = None  # type: ignore[assignment]
-    Container = None  # type: ignore[assignment,misc]
-    NotFound = None  # type: ignore[assignment,misc]
-    DockerException = None  # type: ignore[assignment,misc]
-    APIError = None  # type: ignore[assignment,misc]
-    ImageNotFound = None  # type: ignore[assignment,misc]
+import docker
+from docker.errors import NotFound
+from requests.exceptions import RequestException
 
 from .connection import MCPConnection, MCP_CONNECTION_ERRORS
+from .images import normalize_image_ref
 
 from .constants import (
     SESSION_CONNECT_TIMEOUT_SHORT,
@@ -38,6 +37,7 @@ from .constants import (
     CALL_TOOL_TIMEOUT,
     MCP_REMOVAL_ATTEMPTS,
     MCP_REMOVAL_RETRY_DELAY,
+    MCP_CONTAINER_BIND_HOST,
 )
 from .gateway import DockerMCPGateway, DockerMCPGatewayError, DockerMCPNotInstalledError
 
@@ -65,9 +65,50 @@ DOCKER_CLIENT_TIMEOUT = 120
 IMAGE_PULL_TIMEOUT = 600.0
 
 
-def container_name_for_image(image_name: str) -> str:
-    """The canonical container name used by load and lifecycle management."""
-    return f"mcp-{image_name.replace('/', '-').replace(':', '-')}"
+MCP_OWNER_LABEL = "io.kestrel.mcp.agent-did"
+MCP_IMAGE_LABEL = "io.kestrel.mcp.image"
+
+
+def _require_owner_did(owner_did: str) -> str:
+    if (not isinstance(owner_did, str) or not owner_did.startswith("did:")
+            or not owner_did[4:] or any(char.isspace() for char in owner_did)):
+        raise ValueError("An agent DID is required for MCP container ownership")
+    return owner_did
+
+
+def container_name_for_image(image_name: str, owner_did: str) -> str:
+    """Stable resource identity shared by load, restore and manager startup."""
+    identity = json.dumps([_require_owner_did(owner_did), normalize_image_ref(image_name)], separators=(",", ":"))
+    return f"mcp-{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+class ContainerOwnershipError(RuntimeError):
+    """An existing Docker process does not belong to this agent/connection."""
+
+
+class DockerDaemonUnavailableError(RuntimeError):
+    """The required Docker SDK cannot connect to the local daemon."""
+
+
+@dataclass
+class _ContainerLifecycleGate:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
+def _serialize_container_lifecycle(operation):
+    """Serialize one resource while unrelated containers and RPCs progress."""
+    signature = inspect.signature(operation)
+
+    @wraps(operation)
+    async def serialized(self, *args, **kwargs):
+        arguments = signature.bind(self, *args, **kwargs).arguments
+        name = arguments.get("container_name")
+        if not name and "image_name" in arguments:
+            name = container_name_for_image(arguments["image_name"], self.owner_did)
+        async with self._container_lifecycle(name):
+            return await operation(self, *args, **kwargs)
+    return serialized
 
 
 class MCPToolManager:
@@ -76,64 +117,65 @@ class MCPToolManager:
     Handles container lifecycle and MCP connections.
     """
 
-    def __init__(self, docker_client=None):
-        if docker is None:
-            raise ImportError(
-                "docker package is required for MCPToolManager. "
-                "Install it with: pip install kestrel-feature-mcp"
-            )
+    def __init__(self, *, owner_did: str, docker_client):
+        self._owner_did = _require_owner_did(owner_did)
         self.owned_containers: Dict[str, Dict[str, Any]] = {}
-        if docker_client is not None:
-            # Pre-built client (async ``create`` path, or a test double).
-            self.docker_client = docker_client
-            return
-        # Back-compat/legacy synchronous construction. ``docker.from_env()``
-        # and ``ping()`` are BLOCKING socket ops — running them here on the
-        # event loop stalls every agent on the host (F397). Async callers must
-        # use :meth:`create` instead; this branch remains only for direct
-        # instantiation off the loop (and for tests that patch ``docker``).
-        try:
-            self.docker_client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
-            self.docker_client.ping()
-            logger.info("MCPToolManager initialized with Docker connection")
-        except docker.errors.DockerException as e:
-            logger.warning(f"Docker connection failed: {e}")
-            raise RuntimeError(f"Docker not available for MCP tools: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error initializing Docker: {e}", exc_info=True)
-            raise RuntimeError(f"Docker not available for MCP tools: {e}")
+        self.docker_client = docker_client
+        self._lifecycle_gates: dict[str, _ContainerLifecycleGate] = {}
+
+    @property
+    def owner_did(self) -> str:
+        return self._owner_did
 
     @classmethod
-    async def create(cls) -> "MCPToolManager":
+    async def create(cls, *, owner_did: str) -> "MCPToolManager":
         """Build the manager with its Docker client connected OFF the loop.
 
         ``docker.from_env()`` and ``ping()`` block on the Docker daemon socket;
-        doing them in ``__init__`` on the event loop freezes every agent on a
-        multi-agent host until they return (F397). This factory runs them in a
-        worker thread. Async callers (e.g. the feature's ``initialize``) must
-        use this rather than ``MCPToolManager()``.
+        this factory runs them in a worker thread (F397). The constructor
+        accepts only an already-open client through dependency injection.
         """
-        if docker is None:
-            raise ImportError(
-                "docker package is required for MCPToolManager. "
-                "Install it with: pip install kestrel-feature-mcp"
-            )
+        _require_owner_did(owner_did)
 
         def _connect():
-            client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
-            client.ping()
-            return client
+            with ExitStack() as pending:
+                client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
+                pending.callback(client.close)
+                client.ping()
+                pending.pop_all()
+                return client
 
         try:
             client = await asyncio.to_thread(_connect)
-        except docker.errors.DockerException as e:
+        except (docker.errors.DockerException, RequestException) as e:
             logger.warning(f"Docker connection failed: {e}")
-            raise RuntimeError(f"Docker not available for MCP tools: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error initializing Docker: {e}", exc_info=True)
-            raise RuntimeError(f"Docker not available for MCP tools: {e}")
+            raise DockerDaemonUnavailableError(f"Docker not available for MCP tools: {e}") from e
         logger.info("MCPToolManager initialized with Docker connection")
-        return cls(docker_client=client)
+        return cls(owner_did=owner_did, docker_client=client)
+
+    @asynccontextmanager
+    async def _container_lifecycle(self, name: str):
+        gate = self._lifecycle_gates.get(name)
+        if gate is None:
+            gate = _ContainerLifecycleGate()
+            self._lifecycle_gates[name] = gate
+        # No await separates lookup and borrowing. Count waiters as well as
+        # holders, so cancellation cannot replace a lock that is still in use.
+        gate.users += 1
+        try:
+            async with gate.lock:
+                yield
+        finally:
+            gate.users -= 1
+            if gate.users == 0:
+                del self._lifecycle_gates[name]
+
+    def _assert_container_owner(self, container, *, image_name: str | None = None) -> None:
+        labels = container.labels
+        if not isinstance(labels, dict) or labels.get(MCP_OWNER_LABEL) != self.owner_did:
+            raise ContainerOwnershipError("Refusing an MCP container without this agent's ownership label")
+        if image_name is not None and labels.get(MCP_IMAGE_LABEL) != image_name:
+            raise ContainerOwnershipError("Refusing an MCP container with a different connection image")
 
     async def _wait_for_container_ready(
         self,
@@ -191,8 +233,8 @@ class MCPToolManager:
 
                 host_port = int(ports[port_key][0]['HostPort'])
 
-                if await self._check_port_ready('localhost', host_port):
-                    if await self._check_mcp_ready('localhost', host_port):
+                if await self._check_port_ready(MCP_CONTAINER_BIND_HOST, host_port):
+                    if await self._check_mcp_ready(MCP_CONTAINER_BIND_HOST, host_port):
                         logger.info(
                             f"Container {container_name} ready after {attempt} attempts "
                             f"({elapsed:.1f}s)"
@@ -243,10 +285,12 @@ class MCPToolManager:
             ready = False
         return ready
 
+    @_serialize_container_lifecycle
     async def start_tool_container(self, image_name: str, container_name: str = None, command: List[str] = None, environment: Dict[str, str] = None, volumes: Dict[str, Dict[str, str]] = None) -> str:
         """Starts a Docker container for an MCP tool. Returns the container name."""
+        image_name = normalize_image_ref(image_name)
         if not container_name:
-            container_name = container_name_for_image(image_name)
+            container_name = container_name_for_image(image_name, self.owner_did)
         # Retire the old transport before Docker restarts/replaces its process.
         # A failed healthcheck must not leave an earlier connection published.
         await self._drop_connection(container_name)
@@ -256,6 +300,7 @@ class MCPToolManager:
                 container = await asyncio.to_thread(
                     self.docker_client.containers.get, container_name
                 )
+                self._assert_container_owner(container, image_name=image_name)
                 self._retain_container(container_name, container)
                 if container.status == 'running':
                     logger.info(f"Container {container_name} exists and running. Restarting for clean state...")
@@ -294,18 +339,20 @@ class MCPToolManager:
 
             logger.info(f"Starting container {container_name} from {image_name}...")
             container = await asyncio.to_thread(
-                lambda: self.docker_client.containers.run(
+                lambda: self.docker_client.containers.create(
                     image_name,
                     command=command,
                     name=container_name,
                     detach=True,
-                    ports={'8000/tcp': None},
+                    ports={'8000/tcp': (MCP_CONTAINER_BIND_HOST, None)},
                     environment=env,
-                    volumes=volumes or {}
+                    volumes=volumes or {},
+                    labels={MCP_OWNER_LABEL: self.owner_did, MCP_IMAGE_LABEL: image_name},
                 )
             )
 
             self._retain_container(container_name, container)
+            await asyncio.to_thread(container.start)
             await self._wait_for_container_ready(container_name, port=8000)
             await asyncio.to_thread(container.reload)
             return container_name
@@ -356,18 +403,20 @@ class MCPToolManager:
                 await connection.close()
             info["connection"] = None
 
+    @_serialize_container_lifecycle
     async def connect_to_tool(self, container_name: str):
         """Connect to a running container with native Streamable HTTP."""
         await self._drop_connection(container_name)
         container = await asyncio.to_thread(self.docker_client.containers.get, container_name)
         await asyncio.to_thread(container.reload)
+        self._assert_container_owner(container)
         ports = container.ports
         if not ports or not ports.get("8000/tcp"):
             raise ValueError(f"Container {container_name} does not expose port 8000")
         host_port = ports["8000/tcp"][0]["HostPort"]
         record = self._retain_container(container_name, container)
         connection = MCPConnection(
-            f"http://localhost:{host_port}/mcp",
+            f"http://{MCP_CONTAINER_BIND_HOST}:{host_port}/mcp",
             connect_timeout=SESSION_CONNECT_TIMEOUT_SHORT,
             call_timeout=CALL_TOOL_TIMEOUT,
         )
@@ -392,6 +441,7 @@ class MCPToolManager:
                 await asyncio.sleep(MCP_REMOVAL_RETRY_DELAY)
         raise TimeoutError(f"MCP container {name!r} is still registered after removal")
 
+    @_serialize_container_lifecycle
     async def stop_tool(self, container_name: str) -> bool:
         """Stops a tool, closes connection, and stops container.
 
@@ -424,14 +474,24 @@ class MCPToolManager:
         logger.info(f"stop_tool: no active container named {container_name}")
         return False
 
-    async def call_tool(self, container_name: str, tool_name: str, arguments: dict = None):
-        """Calls a tool on a specific container."""
+    def tool_caller(self, container_name: str) -> Callable[..., Awaitable[Any]]:
+        """Bind a mounted handle to the connection that advertised its schema."""
         info = self.owned_containers.get(container_name)
         if info is None or info["connection"] is None or info["tools"] is None:
             raise ValueError(f"Tool {container_name} not connected")
-
         connection = info["connection"]
-        return await connection.call_tool(tool_name, arguments or {})
+
+        async def call(tool_name: str, arguments: dict = None):
+            if (self.owned_containers.get(container_name) is not info
+                    or info["connection"] is not connection or info["tools"] is None):
+                raise ValueError(f"MCP connection {container_name} changed; rediscover its tools before calling")
+            return await connection.call_tool(tool_name, arguments or {})
+
+        return call
+
+    async def call_tool(self, container_name: str, tool_name: str, arguments: dict = None):
+        """Call a currently published container connection."""
+        return await self.tool_caller(container_name)(tool_name, arguments)
 
     def get_all_tools(self):
         """Returns a list of all available tools across all containers."""
@@ -541,15 +601,24 @@ class MCPGatewayManager:
         auth_token = await self.gateway.remove_server(server_name)
         return await self._connect(auth_token)
 
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any] = None):
-        """Call a tool through the gateway."""
+    def tool_caller(self) -> Callable[..., Awaitable[Any]]:
+        """Bind a mounted handle to this gateway's advertised connection."""
         if self.connection is None:
             raise RuntimeError("Not connected to gateway")
+        connection = self.connection
 
-        if tool_name not in self.tools:
-            raise ValueError(f"Unknown tool: {tool_name}. Available: {list(self.tools.keys())}")
+        async def call(tool_name: str, arguments: Dict[str, Any] = None):
+            if self.connection is not connection:
+                raise ValueError("MCP gateway connection changed; rediscover its tools before calling")
+            if tool_name not in self.tools:
+                raise ValueError(f"Unknown tool: {tool_name}. Available: {list(self.tools.keys())}")
+            return await connection.call_tool(tool_name, arguments or {})
 
-        return await self.connection.call_tool(tool_name, arguments or {})
+        return call
+
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any] = None):
+        """Call the currently published gateway connection."""
+        return await self.tool_caller()(tool_name, arguments)
 
     def get_all_tools(self) -> List[Dict[str, Any]]:
         """Get all available tools."""
