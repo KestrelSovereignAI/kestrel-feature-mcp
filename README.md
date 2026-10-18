@@ -65,7 +65,9 @@ tool. A local entry never overrides an official entry with the same name, and
 an official registry error never becomes a successful local result.
 
 Official catalog and search requests return one page, with `limit` from 1 to 100
-(default 20). Pass the exact `result.metadata.nextCursor` back as `cursor` for
+(default 20). Omit `limit` and `cursor` for the local source; explicit values
+are refused there. Search and catalog list latest versions only; detail lookup
+can request a known exact version. Pass the exact `result.metadata.nextCursor` back as `cursor` for
 the next page. Detail lookup accepts the namespaced server name and an exact
 `version`, or `latest`; results retain the actual version, remote endpoint
 templates, package definitions and registry metadata. Search results are
@@ -85,6 +87,21 @@ entries. A rejected detail lookup is inspectable with its schema problems;
 `RegistryRecord.require_valid()` refuses it. Publisher text is quoted and
 control characters are escaped in the human-readable rendering. The request
 deadline and byte limit also apply to custom registry bases.
+
+Schema diagnostics are bounded to 256 characters per path, detail or rejected
+name, with four problems per rejected record plus an explicit omitted-count
+summary. Every rejected index remains excluded from conforming results even
+when diagnostics are omitted. Model-facing confirmation and error text each
+have an 8192-character budget; complete record blocks and escaped cursor lines are omitted with a visible
+notice rather than cutting an opaque cursor into a different value. The full
+response and exact cursor remain in `data.result`. Configure these bounds with
+`KESTREL_MCP_REGISTRY_PROBLEM_CHARS`, `KESTREL_MCP_REGISTRY_PROBLEMS_PER_RECORD`
+and `KESTREL_MCP_REGISTRY_TEXT_CHARS`. These limits apply to the official source.
+
+Validation follows JSON Schema 2020-12 without a format checker: `uri` and
+`date-time` formats are annotations, not additional validity assertions. Strict
+JSON syntax, schema types, required fields, enumerations and other assertions
+are enforced. Discovery does not establish that an advertised endpoint works.
 
 The bundled `registry_openapi_2025_12_01.json` is an unmodified JSON conversion of
 the official [Registry API contract](https://github.com/modelcontextprotocol/registry/blob/11b7b0e274d518b6f449c5ee3518a6151d9848b9/docs/reference/api/openapi.yaml),

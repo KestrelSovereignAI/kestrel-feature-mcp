@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.resources import files
 import json
 import math
 import os
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import quote, urlsplit
 
 import httpx2
@@ -33,6 +33,9 @@ class RegistrySettings:
     api_url: str = "https://registry.modelcontextprotocol.io/v0.1"
     timeout: float = 30.0
     max_response_bytes: int = 2 * 1024 * 1024
+    max_problem_chars: int = 256
+    max_problems_per_record: int = 4
+    max_text_chars: int = 8192
 
     def __post_init__(self) -> None:
         try:
@@ -43,7 +46,7 @@ class RegistrySettings:
         if (
             origin.scheme != "https" or not origin.hostname
             or origin.username is not None or origin.password is not None
-            or origin.query or origin.fragment or port == 0
+            or "?" in self.api_url or "#" in self.api_url or port == 0
         ):
             raise OfficialRegistryError(
                 "MCP Registry API URL must use HTTPS without credentials, query or fragment"
@@ -52,18 +55,59 @@ class RegistrySettings:
             raise OfficialRegistryError("MCP Registry timeout must be finite and positive")
         if type(self.max_response_bytes) is not int or self.max_response_bytes <= 0:
             raise OfficialRegistryError("MCP Registry response limit must be a positive integer")
+        if type(self.max_problem_chars) is not int or self.max_problem_chars < 64:
+            raise OfficialRegistryError("MCP Registry diagnostic limit must be an integer of at least 64")
+        if type(self.max_problems_per_record) is not int or self.max_problems_per_record <= 0:
+            raise OfficialRegistryError("MCP Registry diagnostic count must be a positive integer")
+        if type(self.max_text_chars) is not int or self.max_text_chars < 256:
+            raise OfficialRegistryError("MCP Registry text limit must be an integer of at least 256")
+
+    def diagnostic(self, value: str) -> str:
+        """Bound schema paths, instance reprs and rejected names at one boundary."""
+        suffix = " [truncated]"
+        if len(value) <= self.max_problem_chars:
+            return value
+        return value[:self.max_problem_chars - len(suffix)] + suffix
+
+    def render(self, lines: Iterable[str]) -> str:
+        """Keep complete record blocks; an omitted opaque value is never shortened."""
+        notice = "Display blocks omitted; inspect the complete payload (data.result for tools)."
+        budget = self.max_text_chars - len(notice) - 1
+        selected = []
+        omitted = False
+        used = 0
+        for line in lines:
+            size = len(line) + bool(selected)
+            if used + size <= budget:
+                selected.append(line)
+                used += size
+            else:
+                omitted = True
+        if omitted:
+            selected.append(notice)
+        return "\n".join(selected)
+
+    def schema_error(self, problems: Iterable[RegistryProblem]) -> str:
+        return self.render([
+            "MCP Registry schema error:",
+            *(json.dumps({"index": p.record_index, **p.to_dict()}, ensure_ascii=True) for p in problems),
+        ])
 
     @classmethod
     def from_environment(cls) -> RegistrySettings:
         try:
             timeout = float(os.environ.get("KESTREL_MCP_REGISTRY_TIMEOUT", "30"))
             size = int(os.environ.get("KESTREL_MCP_REGISTRY_MAX_BYTES", "2097152"))
+            problem_chars = int(os.environ.get("KESTREL_MCP_REGISTRY_PROBLEM_CHARS", str(cls.max_problem_chars)))
+            problem_count = int(os.environ.get("KESTREL_MCP_REGISTRY_PROBLEMS_PER_RECORD", str(cls.max_problems_per_record)))
+            text_chars = int(os.environ.get("KESTREL_MCP_REGISTRY_TEXT_CHARS", str(cls.max_text_chars)))
         except ValueError as error:
             raise OfficialRegistryError("Invalid MCP Registry timeout or response limit") from error
         return cls(
             api_url=os.environ.get("KESTREL_MCP_REGISTRY_URL", cls.api_url),
             timeout=timeout,
             max_response_bytes=size,
+            max_problem_chars=problem_chars, max_problems_per_record=problem_count, max_text_chars=text_chars,
         )
 
 
@@ -72,6 +116,7 @@ class RegistryPage:
     registry_url: str
     payload: dict[str, Any]
     problems: tuple[RegistryProblem, ...] = ()
+    settings: RegistrySettings = field(default_factory=RegistrySettings)
 
     @property
     def servers(self) -> list[dict[str, Any]]:
@@ -86,7 +131,7 @@ class RegistryPage:
             server = record.get("server") if isinstance(record, dict) else None
             name = server.get("name") if isinstance(server, dict) else None
             rejected.append({
-                "index": index, "name": name if isinstance(name, str) else None,
+                "index": index, "name": self.settings.diagnostic(name) if isinstance(name, str) else None,
                 "problems": [p.to_dict() for p in self.problems if p.record_index == index],
             })
         return rejected
@@ -112,13 +157,12 @@ class RegistryRecord:
     registry_url: str
     payload: dict[str, Any]
     problems: tuple[RegistryProblem, ...] = ()
+    settings: RegistrySettings = field(default_factory=RegistrySettings)
 
     def require_valid(self) -> dict[str, Any]:
         """Refuse a record rejected during this inspection."""
         if self.problems:
-            raise OfficialRegistryError("MCP Registry schema error: " + json.dumps(
-                [problem.to_dict() for problem in self.problems], ensure_ascii=True,
-            ))
+            raise OfficialRegistryError(self.settings.schema_error(self.problems))
         return self.payload
 
 
@@ -150,16 +194,30 @@ class OfficialRegistryClient:
 
     def _validate(self, payload: Any, component: str) -> tuple[RegistryProblem, ...]:
         problems = []
+        counts: dict[int, int] = {}
         for error in self._validators[component].iter_errors(payload):
             path = tuple(error.absolute_path)
             index = 0
             if component == "ServerList":
                 if len(path) < 2 or path[0] != "servers" or type(path[1]) is not int:
                     raise OfficialRegistryError(
-                        f"MCP Registry schema error at {error.json_path} ({error.validator})"
+                        "MCP Registry schema error at "
+                        + json.dumps(self.settings.diagnostic(error.json_path), ensure_ascii=True)
+                        + f" ({error.validator})"
                     )
                 index = path[1]
-            problems.append(RegistryProblem(index, error.json_path, error.validator, error.message))
+            counts[index] = counts.get(index, 0) + 1
+            if counts[index] <= self.settings.max_problems_per_record:
+                problems.append(RegistryProblem(
+                    index, self.settings.diagnostic(error.json_path), error.validator,
+                    self.settings.diagnostic(error.message),
+                ))
+        # Retain a rejection for every invalid record, even after its detail cap.
+        # A page-wide cap could accidentally admit records whose errors were dropped.
+        for index, count in counts.items():
+            omitted = count - self.settings.max_problems_per_record
+            if omitted > 0:
+                problems.append(RegistryProblem(index, "$", "omitted", f"{omitted} additional schema errors omitted"))
         return tuple(problems)
 
     def _segment(self, value: str, field: str) -> str:
@@ -186,7 +244,7 @@ class OfficialRegistryClient:
                     transport=transport, timeout=self.settings.timeout,
                     follow_redirects=False, trust_env=False,
                 ) as client:
-                    async with client.stream("GET", url, params=params) as response:
+                    async with client.stream("GET", validated.url, params=params) as response:
                         response.raise_for_status()
                         body = bytearray()
                         chunk_size = min(65536, self.settings.max_response_bytes + 1)
@@ -204,7 +262,7 @@ class OfficialRegistryClient:
         except TimeoutError as error:
             raise OfficialRegistryError("MCP Registry request exceeded its deadline") from error
         except (SSRFError, httpx2.HTTPError, httpx2.InvalidURL, UnicodeError, json.JSONDecodeError, RecursionError) as error:
-            raise OfficialRegistryError(f"MCP Registry request failed: {error}") from error
+            raise OfficialRegistryError("MCP Registry request failed: " + self.settings.diagnostic(str(error))) from error
 
     async def search(
         self, query: str | None = None, *, cursor: str | None = None, limit: int = 20,
@@ -227,7 +285,7 @@ class OfficialRegistryClient:
         next_cursor = payload.get("metadata", {}).get("nextCursor")
         if cursor is not None and next_cursor == cursor:
             raise OfficialRegistryError("MCP Registry repeated its pagination cursor")
-        return RegistryPage(self.settings.api_url.rstrip("/"), payload, problems)
+        return RegistryPage(self.settings.api_url.rstrip("/"), payload, problems, self.settings)
 
     async def get(self, server_name: str, *, version: str = "latest") -> RegistryRecord:
         name_segment = self._segment(server_name, "name")
@@ -239,4 +297,4 @@ class OfficialRegistryClient:
             raise OfficialRegistryError("MCP Registry returned a different server identity")
         if version != "latest" and payload["server"].get("version") != version:
             raise OfficialRegistryError("MCP Registry returned a different server version")
-        return RegistryRecord(self.settings.api_url.rstrip("/"), payload, problems)
+        return RegistryRecord(self.settings.api_url.rstrip("/"), payload, problems, self.settings)

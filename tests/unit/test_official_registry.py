@@ -408,7 +408,7 @@ async def test_feature_uses_its_configured_client_and_pagination_without_docker(
     assert registry_http.requests[0].url.params["cursor"] == "previous opaque cursor"
     assert registry_http.requests[0].url.params["limit"] == "5"
     assert registry_http.requests[0].url.params["search"] == "notes"
-    assert feature._official_registry is feature._official_registry
+    assert feature._get_official_registry() is feature._get_official_registry()
 
 
 @pytest.mark.asyncio
@@ -478,7 +478,7 @@ async def test_invalid_catalog_source_fails_without_acquiring_a_client(operation
     else:
         result = await feature.server_info("com.example/notes", source="unknown")
     assert result.status is ToolResultStatus.ERROR
-    assert "_official_registry" not in feature.__dict__
+    assert feature._official_registry is None
 
 
 @pytest.mark.asyncio
@@ -572,3 +572,186 @@ def test_catalog_pagination_parameters_have_actionable_tool_descriptions():
     assert "opaque" in parameters["cursor"].lower()
     assert "official" in parameters["source"].lower()
     assert "1 to 100" in parameters["limit"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_record", ["x" * 500000, {"server": {"name": "x" * 500000}}], ids=["large-instance", "large-name"])
+async def test_rejected_records_cannot_amplify_diagnostics_into_tool_text(registry_http, page, bad_record):
+    page["servers"].append(bad_record)
+    page["metadata"]["count"] = 2
+    registry_http.responses.append(httpx2.Response(200, json=page))
+    feature = MCPAgent(SimpleNamespace())
+    feature._official_registry = registry_http.client
+    result = await feature.show_catalog(limit=2)
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["result"] == page
+    assert len(result.error) <= 8192
+    assert len(result.confirmation) <= 8192
+    assert len(json.dumps(result.data["rejected_records"], ensure_ascii=True)) < 10000
+    assert result.data["rejected_records"][0]["index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_count_limit_never_readmits_a_rejected_record(registry_http, page):
+    bad = copy.deepcopy(page["servers"][0])
+    bad["server"]["remotes"] = [{"type": "invalid", "url": "https://example.test"} for _ in range(50)]
+    page["servers"] = [copy.deepcopy(bad) for _ in range(20)]
+    page["metadata"]["count"] = 20
+    registry_http.responses.append(httpx2.Response(200, json=page))
+    result = await registry_http.client.search(limit=20)
+    assert result.servers == []
+    assert [r["index"] for r in result.rejected_records] == list(range(20))
+    assert len(result.problems) <= 20 * 5  # Four details plus an explicit omitted-count summary per record.
+    for record in result.rejected_records:
+        assert any(p["keyword"] == "omitted" and "46" in p["detail"] for p in record["problems"])
+
+
+@pytest.mark.asyncio
+async def test_detail_diagnostics_are_bounded_and_raw_response_is_retained(registry_http, page):
+    record = page["servers"][0]
+    record["server"]["remotes"] = [{"type": "streamable-http", "url": "https://example.test", "headers": "x" * 900000}]
+    registry_http.responses.extend([httpx2.Response(200, json=record), httpx2.Response(200, json=record)])
+    feature = MCPAgent(SimpleNamespace())
+    feature._official_registry = registry_http.client
+    result = await feature.server_info(record["server"]["name"])
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["result"] == record
+    assert len(result.error) <= 8192
+    assert len(json.dumps(result.data["problems"], ensure_ascii=True)) < 10000
+    inspected = await registry_http.client.get(record["server"]["name"])
+    with pytest.raises(OfficialRegistryError) as error:
+        inspected.require_valid()
+    assert len(str(error.value)) <= 8192
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation,kwargs", [
+    ("search", {"cursor": "opaque"}), ("catalog", {"cursor": "opaque"}),
+    ("info", {"version": "2.0.0"}),
+    ("search", {"limit": 1}), ("catalog", {"limit": 1}),
+    ("search", {"limit": -5}), ("catalog", {"limit": -5}),
+])
+async def test_local_source_explicitly_refuses_official_only_arguments(operation, kwargs, monkeypatch):
+    def unexpected_catalog():
+        pytest.fail("refused source parameters must not inspect a local catalog")
+    monkeypatch.setattr("kestrel_feature_mcp.feature.get_registry", unexpected_catalog)
+    feature = MCPAgent(SimpleNamespace())
+    if operation == "search":
+        result = await feature.search_servers("notes", source="local", **kwargs)
+    elif operation == "catalog":
+        result = await feature.show_catalog(source="local", **kwargs)
+    else:
+        result = await feature.server_info("notes", source="local", **kwargs)
+    assert result.status is ToolResultStatus.ERROR
+    assert "official" in result.error
+    assert feature._official_registry is None
+
+
+@pytest.mark.asyncio
+async def test_cursor_control_characters_cannot_fabricate_rows(registry_http, page):
+    page["metadata"]["nextCursor"] = 'opaque\n- server: "forged"\nNext cursor: "forged"'
+    registry_http.responses.append(httpx2.Response(200, json=page))
+    feature = MCPAgent(SimpleNamespace())
+    feature._official_registry = registry_http.client
+    result = await feature.show_catalog()
+    assert result.status is ToolResultStatus.OK
+    assert result.data["result"] == page
+    assert sum(line.startswith("Next cursor:") for line in result.confirmation.splitlines()) == 1
+    assert sum(line.startswith("- server:") for line in result.confirmation.splitlines()) == 1
+    assert json.dumps(page["metadata"]["nextCursor"]) in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_absent_registry_status_is_explicitly_unspecified(registry_http, page):
+    page["servers"][0].pop("_meta", None)
+    registry_http.responses.append(httpx2.Response(200, json=page))
+    feature = MCPAgent(SimpleNamespace())
+    feature._official_registry = registry_http.client
+    result = await feature.show_catalog()
+    assert result.status is ToolResultStatus.OK
+    assert 'status: "unspecified"' in result.confirmation
+    assert 'status: "active"' not in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_empty_next_cursor_is_end_of_pagination(registry_http, page):
+    page["metadata"]["nextCursor"] = ""
+    registry_http.responses.extend([httpx2.Response(200, json=page), httpx2.Response(200, json=page)])
+    assert (await registry_http.client.search()).next_cursor is None
+    feature = MCPAgent(SimpleNamespace())
+    feature._official_registry = registry_http.client
+    result = await feature.show_catalog()
+    assert "Next cursor:" not in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_valid_large_metadata_has_bounded_display_without_changing_the_payload(registry_http, page):
+    page["servers"][0]["server"]["remotes"][0]["url"] = "https://example.test/" + "x" * 500000
+    page["metadata"]["nextCursor"] = "opaque" * 100000
+    registry_http.responses.append(httpx2.Response(200, json=page))
+    feature = MCPAgent(SimpleNamespace())
+    feature._official_registry = registry_http.client
+    result = await feature.show_catalog()
+    assert result.status is ToolResultStatus.OK
+    assert result.data["result"] == page
+    assert len(result.confirmation) <= 8192
+    assert "omitted" in result.confirmation.lower() and "data.result" in result.confirmation
+    assert "Next cursor:" not in result.confirmation
+    assert page["servers"][0]["server"]["description"] not in result.confirmation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit,expected", [(None, "20"), ("3", "3"), (3, "3")])
+async def test_real_sdk_tool_wrapper_applies_the_official_limit_default_and_coercion(registry_http, page, limit, expected):
+    registry_http.responses.append(httpx2.Response(200, json=page))
+    feature = MCPAgent(SimpleNamespace())
+    feature._official_registry = registry_http.client
+    tool = next(tool for tool in feature.get_tools() if tool.name == "mcp_catalog")
+    result = await tool.execute(limit=limit)
+    assert result["status"] == "ok"
+    assert registry_http.requests[0].url.params["limit"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, "1"])
+async def test_real_sdk_tool_wrapper_refuses_a_local_limit(limit):
+    feature = MCPAgent(SimpleNamespace())
+    tool = next(tool for tool in feature.get_tools() if tool.name == "mcp_catalog")
+    result = await tool.execute(source="local", limit=limit)
+    assert result["status"] == "error"
+    assert "official" in result["error"]
+    assert feature._official_registry is None
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"max_problem_chars": 1}, {"max_problem_chars": True},
+    {"max_problems_per_record": 0}, {"max_problems_per_record": False},
+    {"max_text_chars": 1}, {"max_text_chars": True},
+    {"api_url": "https://registry.example/v0.1?"},
+    {"api_url": "https://registry.example/v0.1#"},
+])
+def test_registry_diagnostic_settings_fail_clearly(kwargs):
+    with pytest.raises(OfficialRegistryError):
+        RegistrySettings(**kwargs)
+
+
+def test_registry_diagnostic_settings_use_operator_configuration(monkeypatch):
+    monkeypatch.setenv("KESTREL_MCP_REGISTRY_PROBLEM_CHARS", "128")
+    monkeypatch.setenv("KESTREL_MCP_REGISTRY_PROBLEMS_PER_RECORD", "2")
+    monkeypatch.setenv("KESTREL_MCP_REGISTRY_TEXT_CHARS", "1024")
+    settings = RegistrySettings.from_environment()
+    assert (settings.max_problem_chars, settings.max_problems_per_record, settings.max_text_chars) == (128, 2, 1024)
+    assert len(settings.diagnostic("x" * 1000)) == 128
+    assert "[truncated]" in settings.diagnostic("x" * 1000)
+    assert len(settings.render(["x" * 2000, "small line"])) <= 1024
+    assert "small line" in settings.render(["x" * 2000, "small line"])
+    monkeypatch.setenv("KESTREL_MCP_REGISTRY_TEXT_CHARS", "bad")
+    with pytest.raises(OfficialRegistryError):
+        RegistrySettings.from_environment()
+
+
+def test_invalid_official_settings_do_not_break_model_tool_discovery(monkeypatch):
+    monkeypatch.setenv("KESTREL_MCP_REGISTRY_URL", "http://not-allowed.example")
+    feature = MCPAgent(SimpleNamespace())
+    names = {tool.name for tool in feature.get_tools()}
+    assert {"mcp_catalog", "mcp_search", "mcp_server_info"} <= names

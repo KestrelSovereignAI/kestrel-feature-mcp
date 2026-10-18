@@ -15,7 +15,6 @@ of their native transport protocol.
 
 import asyncio
 from contextlib import AsyncExitStack
-from functools import cached_property
 import logging
 import json
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
@@ -37,6 +36,7 @@ from .registry import (
 # This prevents pytest from hanging due to anyio event loop issues
 if TYPE_CHECKING:
     from .manager import MCPToolManager, MCPGatewayManager
+    from .official_registry import OfficialRegistryClient
 
 logger = logging.getLogger(__name__)
 
@@ -68,28 +68,29 @@ def _loaded_tool_result(confirmation: str, *, data: dict) -> ToolResult:
     return ToolResult.ok(confirmation, data=data)
 
 
-def _format_official_records(records: list[dict[str, Any]]) -> str:
+def _official_record_blocks(records: list[dict[str, Any]]) -> list[str]:
     lines = ["Official MCP Registry results:"]
     for record in records:
         server = record["server"]
         status = record.get("_meta", {}).get("io.modelcontextprotocol.registry/official", {}).get("status", "unspecified")
-        lines.extend([
+        block = [
             f"- server: {json.dumps(server['name'], ensure_ascii=True)}; "
             f"version: {json.dumps(server['version'], ensure_ascii=True)}; "
             f"status: {json.dumps(status, ensure_ascii=True)}",
             f"  description: {json.dumps(server['description'], ensure_ascii=True)}",
-        ])
+        ]
         for remote in server.get("remotes", []):
             support = " (unsupported transport)" if remote["type"] != "streamable-http" else ""
-            lines.append(f"  {remote['type']}{support}: {json.dumps(remote['url'], ensure_ascii=True)}")
+            block.append(f"  {remote['type']}{support}: {json.dumps(remote['url'], ensure_ascii=True)}")
         for package in server.get("packages", []):
-            lines.append(
+            block.append(
                 f"  Package: {json.dumps(package['registryType'], ensure_ascii=True)} / "
                 f"{json.dumps(package['identifier'], ensure_ascii=True)}"
             )
+        lines.append("\n".join(block))
     if not records:
         lines.append("No conforming server records are available on this page.")
-    return "\n".join(lines)
+    return lines
 
 
 class MCPAgent(Feature):
@@ -98,6 +99,10 @@ class MCPAgent(Feature):
     It encapsulates the complexity of Docker container management and tool discovery,
     providing a high-level interface for the main KestrelAgent.
     """
+
+    def __init__(self, agent):
+        super().__init__(agent)
+        self._official_registry: OfficialRegistryClient | None = None
 
     @property
     def tool_description(self) -> str:
@@ -667,36 +672,41 @@ class MCPAgent(Feature):
             logger.error(f"Failed to unload gateway server {server_name}: {e}", exc_info=True)
             return ToolResult.failed(f"Failed to unload {server_name}: {str(e)}")
 
-    @cached_property
-    def _official_registry(self):
+    def _get_official_registry(self) -> "OfficialRegistryClient":
+        """Construct only on an official request, never during tool introspection."""
         from .official_registry import OfficialRegistryClient
 
-        return OfficialRegistryClient()
+        if self._official_registry is None:
+            self._official_registry = OfficialRegistryClient()
+        return self._official_registry
 
     async def _official_registry_page(
-        self, query: str | None, *, cursor: str | None, limit: int,
+        self, query: str | None, *, cursor: str | None, limit: int | None,
     ) -> ToolResult:
         from .official_registry import OfficialRegistryError
 
         try:
-            page = await self._official_registry.search(query, cursor=cursor, limit=limit)
+            options = {"cursor": cursor}
+            if limit is not None:
+                options["limit"] = limit
+            page = await self._get_official_registry().search(query, **options)
         except OfficialRegistryError as error:
             return ToolResult.failed(str(error), data={"source": "official"})
-        text = _format_official_records(page.servers)
+        lines = _official_record_blocks(page.servers)
         if page.next_cursor is not None:
-            text += "\nNext cursor: " + json.dumps(page.next_cursor, ensure_ascii=True)
+            lines.append("Next cursor: " + json.dumps(page.next_cursor, ensure_ascii=True))
         data = {
             "source": "official", "registry_url": page.registry_url, "result": page.payload,
         }
         rejected = page.rejected_records
         if rejected:
             data["rejected_records"] = rejected
-            text += "\nRejected records: " + json.dumps(
+            lines.append("Rejected records: " + json.dumps(
                 [{"index": item["index"], "name": item["name"]} for item in rejected],
                 ensure_ascii=True,
-            )
-            return ToolResult.partial(text, "MCP Registry schema errors: " + json.dumps(rejected, ensure_ascii=True), data=data)
-        return ToolResult.ok(text, data=data)
+            ))
+            return ToolResult.partial(page.settings.render(lines), page.settings.schema_error(page.problems), data=data)
+        return ToolResult.ok(page.settings.render(lines), data=data)
 
     @tool(
         name="mcp_search",
@@ -706,7 +716,7 @@ class MCPAgent(Feature):
     )
     async def search_servers(
         self, query: str, source: str = "official",
-        cursor: str | None = None, limit: int = 20,
+        cursor: str | None = None, limit: int | None = None,
     ) -> ToolResult:
         """
         Search the MCP server catalog for servers matching a query.
@@ -715,15 +725,15 @@ class MCPAgent(Feature):
             query: Official server-name substring, or local capability/category
             source: Explicit catalog; entries never override another source
             cursor: Official registry's opaque next-page cursor
-            limit: Official registry page size (1 to 100)
+            limit: Official registry page size (1 to 100, default 20); omit for local
 
         Returns:
             List of matching MCP servers with their details.
         """
         if source == "official":
             return await self._official_registry_page(query, cursor=cursor, limit=limit)
-        if source != "local" or cursor is not None:
-            return ToolResult.failed("Select source='official' or source='local'; only the official source accepts a cursor.")
+        if source != "local" or cursor is not None or limit is not None:
+            return ToolResult.failed("Select source='official' or source='local'; only the official source accepts a cursor or limit.")
         registry = get_registry()
         matches = registry.search(query)
 
@@ -761,7 +771,7 @@ class MCPAgent(Feature):
     )
     async def show_catalog(
         self, source: str = "official",
-        cursor: str | None = None, limit: int = 20,
+        cursor: str | None = None, limit: int | None = None,
     ) -> ToolResult:
         """
         Display a page of the official registry, or the full local catalog.
@@ -769,15 +779,15 @@ class MCPAgent(Feature):
         Args:
             source: Explicit official or local catalog
             cursor: Exact opaque next-page cursor returned by the official registry
-            limit: Official registry page size, from 1 to 100
+            limit: Official registry page size, from 1 to 100 (default 20); omit for local
 
         Returns:
             Formatted list of all available MCP servers.
         """
         if source == "official":
             return await self._official_registry_page(None, cursor=cursor, limit=limit)
-        if source != "local" or cursor is not None:
-            return ToolResult.failed("Select source='official' or source='local'; only the official source accepts a cursor.")
+        if source != "local" or cursor is not None or limit is not None:
+            return ToolResult.failed("Select source='official' or source='local'; only the official source accepts a cursor or limit.")
         registry = get_registry()
         return ToolResult.ok(
             registry.format_catalog(),
@@ -809,7 +819,7 @@ class MCPAgent(Feature):
             from .official_registry import OfficialRegistryError
 
             try:
-                record = await self._official_registry.get(server_name, version=version)
+                record = await self._get_official_registry().get(server_name, version=version)
             except OfficialRegistryError as error:
                 return ToolResult.failed(str(error), data={"source": "official"})
             data = {
@@ -819,10 +829,10 @@ class MCPAgent(Feature):
                 problems = [problem.to_dict() for problem in record.problems]
                 data["problems"] = problems
                 return ToolResult.partial(
-                    f"Registry record {json.dumps(server_name, ensure_ascii=True)} was rejected by the published schema; its metadata is available for inspection.",
-                    "MCP Registry schema errors: " + json.dumps(problems, ensure_ascii=True), data=data,
+                    "Registry record was rejected by the published schema; inspect data.result for its metadata.",
+                    record.settings.schema_error(record.problems), data=data,
                 )
-            return ToolResult.ok(_format_official_records([record.require_valid()]), data=data)
+            return ToolResult.ok(record.settings.render(_official_record_blocks([record.require_valid()])), data=data)
         if source != "local" or version != "latest":
             return ToolResult.failed("Select source='official' or source='local'; only the official source accepts a version.")
         registry = get_registry()
