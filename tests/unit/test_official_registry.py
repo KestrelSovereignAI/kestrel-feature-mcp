@@ -755,3 +755,19 @@ def test_invalid_official_settings_do_not_break_model_tool_discovery(monkeypatch
     feature = MCPAgent(SimpleNamespace())
     names = {tool.name for tool in feature.get_tools()}
     assert {"mcp_catalog", "mcp_search", "mcp_server_info"} <= names
+
+
+@pytest.mark.asyncio
+async def test_pagination_cursor_has_priority_over_record_display(registry_http, page):
+    registry_http.client.settings = RegistrySettings(api_url="https://registry.example/v0.1", max_text_chars=400)
+    cursor = "cursor:" + "x" * 193
+    page["metadata"]["nextCursor"] = cursor
+    registry_http.responses.append(httpx2.Response(200, json=page))
+    feature = MCPAgent(SimpleNamespace())
+    feature._official_registry = registry_http.client
+    result = await feature.show_catalog()
+    assert result.status is ToolResultStatus.OK
+    assert result.data["result"] == page
+    assert len(result.confirmation) <= 400
+    assert "Next cursor: " + json.dumps(cursor) in result.confirmation
+    assert "omitted" in result.confirmation

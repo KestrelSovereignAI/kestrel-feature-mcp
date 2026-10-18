@@ -94,7 +94,9 @@ summary. Every rejected index remains excluded from conforming results even
 when diagnostics are omitted. Model-facing confirmation and error text each
 have an 8192-character budget; complete record blocks and escaped cursor lines are omitted with a visible
 notice rather than cutting an opaque cursor into a different value. The full
-response and exact cursor remain in `data.result`. Configure these bounds with
+response and exact cursor remain in `data.result`. The next cursor has display
+priority over record blocks so a normal pagination token remains available when
+the record display budget is exhausted. Configure these bounds with
 `KESTREL_MCP_REGISTRY_PROBLEM_CHARS`, `KESTREL_MCP_REGISTRY_PROBLEMS_PER_RECORD`
 and `KESTREL_MCP_REGISTRY_TEXT_CHARS`. These limits apply to the official source.
 

@@ -694,7 +694,7 @@ class MCPAgent(Feature):
             return ToolResult.failed(str(error), data={"source": "official"})
         lines = _official_record_blocks(page.servers)
         if page.next_cursor is not None:
-            lines.append("Next cursor: " + json.dumps(page.next_cursor, ensure_ascii=True))
+            lines.insert(1, "Next cursor: " + json.dumps(page.next_cursor, ensure_ascii=True))
         data = {
             "source": "official", "registry_url": page.registry_url, "result": page.payload,
         }
