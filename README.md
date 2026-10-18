@@ -10,7 +10,7 @@ uv pip install kestrel-feature-mcp
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk[httpx2]>=0.39.1`
+- `kestrel-sovereign-sdk[httpx2]>=0.39.2,<1`
 - `docker>=7.1.0`
 - `mcp>=2.3,<3`
 - `requests>=2.34.2`
@@ -55,6 +55,9 @@ waiting for approval. A fresh handle and approval are required after reload.
 | `KESTREL_MCP_REGISTRY_URL` | HTTPS Registry API base, default `https://registry.modelcontextprotocol.io/v0.1` |
 | `KESTREL_MCP_REGISTRY_TIMEOUT` | Request deadline including decoding and schema validation, in seconds; default `30` |
 | `KESTREL_MCP_REGISTRY_MAX_BYTES` | Maximum response body size, default `2097152` bytes |
+| `KESTREL_MCP_REGISTRY_PROBLEM_CHARS` | Maximum characters per diagnostic field, default `256` |
+| `KESTREL_MCP_REGISTRY_PROBLEMS_PER_RECORD` | Maximum diagnostic details per rejected record, default `4` |
+| `KESTREL_MCP_REGISTRY_TEXT_CHARS` | Maximum characters per tool confirmation or error, default `8192` |
 
 ### Discovery sources
 
@@ -123,13 +126,13 @@ relaxed to accept it.
 ## Development
 
 ```bash
-uv pip install kestrel-sovereign-sdk && uv pip install -e ".[test]"
+uv pip install -e ".[test]"
 uv run pytest
 ```
 
 ## Native MCP protocol
 
-Version 0.5 uses the official MCP 2.x `Client` over Streamable HTTP. Its standard
+The feature uses the official MCP 2.x `Client` over Streamable HTTP. Its standard
 version negotiation selects `2026-07-28` with modern servers and a mutually
 supported published revision with other servers. Tool listings expose the
 selected `protocol_version`. Container servers must expose MCP at `/mcp`; the

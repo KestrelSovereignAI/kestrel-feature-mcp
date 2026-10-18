@@ -35,7 +35,7 @@ def rejected_repository_record():
 
 @pytest.fixture
 def registry_http(monkeypatch):
-    state = SimpleNamespace(requests=[], approved=[], responses=[], closed=0)
+    state = SimpleNamespace(requests=[], approved=[], responses=[], closed=0, dns_host="registry.example")
 
     async def respond(request):
         state.requests.append(request)
@@ -54,7 +54,7 @@ def registry_http(monkeypatch):
         return ObservedTransport(respond)
 
     def dns(host, port, *, type, proto):
-        assert host == "registry.example" and port == 443
+        assert host == state.dns_host and port == 443
         assert type == socket.SOCK_STREAM and proto == socket.IPPROTO_TCP
         return [(socket.AF_INET, socket.SOCK_STREAM, proto, "", ("8.8.8.8", port))]
 
@@ -92,6 +92,27 @@ async def test_search_preserves_published_records_source_and_opaque_cursor(regis
     assert state.closed == 1
     # A page never follows its own cursor or a remote endpoint automatically.
     assert len(state.requests) == len(state.approved) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("base,host", [
+    ("https://REGISTRY.Example/v0.1", "registry.example"),
+    ("https://rägistry.example/v0.1", "xn--rgistry-5wa.example"),
+])
+async def test_custom_registry_authority_matches_dns_and_the_native_wire(registry_http, page, base, host):
+    state = registry_http
+    state.dns_host = host
+    state.client = OfficialRegistryClient(RegistrySettings(api_url=base))
+    state.responses.append(httpx2.Response(200, json=page))
+    result = await state.client.search()
+    assert result.payload == page
+    assert len(state.approved) == len(state.requests) == 1
+    approved, request = state.approved[0], state.requests[0]
+    assert approved.host == host
+    assert request.url.raw_host == host.encode("ascii")
+    assert request.url.scheme == approved.scheme == "https"
+    assert (request.url.port or 443) == approved.port
+    assert str(request.url).split("?", 1)[0] == approved.url
 
 
 @pytest.mark.asyncio
@@ -597,13 +618,23 @@ async def test_diagnostic_count_limit_never_readmits_a_rejected_record(registry_
     bad["server"]["remotes"] = [{"type": "invalid", "url": "https://example.test"} for _ in range(50)]
     page["servers"] = [copy.deepcopy(bad) for _ in range(20)]
     page["metadata"]["count"] = 20
-    registry_http.responses.append(httpx2.Response(200, json=page))
+    registry_http.responses.extend([httpx2.Response(200, json=page), httpx2.Response(200, json=page)])
     result = await registry_http.client.search(limit=20)
     assert result.servers == []
     assert [r["index"] for r in result.rejected_records] == list(range(20))
     assert len(result.problems) <= 20 * 5  # Four details plus an explicit omitted-count summary per record.
     for record in result.rejected_records:
         assert any(p["keyword"] == "omitted" and "46" in p["detail"] for p in record["problems"])
+    feature = MCPAgent(SimpleNamespace())
+    feature._official_registry = registry_http.client
+    rendered = await feature.show_catalog(limit=20)
+    assert rendered.status is ToolResultStatus.PARTIAL
+    assert rendered.data["result"] == page
+    assert [record["index"] for record in rendered.data["rejected_records"]] == list(range(20))
+    assert len(rendered.error) <= registry_http.client.settings.max_text_chars
+    assert "Display blocks omitted" in rendered.error
+    assert "Next cursor: " + json.dumps(page["metadata"]["nextCursor"]) in rendered.confirmation
+    assert not any(line.startswith("- server:") for line in rendered.confirmation.splitlines())
 
 
 @pytest.mark.asyncio
@@ -685,19 +716,40 @@ async def test_empty_next_cursor_is_end_of_pagination(registry_http, page):
 
 
 @pytest.mark.asyncio
-async def test_valid_large_metadata_has_bounded_display_without_changing_the_payload(registry_http, page):
+@pytest.mark.parametrize("partial", [False, True], ids=["valid-page", "partial-page"])
+async def test_valid_large_metadata_has_bounded_display_without_changing_the_payload(registry_http, page, partial):
     page["servers"][0]["server"]["remotes"][0]["url"] = "https://example.test/" + "x" * 500000
     page["metadata"]["nextCursor"] = "opaque" * 100000
+    if partial:
+        page["servers"].append({})
+        page["metadata"]["count"] = 2
     registry_http.responses.append(httpx2.Response(200, json=page))
     feature = MCPAgent(SimpleNamespace())
     feature._official_registry = registry_http.client
     result = await feature.show_catalog()
-    assert result.status is ToolResultStatus.OK
+    assert result.status is (ToolResultStatus.PARTIAL if partial else ToolResultStatus.OK)
     assert result.data["result"] == page
     assert len(result.confirmation) <= 8192
     assert "omitted" in result.confirmation.lower() and "data.result" in result.confirmation
     assert "Next cursor:" not in result.confirmation
     assert page["servers"][0]["server"]["description"] not in result.confirmation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text_limit", [400, 8192])
+async def test_valid_detail_obeys_the_configured_display_budget_and_keeps_raw_metadata(registry_http, page, text_limit):
+    registry_http.client.settings = RegistrySettings(api_url="https://registry.example/v0.1", max_text_chars=text_limit)
+    record = page["servers"][0]
+    record["server"]["remotes"][0]["url"] = "https://example.test/" + "x" * (text_limit + 100)
+    registry_http.responses.append(httpx2.Response(200, json=record))
+    feature = MCPAgent(SimpleNamespace())
+    feature._official_registry = registry_http.client
+    result = await feature.server_info(record["server"]["name"])
+    assert result.status is ToolResultStatus.OK
+    assert result.data["result"] == record
+    assert len(result.confirmation) <= text_limit
+    assert "Display blocks omitted" in result.confirmation and "data.result" in result.confirmation
+    assert record["server"]["description"] not in result.confirmation
 
 
 @pytest.mark.asyncio
