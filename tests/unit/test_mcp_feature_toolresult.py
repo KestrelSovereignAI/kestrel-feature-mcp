@@ -51,26 +51,26 @@ def test_all_tools_return_tool_result_annotation():
 class TestRegistryTools:
     @pytest.mark.asyncio
     async def test_catalog_ok(self):
-        result = await _make_feature().show_catalog()
+        result = await _make_feature().show_catalog(source="local")
         assert isinstance(result, ToolResult)
         assert result.status is ToolResultStatus.OK
         assert isinstance(result.data.get("servers"), list) and result.data["servers"]
 
     @pytest.mark.asyncio
     async def test_search_no_match_is_ok_empty(self):
-        result = await _make_feature().search_servers("zzz-no-such-server-zzz")
+        result = await _make_feature().search_servers("zzz-no-such-server-zzz", source="local")
         assert result.status is ToolResultStatus.OK
         assert result.data["matches"] == []
 
     @pytest.mark.asyncio
     async def test_search_match_is_ok(self):
-        result = await _make_feature().search_servers("fetch")
+        result = await _make_feature().search_servers("fetch", source="local")
         assert result.status is ToolResultStatus.OK
         assert "fetch" in result.data["matches"]
 
     @pytest.mark.asyncio
     async def test_server_info_unknown_is_failed(self):
-        result = await _make_feature().server_info("zzz-no-such-server-zzz")
+        result = await _make_feature().server_info("zzz-no-such-server-zzz", source="local")
         assert result.status is ToolResultStatus.ERROR
         assert "not found" in (result.error or "")
 

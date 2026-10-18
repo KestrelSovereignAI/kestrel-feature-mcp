@@ -26,7 +26,10 @@ files:
   - gateway.py
   - images.py
   - manager.py
+  - official_registry.py
   - registry.py
+  - registry_contract_LICENSE.txt
+  - registry_openapi_2025_12_01.json
 
 dependencies:
   - docker

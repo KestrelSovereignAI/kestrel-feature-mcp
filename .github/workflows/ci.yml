@@ -97,6 +97,9 @@ jobs:
               'kestrel_feature_mcp/constants.py',
               'kestrel_feature_mcp/dynamic_tools.py',
               'kestrel_feature_mcp/registry.py',
+              'kestrel_feature_mcp/official_registry.py',
+              'kestrel_feature_mcp/registry_openapi_2025_12_01.json',
+              'kestrel_feature_mcp/registry_contract_LICENSE.txt',
               'kestrel_feature_mcp/catalog.toml',
               'kestrel_feature_mcp/component.yaml',
           ]
