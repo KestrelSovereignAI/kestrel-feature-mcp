@@ -648,3 +648,17 @@ async def test_failed_container_reload_withdraws_handles_and_retires_the_old_own
         if name in manager.owned_containers:
             await manager._drop_connection(name)
         await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tool_handles_use_semantic_image_prefix_without_changing_resource_owner(mcp_http_server):
+    feature, manager, name = _native_container_feature(mcp_http_server, "acme/native:latest")
+    feature._mount_tools = MagicMock(wraps=feature._mount_tools)
+    try:
+        assert (await feature.load_tool("acme/native")).status is ToolResultStatus.OK
+        args = feature._mount_tools.call_args.args
+        assert args[0] == _container_owner(name)
+        assert args[1] == "acme/native:latest"
+        assert {tool["container"] for tool in args[2]} == {name}
+    finally:
+        await feature.shutdown()

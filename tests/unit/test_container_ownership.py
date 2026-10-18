@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+import asyncio
+import threading
 import builtins
 import sys
 
@@ -17,7 +19,7 @@ from kestrel_feature_mcp.manager import (
 )
 
 
-@pytest.mark.parametrize("owner", [None, "", "agent", "did:"])
+@pytest.mark.parametrize("owner", [None, "", "agent", "did:", "did:test:owner ", " did:test:owner", "did:test:owner\n", "did:te st:owner"])
 @pytest.mark.asyncio
 async def test_invalid_owner_is_rejected_before_docker_acquisition(owner, monkeypatch):
     acquire = MagicMock(side_effect=AssertionError("invalid ownership reached Docker"))
@@ -191,3 +193,46 @@ async def test_feature_initialization_does_not_hide_an_invalid_agent():
     feature = MCPAgent(SimpleNamespace(agent_id=None))
     with pytest.raises(ValueError, match="agent DID"):
         await feature.initialize()
+
+
+@pytest.mark.asyncio
+async def test_slow_load_does_not_block_unrelated_unload_or_lose_a_same_resource_gate():
+    client = MagicMock()
+    client.containers.get.side_effect = NotFound("absent")
+    client.images.get.side_effect = NotFound("pull required")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def pull(image):
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release controlled pull")
+
+    client.images.pull.side_effect = pull
+    manager = MCPToolManager(owner_did="did:test:scope", docker_client=client)
+    manager._wait_for_container_ready = AsyncMock()
+    name = container_name_for_image("slow", manager.owner_did)
+    unrelated = MagicMock()
+    manager._retain_container("unrelated", unrelated)
+    loading = asyncio.create_task(manager.start_tool_container("slow"))
+    cancelled = following = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        cancelled = asyncio.create_task(manager.stop_tool(name))
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        following = asyncio.create_task(manager.stop_tool(name))
+        assert await asyncio.wait_for(manager.stop_tool("unrelated"), 1)
+        assert not loading.done() and not following.done()
+        unrelated.stop.assert_called_once()
+        release.set()
+        assert await loading == name
+        assert await following
+        assert manager.owned_containers == {}
+        assert not manager._lifecycle_gates
+    finally:
+        release.set()
+        await asyncio.gather(*(task for task in (loading, cancelled, following) if task is not None), return_exceptions=True)
+        await manager.aclose()

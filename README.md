@@ -14,6 +14,9 @@ uv pip install kestrel-feature-mcp
 - `docker>=7.1.0`
 - `mcp>=2.3,<3`
 - `httpx2>=2.10`
+- `requests>=2.34.2`
+- `anyio>=4.7,<5`
+- `pydantic>=2.12,<3`
 
 ## Usage
 
@@ -105,7 +108,9 @@ selectors and image references reject surrounding whitespace before routing.
 
 Container creation is recorded before Docker starts the process, so a rejected
 command still leaves an identifiable resource that unload can reclaim. Resource
-configuration transitions are serialized per agent; ordinary MCP tool calls
+configuration transitions are serialized per container; a slow load does not
+block another container's unload. Model-facing handles use the image reference,
+while resource ownership keeps the full DID-bound identifier. Ordinary MCP tool calls
 remain concurrent and hold no configuration lock.
 
 Docker catalog discovery uses the current OCI catalog JSON API. Set `KESTREL_MCP_DOCKER_CATALOG` to select a catalog reference (default `mcp/docker-mcp-catalog`). Missing metadata is pulled into Docker's cache; unreadable catalogs return an error. Catalog counts describe available definitions, while gateway status reports this process's requested configuration and observed tools.

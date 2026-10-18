@@ -18,8 +18,10 @@ import asyncio
 import time
 import hashlib
 import json
-from contextlib import ExitStack
+import inspect
+from contextlib import ExitStack, asynccontextmanager
 from functools import wraps
+from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Awaitable, Callable
 
 import docker
@@ -68,7 +70,8 @@ MCP_IMAGE_LABEL = "io.kestrel.mcp.image"
 
 
 def _require_owner_did(owner_did: str) -> str:
-    if not isinstance(owner_did, str) or not owner_did.startswith("did:") or not owner_did[4:]:
+    if (not isinstance(owner_did, str) or not owner_did.startswith("did:")
+            or not owner_did[4:] or any(char.isspace() for char in owner_did)):
         raise ValueError("An agent DID is required for MCP container ownership")
     return owner_did
 
@@ -87,15 +90,23 @@ class DockerDaemonUnavailableError(RuntimeError):
     """The required Docker SDK cannot connect to the local daemon."""
 
 
-def _serialize_container_lifecycle(operation):
-    """One agent's resource mutations cannot replace each other's owners.
+@dataclass
+class _ContainerLifecycleGate:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
 
-    Ordinary tool calls stay concurrent and hold no configuration lock while
-    waiting on a server. These transitions perform only bounded setup/teardown.
-    """
+
+def _serialize_container_lifecycle(operation):
+    """Serialize one resource while unrelated containers and RPCs progress."""
+    signature = inspect.signature(operation)
+
     @wraps(operation)
     async def serialized(self, *args, **kwargs):
-        async with self._lifecycle_lock:
+        arguments = signature.bind(self, *args, **kwargs).arguments
+        name = arguments.get("container_name")
+        if not name and "image_name" in arguments:
+            name = container_name_for_image(arguments["image_name"], self.owner_did)
+        async with self._container_lifecycle(name):
             return await operation(self, *args, **kwargs)
     return serialized
 
@@ -110,7 +121,7 @@ class MCPToolManager:
         self._owner_did = _require_owner_did(owner_did)
         self.owned_containers: Dict[str, Dict[str, Any]] = {}
         self.docker_client = docker_client
-        self._lifecycle_lock = asyncio.Lock()
+        self._lifecycle_gates: dict[str, _ContainerLifecycleGate] = {}
 
     @property
     def owner_did(self) -> str:
@@ -141,6 +152,23 @@ class MCPToolManager:
             raise DockerDaemonUnavailableError(f"Docker not available for MCP tools: {e}") from e
         logger.info("MCPToolManager initialized with Docker connection")
         return cls(owner_did=owner_did, docker_client=client)
+
+    @asynccontextmanager
+    async def _container_lifecycle(self, name: str):
+        gate = self._lifecycle_gates.get(name)
+        if gate is None:
+            gate = _ContainerLifecycleGate()
+            self._lifecycle_gates[name] = gate
+        # No await separates lookup and borrowing. Count waiters as well as
+        # holders, so cancellation cannot replace a lock that is still in use.
+        gate.users += 1
+        try:
+            async with gate.lock:
+                yield
+        finally:
+            gate.users -= 1
+            if gate.users == 0:
+                del self._lifecycle_gates[name]
 
     def _assert_container_owner(self, container, *, image_name: str | None = None) -> None:
         labels = container.labels

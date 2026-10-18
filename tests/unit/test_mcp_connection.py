@@ -225,7 +225,7 @@ async def test_tool_call_does_not_hold_or_wait_for_the_configuration_lock(mcp_ht
     manager = container_manager(mcp_http_server.url)
     try:
         await manager.connect_to_tool("test")
-        async with manager._lifecycle_lock:
+        async with manager._container_lifecycle("test"):
             result = await asyncio.wait_for(manager.call_tool("test", "echo", {"text": "concurrent"}), 1)
         assert result.content[0].text == "concurrent"
     finally:

@@ -362,7 +362,7 @@ class MCPAgent(Feature):
             tool_names = [tool.name for tool in tools]
             owner = _container_owner(container_name)
             mounted = self._mount_tools(
-                owner, container_name, tool_dicts,
+                owner, normalize_image_ref(image_name), tool_dicts,
                 self.manager.tool_caller(container_name),
             )
             # Persist so this container is auto-restored on restart.
