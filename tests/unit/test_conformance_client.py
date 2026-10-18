@@ -1,11 +1,29 @@
 """The official-scenario driver fails clearly and closes real SDK resources."""
 
 import json
+from pathlib import Path, PurePosixPath
 from unittest.mock import MagicMock
+from urllib.parse import urlsplit
 
 import pytest
 
 from tests.conformance import client
+
+
+def test_harness_lock_uses_only_portable_registry_packages():
+    directory = Path(client.__file__).parent
+    manifest = json.loads((directory / "package.json").read_text())
+    lock = json.loads((directory / "package-lock.json").read_text())
+    assert lock["name"] == manifest["name"]
+    assert lock.get("version") == manifest.get("version"), "Lock metadata must describe the manifest, not a local install"
+    assert lock["packages"][""]["dependencies"] == manifest["dependencies"]
+    for name, package in lock["packages"].items():
+        assert not package.get("link"), f"Conformance cannot require a local package link: {name}"
+        if name:
+            assert name.startswith("node_modules/"), f"Package lies outside the harness: {name}"
+            assert ".." not in PurePosixPath(name).parts, f"Package escapes the harness: {name}"
+        if "resolved" in package:
+            assert urlsplit(package["resolved"]).scheme == "https", f"Package requires a non-registry source: {name}"
 
 
 @pytest.fixture
