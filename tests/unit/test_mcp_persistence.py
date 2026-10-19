@@ -37,9 +37,12 @@ def _feature(host=None, *, manager=None, gateway=None) -> MCPAgent:
 class TestPersistHelpers:
     @pytest.mark.asyncio
     async def test_persist_server_writes_delta(self):
-        host = _host()
+        from tests.unit.test_remote_mcp import RegistryHost
+        host = RegistryHost()
+        host.persist_feature_enablement = AsyncMock(wraps=host.persist_feature_enablement)
         feat = _feature(host)
-        await feat._persist_server("fetch", "enabled", metadata={"mode": "gateway"})
+        assert await feat._persist_server("fetch", "enabled", metadata={"mode": "gateway"})
+        assert host.saved["fetch"]["metadata"] == {"mode": "gateway"}
         host.persist_feature_enablement.assert_awaited_once()
         args, kwargs = host.persist_feature_enablement.await_args
         assert args[0] == "mcp_server" and args[1] == "fetch" and args[2] == "enabled"
@@ -66,14 +69,20 @@ class TestGatewayDesiredPersistence:
     async def test_reconcile_forgets_replaced_servers(self):
         # Prior gateway had fetch+old; new gateway_start is just [time] -> persist
         # 'time', forget fetch+old (so a restart restores only the current set).
-        host = _host()
-        host.get_enablement_deltas = AsyncMock(return_value=[
-            {"name": "fetch", "state": "enabled", "metadata": {"mode": "gateway"}},
-            {"name": "old", "state": "enabled", "metadata": {"mode": "gateway"}},
-            {"name": "keepc", "state": "enabled", "metadata": {"mode": "container"}},
-        ])
+        from tests.unit.test_remote_mcp import RegistryHost
+        host = RegistryHost()
+        host.saved = {
+            row["name"]: row for row in [
+                {"name": "fetch", "state": "enabled", "metadata": {"mode": "gateway"}},
+                {"name": "old", "state": "enabled", "metadata": {"mode": "gateway"}},
+                {"name": "keepc", "state": "enabled", "metadata": {"mode": "container"}},
+            ]
+        }
+        host.persist_feature_enablement = AsyncMock(wraps=host.persist_feature_enablement)
+        host.clear_feature_enablement = AsyncMock(wraps=host.clear_feature_enablement)
         feat = _feature(host)
-        await feat._reconcile_gateway_persistence(["time"])
+        assert await feat._reconcile_gateway_persistence(["time"])
+        assert set(host.saved) == {"time", "keepc"}
         forgot = {c.args[1] for c in host.clear_feature_enablement.await_args_list}
         assert forgot == {"fetch", "old"}  # container 'keepc' untouched
         persisted = {c.args[1] for c in host.persist_feature_enablement.await_args_list}
@@ -149,8 +158,10 @@ class TestRestoreOnStartup:
             "metadata": {"mode": "container", "image": "org/img:1"},
         }]
         feature = _feature(host)
+        feature._ensure_container_manager = AsyncMock(return_value=False)
         feature._load_via_container = AsyncMock()
         await feature.post_all_features_loaded(host)
+        feature._ensure_container_manager.assert_awaited_once()
         feature._load_via_container.assert_not_awaited()
         assert "agent-bound container manager is unavailable" in caplog.text
 
@@ -246,3 +257,36 @@ async def test_explicit_stop_retires_a_disconnected_gateway_owner():
     await feature.gateway_stop()
     gateway.stop.assert_awaited_once()
     assert feature.gateway_manager is None
+
+
+async def test_gateway_reconcile_read_failure_preserves_rows_and_refuses_writes():
+    from kestrel_sdk.storage.database import DatabaseError
+    from tests.unit.test_remote_mcp import RegistryHost
+
+    host = RegistryHost()
+    host.saved["fetch"] = {"name": "fetch", "state": "enabled", "metadata": {"mode": "gateway"}}
+    original = dict(host.saved)
+    failure = DatabaseError("cannot read saved gateway configuration")
+    host.get_enablement_deltas = AsyncMock(side_effect=failure)
+    host.persist_feature_enablement = AsyncMock(wraps=host.persist_feature_enablement)
+    host.clear_feature_enablement = AsyncMock(wraps=host.clear_feature_enablement)
+    feature = _feature(host)
+    with pytest.raises(DatabaseError) as raised:
+        await feature._reconcile_gateway_persistence(["time"])
+    assert raised.value is failure
+    host.persist_feature_enablement.assert_not_awaited()
+    host.clear_feature_enablement.assert_not_awaited()
+    assert host.saved == original
+
+
+async def test_gateway_reconcile_requires_the_complete_saved_server_set():
+    from kestrel_feature_mcp.remote import RemoteMCPError
+    from tests.unit.test_remote_mcp import RegistryHost
+
+    host = RegistryHost()
+    host.saved["old"] = {"name": "old", "state": "enabled", "metadata": {"mode": "gateway"}}
+    host.clear_feature_enablement = AsyncMock()
+    feature = _feature(host)
+    with pytest.raises(RemoteMCPError, match="requested gateway server set"):
+        await feature._reconcile_gateway_persistence(["time"])
+    assert set(host.saved) == {"old", "time"}

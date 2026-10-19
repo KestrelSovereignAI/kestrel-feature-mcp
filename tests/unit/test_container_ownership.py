@@ -127,12 +127,16 @@ async def test_stale_resource_record_is_retired_before_a_new_image_pull_fails(pr
 
 
 @pytest.mark.asyncio
-async def test_feature_initialization_binds_the_hosts_agent_identity(monkeypatch):
+async def test_first_container_use_binds_the_initialized_hosts_identity(monkeypatch):
     manager = MagicMock()
     create = AsyncMock(return_value=manager)
     monkeypatch.setattr(MCPToolManager, "create", create)
     feature = MCPAgent(SimpleNamespace(agent_id="did:test:host-agent"))
     await feature.initialize()
+    create.assert_not_awaited()
+    assert feature.manager is None
+    feature.agent.agent_id = "did:test:changed-after-initialization"
+    assert await feature._ensure_container_manager()
     create.assert_awaited_once_with(owner_did="did:test:host-agent")
     assert feature.manager is manager
 
@@ -150,6 +154,8 @@ async def test_daemon_unavailability_disables_only_local_docker_tools(monkeypatc
     monkeypatch.setattr(manager_module.docker, "from_env", acquire)
     feature = MCPAgent(SimpleNamespace(agent_id="did:test:host-agent"))
     await feature.initialize()
+    acquire.assert_not_called()
+    assert not await feature._ensure_container_manager()
     assert feature.manager is None and feature.gateway_manager is None
     assert "daemon unavailable" in caplog.text
     if failure_stage == "ping":
@@ -157,7 +163,7 @@ async def test_daemon_unavailability_disables_only_local_docker_tools(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_missing_required_python_dependency_fails_startup_clearly(monkeypatch):
+async def test_missing_docker_dependency_fails_at_first_container_use(monkeypatch):
     original_import = builtins.__import__
     failure = ModuleNotFoundError("required docker SDK is not installed")
 
@@ -167,11 +173,12 @@ async def test_missing_required_python_dependency_fails_startup_clearly(monkeypa
         return original_import(name, *args, **kwargs)
 
     feature = MCPAgent(SimpleNamespace(agent_id="did:test:host-agent"))
+    await feature.initialize()
     with monkeypatch.context() as isolated:
         isolated.delitem(sys.modules, "kestrel_feature_mcp.manager")
         isolated.setattr(builtins, "__import__", import_without_docker)
         with pytest.raises(ModuleNotFoundError, match="required docker SDK") as caught:
-            await feature.initialize()
+            await feature._ensure_container_manager()
         assert caught.value is failure
 
 
@@ -182,8 +189,9 @@ async def test_unexpected_runtime_failure_is_not_classified_as_daemon_unavailabi
     client.ping.side_effect = failure
     monkeypatch.setattr(manager_module.docker, "from_env", MagicMock(return_value=client))
     feature = MCPAgent(SimpleNamespace(agent_id="did:test:host-agent"))
+    await feature.initialize()
     with pytest.raises(RuntimeError, match="programming error in ping") as caught:
-        await feature.initialize()
+        await feature._ensure_container_manager()
     assert caught.value is failure
     client.close.assert_called_once()
 

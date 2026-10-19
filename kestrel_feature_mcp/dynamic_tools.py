@@ -20,6 +20,7 @@ import logging
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from kestrel_sdk.tools.result import ToolResult
+from .connection import MCPCallOutcomeUnknownError, MCP_CONNECTION_ERRORS
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,15 @@ class MCPToolWrapper:
         """
         try:
             result = await self._caller(self._real_name, kwargs)
-        except Exception as e:  # noqa: BLE001 - surface any transport failure
+        except MCPCallOutcomeUnknownError as error:
+            return ToolResult.failed(
+                str(error), data={"mcp_tool": self._real_name, "execution_outcome": "unknown"},
+            ).to_dict()
+        except (ExceptionGroup, ValueError, *MCP_CONNECTION_ERRORS) as e:
+            if isinstance(e, ExceptionGroup):
+                _, unexpected = e.split((*MCP_CONNECTION_ERRORS, ValueError))
+                if unexpected is not None:
+                    raise
             logger.error(
                 "MCP tool '%s' execution failed: %s", self._real_name, e, exc_info=True
             )

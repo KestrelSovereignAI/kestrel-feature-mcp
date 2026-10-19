@@ -1,5 +1,7 @@
 # kestrel-feature-mcp — Agent Instructions
 
+See /Volumes/data2/projects/AGENTS.md for global standards.
+
 See [README.md](README.md) for package overview.
 
 ## Package Structure
@@ -13,6 +15,8 @@ kestrel-feature-mcp/
 │   ├── feature.py     # MCPAgent feature entry point
 │   ├── gateway.py     # Docker MCP Gateway management
 │   ├── manager.py     # Container lifecycle management
+│   ├── connection.py  # Official MCP client and transport lifecycle
+│   ├── remote.py      # Public HTTPS connection records
 │   └── registry.py    # MCP server catalog/registry
 ```
 
@@ -35,5 +39,6 @@ uv run pytest
 ## Agent-Specific Instructions
 
 - Requires Docker to be running for gateway and container modes
-- MCP servers run as Docker containers — manage lifecycle carefully
-- The registry provides a searchable catalog of 311+ available servers
+- Public HTTPS mode requires no Docker daemon; validate and pin outbound URLs through the SDK.
+- Manage the owned connections and Docker resources carefully.
+- Discovery supports the official MCP Registry alongside Docker and local catalogs.

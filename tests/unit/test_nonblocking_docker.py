@@ -160,6 +160,8 @@ async def test_real_docker_ping_transport_failure_is_a_typed_daemon_error(failin
 async def test_feature_survives_real_daemon_ping_transport_failure(failing_docker_http, caplog):
     feature = MCPAgent(SimpleNamespace(agent_id="did:test:loopback-daemon"))
     await feature.initialize()
+    assert failing_docker_http == []
+    assert not await feature._ensure_container_manager()
     assert feature.manager is None and feature.gateway_manager is None
     assert "Local Docker daemon unavailable" in caplog.text
     assert failing_docker_http == ["/version", "/v1.45/_ping"]

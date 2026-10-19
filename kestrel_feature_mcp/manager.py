@@ -16,19 +16,20 @@ all MCP servers regardless of their native transport.
 import logging
 import asyncio
 import time
-import hashlib
-import json
 import inspect
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import ExitStack
 from functools import wraps
-from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Awaitable, Callable
 
 import docker
 from docker.errors import NotFound
 from requests.exceptions import RequestException
 
-from .connection import MCPConnection, MCP_CONNECTION_ERRORS
+from .connection import (
+    MCPConnection, MCP_CONNECTION_ERRORS, ConnectionLifecycleGate,
+    bind_tool_caller, connection_digest, connection_lifecycle, describe_tools,
+    require_owner_did as _require_owner_did,
+)
 from .images import normalize_image_ref
 
 from .constants import (
@@ -69,17 +70,9 @@ MCP_OWNER_LABEL = "io.kestrel.mcp.agent-did"
 MCP_IMAGE_LABEL = "io.kestrel.mcp.image"
 
 
-def _require_owner_did(owner_did: str) -> str:
-    if (not isinstance(owner_did, str) or not owner_did.startswith("did:")
-            or not owner_did[4:] or any(char.isspace() for char in owner_did)):
-        raise ValueError("An agent DID is required for MCP container ownership")
-    return owner_did
-
-
 def container_name_for_image(image_name: str, owner_did: str) -> str:
     """Stable resource identity shared by load, restore and manager startup."""
-    identity = json.dumps([_require_owner_did(owner_did), normalize_image_ref(image_name)], separators=(",", ":"))
-    return f"mcp-{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+    return f"mcp-{connection_digest(normalize_image_ref(image_name), owner_did)}"
 
 
 class ContainerOwnershipError(RuntimeError):
@@ -88,12 +81,6 @@ class ContainerOwnershipError(RuntimeError):
 
 class DockerDaemonUnavailableError(RuntimeError):
     """The required Docker SDK cannot connect to the local daemon."""
-
-
-@dataclass
-class _ContainerLifecycleGate:
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    users: int = 0
 
 
 def _serialize_container_lifecycle(operation):
@@ -121,7 +108,7 @@ class MCPToolManager:
         self._owner_did = _require_owner_did(owner_did)
         self.owned_containers: Dict[str, Dict[str, Any]] = {}
         self.docker_client = docker_client
-        self._lifecycle_gates: dict[str, _ContainerLifecycleGate] = {}
+        self._lifecycle_gates: dict[str, ConnectionLifecycleGate] = {}
 
     @property
     def owner_did(self) -> str:
@@ -153,22 +140,8 @@ class MCPToolManager:
         logger.info("MCPToolManager initialized with Docker connection")
         return cls(owner_did=owner_did, docker_client=client)
 
-    @asynccontextmanager
-    async def _container_lifecycle(self, name: str):
-        gate = self._lifecycle_gates.get(name)
-        if gate is None:
-            gate = _ContainerLifecycleGate()
-            self._lifecycle_gates[name] = gate
-        # No await separates lookup and borrowing. Count waiters as well as
-        # holders, so cancellation cannot replace a lock that is still in use.
-        gate.users += 1
-        try:
-            async with gate.lock:
-                yield
-        finally:
-            gate.users -= 1
-            if gate.users == 0:
-                del self._lifecycle_gates[name]
+    def _container_lifecycle(self, name: str):
+        return connection_lifecycle(self._lifecycle_gates, name)
 
     def _assert_container_owner(self, container, *, image_name: str | None = None) -> None:
         labels = container.labels
@@ -481,13 +454,12 @@ class MCPToolManager:
             raise ValueError(f"Tool {container_name} not connected")
         connection = info["connection"]
 
-        async def call(tool_name: str, arguments: dict = None):
-            if (self.owned_containers.get(container_name) is not info
-                    or info["connection"] is not connection or info["tools"] is None):
-                raise ValueError(f"MCP connection {container_name} changed; rediscover its tools before calling")
-            return await connection.call_tool(tool_name, arguments or {})
-
-        return call
+        return bind_tool_caller(
+            connection,
+            lambda: (self.owned_containers.get(container_name) is info
+                     and info["connection"] is connection and info["tools"] is not None),
+            container_name,
+        )
 
     async def call_tool(self, container_name: str, tool_name: str, arguments: dict = None):
         """Call a currently published container connection."""
@@ -499,14 +471,7 @@ class MCPToolManager:
         for c_name, info in self.owned_containers.items():
             if info["tools"] is None:
                 continue
-            for tool in info["tools"]:
-                all_tools.append({
-                    "container": c_name,
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": tool.input_schema,
-                    "protocol_version": info["connection"].protocol_version,
-                })
+            all_tools.extend(describe_tools(info["connection"], info["tools"], container=c_name))
         return all_tools
 
     def close(self):
@@ -607,14 +572,8 @@ class MCPGatewayManager:
             raise RuntimeError("Not connected to gateway")
         connection = self.connection
 
-        async def call(tool_name: str, arguments: Dict[str, Any] = None):
-            if self.connection is not connection:
-                raise ValueError("MCP gateway connection changed; rediscover its tools before calling")
-            if tool_name not in self.tools:
-                raise ValueError(f"Unknown tool: {tool_name}. Available: {list(self.tools.keys())}")
-            return await connection.call_tool(tool_name, arguments or {})
-
-        return call
+        return bind_tool_caller(connection, lambda: self.connection is connection,
+                                "gateway", tool_names=self.tools)
 
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any] = None):
         """Call the currently published gateway connection."""
@@ -622,15 +581,7 @@ class MCPGatewayManager:
 
     def get_all_tools(self) -> List[Dict[str, Any]]:
         """Get all available tools."""
-        return [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": tool.input_schema,
-                "protocol_version": self.connection.protocol_version if self.connection else None,
-            }
-            for tool in self.tools.values()
-        ]
+        return describe_tools(self.connection, self.tools.values())
 
     @property
     def is_connected(self) -> bool:

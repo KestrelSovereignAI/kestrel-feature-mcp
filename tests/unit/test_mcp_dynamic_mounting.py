@@ -80,9 +80,12 @@ async def test_empty_container_catalog_reports_no_tools_without_misdiagnosing_th
     ("private.registry:5000/native:v2", "private.registry:5000/native:v2", "private.registry:5000/native:v2"),
 ])
 async def test_container_unload_accepts_the_image_reference_used_to_load_it(mcp_http_server, selector, image, unload_alias):
+    from tests.unit.test_remote_mcp import RegistryHost
+
     feature, manager, name = _native_container_feature(mcp_http_server, image)
-    feature.agent.persist_feature_enablement = AsyncMock()
-    feature.agent.clear_feature_enablement = AsyncMock()
+    feature.agent = RegistryHost(manager.owner_did)
+    feature.agent.persist_feature_enablement = AsyncMock(wraps=feature.agent.persist_feature_enablement)
+    feature.agent.clear_feature_enablement = AsyncMock(wraps=feature.agent.clear_feature_enablement)
     try:
         loaded = await feature.load_tool(selector)
         assert loaded.status is ToolResultStatus.OK
@@ -98,6 +101,7 @@ async def test_container_unload_accepts_the_image_reference_used_to_load_it(mcp_
         assert result.data["container"] == name
         assert manager.owned_containers == {}
         assert feature.agent.registered == {}
+        assert not feature.agent.saved
         feature.agent.clear_feature_enablement.assert_awaited_once_with("mcp_server", name)
     finally:
         await feature.shutdown()
@@ -283,11 +287,31 @@ class TestWrapper:
 
     @pytest.mark.asyncio
     async def test_execute_exception_is_failed(self):
-        caller = AsyncMock(side_effect=RuntimeError("transport down"))
+        caller = AsyncMock(side_effect=ConnectionError("transport down"))
         w = MCPToolWrapper(handle_name="h", real_name="fetch",
                            description="", input_schema=None, caller=caller)
         res = await w.execute()
         assert isinstance(res, dict) and res["status"] == "error" and "transport down" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_programming_errors_are_not_transport_failures(self):
+        async def broken_caller(name, arguments):
+            raise RuntimeError("broken caller invariant")
+        wrapper = MCPToolWrapper(handle_name="h", real_name="echo",
+                                 description="", input_schema=None, caller=broken_caller)
+        with pytest.raises(RuntimeError, match="broken caller invariant"):
+            await wrapper.execute()
+
+    @pytest.mark.asyncio
+    async def test_disconnected_native_connection_is_a_known_failure(self):
+        from kestrel_feature_mcp.connection import MCPConnection
+        connection = MCPConnection("http://127.0.0.1:1/mcp")
+        wrapper = MCPToolWrapper(handle_name="h", real_name="echo",
+                                 description="", input_schema=None, caller=connection.call_tool)
+        result = await wrapper.execute()
+        assert result["status"] == "error"
+        assert "not connected" in result["error"]
+        assert result.get("data", {}).get("execution_outcome") != "unknown"
 
     def test_schema_uses_input_schema_as_parameters(self):
         schema = {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}
@@ -516,7 +540,12 @@ class TestMounting:
 async def test_shutdown_attempts_every_resource_and_propagates_cleanup_errors():
     manager = MagicMock()
     manager.owned_containers = {"a": {}, "b": {}}
-    manager.stop_tool = AsyncMock(side_effect=[TimeoutError("a close failed"), True])
+    async def stop(name):
+        if name == "a":
+            raise TimeoutError("a close failed")
+        del manager.owned_containers[name]
+        return True
+    manager.stop_tool = AsyncMock(side_effect=stop)
     manager.aclose = AsyncMock()
     gateway = MagicMock()
     gateway.is_connected = False
@@ -525,7 +554,9 @@ async def test_shutdown_attempts_every_resource_and_propagates_cleanup_errors():
     with pytest.raises(TimeoutError, match="a close failed"):
         await feature.shutdown()
     assert [call.args[0] for call in manager.stop_tool.await_args_list] == ["a", "b"]
-    manager.aclose.assert_awaited_once()
+    # The failed resource still owns the client required to retry its removal.
+    manager.aclose.assert_not_awaited()
+    assert set(manager.owned_containers) == {"a"}
     gateway.stop.assert_awaited_once()
 
 
