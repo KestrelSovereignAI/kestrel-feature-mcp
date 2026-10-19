@@ -54,11 +54,15 @@ command arguments are invalid for a remote endpoint.
 Load results include the canonical endpoint, DID-bound connection identifier,
 negotiated `protocol_version`, mounted count and `persistent` status. Unload
 accepts that identifier or the canonical endpoint returned by load. Enabled
-connections are restored from the host's agent-scoped enablement store. Hosts
-without that capability explicitly report that connections last for the session.
+connections are restored from the host's agent-scoped enablement store.
+Restore reads existing remote rows without rewriting them and rechecks saved
+state before tools become callable. Hosts without that capability explicitly
+report that connections last for the session.
 Saved state is read back before persistence or removal is reported. A host
 that silently ignores an enablement write fails explicitly. Storage errors
 fail the operation; a failed remote load withdraws handles and closes its transport. Reload, unload and shutdown invalidate old bound callers.
+If setup fails after confirmed persistence, its error reports that enablement
+remains saved and will restore after restart; unload it to disable that state.
 New catalogs become callable only after persistence is confirmed. Unload
 invalidates the catalog before waiting on storage removal.
 Configuration changes for one remote connection are serialized without locking

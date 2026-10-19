@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 # Gateway-mounted tools share one owner (the gateway aggregates many servers and
 # does not attribute tools per-server); each container is its own owner.
 _GATEWAY_OWNER = "mcp:gateway"
+_REMOTE_LOAD_ERRORS = MCP_CONNECTION_ERRORS + (SSRFError, ValueError, RemoteMCPError)
 
 
 def _container_owner(container_name: str) -> str:
@@ -421,17 +422,22 @@ class MCPAgent(Feature):
             record = RemoteMCPServer(name, endpoint, MCPConnection(endpoint))
             self._remote_connections[name] = record
             published = False
+            persistent = False
             try:
                 discovered = await record.connection.connect()
                 if self._closing:
                     raise RemoteMCPError("MCP feature is shutting down")
                 metadata = {"mode": "remote", "url": endpoint.url, "auth": "none"}
-                persistent = await self._persist_server(name, "enabled", metadata=metadata)
-                if persistent:
+                # Restore reads existing desired state; it must not require a
+                # redundant write or change the saved row's audit metadata.
+                persisted = (expected_name is not None or
+                             await self._persist_server(name, "enabled", metadata=metadata))
+                if persisted:
                     saved = await self._read_server_delta(name)
                     if (saved is None or saved["state"] != "enabled"
                             or saved.get("metadata") != metadata):
                         raise RemoteMCPError("Host did not retain MCP enablement; initialize its durable store")
+                persistent = persisted
                 if self._closing:
                     raise RemoteMCPError("MCP feature is shutting down")
                 record.tools = discovered
@@ -454,6 +460,13 @@ class MCPAgent(Feature):
                 if not tools:
                     return ToolResult.partial(summary, "The server advertised an empty tool catalog.", data=data)
                 return _loaded_tool_result(summary, data=data)
+            except* _REMOTE_LOAD_ERRORS as errors:
+                if persistent:
+                    raise RemoteMCPError(
+                        f"{connection_error_message(errors)}; enablement remains saved and will "
+                        "restore after restart. Unload the saved connection to disable it."
+                    ) from errors
+                raise
             finally:
                 if not published:
                     try:
@@ -465,7 +478,7 @@ class MCPAgent(Feature):
         failure = None
         try:
             result = await self._load_remote_connection(url, expected_name)
-        except* (MCP_CONNECTION_ERRORS + (SSRFError, ValueError, RemoteMCPError)) as errors:
+        except* _REMOTE_LOAD_ERRORS as errors:
             failure = connection_error_message(errors)
         if failure is not None:
             return ToolResult.failed(f"Failed to connect remote MCP server: {failure}")

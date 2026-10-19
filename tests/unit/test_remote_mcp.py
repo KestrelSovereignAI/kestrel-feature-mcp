@@ -3,7 +3,9 @@
 import asyncio
 import json
 import socket
+import sqlite3
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpcore2
 import httpx2
@@ -534,6 +536,19 @@ async def test_catalog_is_not_callable_before_persistence_ack(remote_peer, shutd
             await closing
             assert loaded.status.value == "error" and "shutting down" in loaded.error
             assert not host.registered and not feature._remote_connections
+            assert host.saved
+            restored = MCPAgent(host)
+            try:
+                await restored.initialize()
+                await restored.post_all_features_loaded()
+                wrapper = next(t for ts in host.registered.values() for t in ts if t._real_name == "echo")
+                called = await wrapper.execute(text="restored-after-aborted-load")
+                assert remote_peer.peer.witness == ["restored-after-aborted-load"]
+                assert called["status"] == "ok"
+            finally:
+                await restored.shutdown()
+            assert "enablement remains saved" in loaded.error
+            assert "restore after restart" in loaded.error
         else:
             assert loaded.status.value == "ok"
             wrapper = next(t for ts in host.registered.values() for t in ts if t._real_name == "echo")
@@ -545,6 +560,104 @@ async def test_catalog_is_not_callable_before_persistence_ack(remote_peer, shutd
         await loading
         if closing is not None:
             await closing
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+@pytest.mark.parametrize("readonly", [False, True])
+async def test_restore_reads_existing_enablement_without_rewriting_it(remote_peer, tmp_path, readonly):
+    from kestrel_feature_mcp.manager import container_name_for_image
+    from kestrel_feature_mcp.remote import remote_name_for_url
+    host = RegistryHost()
+    remote_name = remote_name_for_url(remote_peer.url, host.agent_id)
+    rows = [
+        (remote_name, "enabled", {"mode": "remote", "url": remote_peer.url, "auth": "none"}),
+        (container_name_for_image("org/img:1", host.agent_id), "enabled",
+         {"mode": "container", "image": "org/img:1", "args": None}),
+    ]
+    path = tmp_path / "enablement.sqlite"
+    with sqlite3.connect(path) as setup:
+        setup.execute("CREATE TABLE enablement (name TEXT PRIMARY KEY, state TEXT, metadata TEXT)")
+        setup.executemany("INSERT INTO enablement VALUES (?, ?, ?)",
+                          [(name, state, json.dumps(metadata)) for name, state, metadata in rows])
+    store = sqlite3.connect(f"{path.as_uri()}?mode={'ro' if readonly else 'rw'}", uri=True)
+    writes = []
+    async def read(kind):
+        return [{"name": name, "state": state, "metadata": json.loads(metadata)}
+                for name, state, metadata in store.execute("SELECT name, state, metadata FROM enablement ORDER BY rowid")]
+    async def persist(kind, name, state, *, actor, metadata):
+        writes.append(name)
+        store.execute("INSERT OR REPLACE INTO enablement VALUES (?, ?, ?)",
+                      (name, state, json.dumps(metadata)))
+        store.commit()
+    host.get_enablement_deltas = read
+    host.persist_feature_enablement = persist
+    feature = MCPAgent(host)
+    feature.manager = SimpleNamespace(owner_did=host.agent_id, owned_containers={}, aclose=AsyncMock())
+    feature._load_via_container = AsyncMock()
+    try:
+        await feature.initialize()
+        await feature.post_all_features_loaded()
+        wrapper = next(t for ts in host.registered.values() for t in ts if t._real_name == "echo")
+        result = await wrapper.execute(text="restored-from-existing-row")
+        assert remote_peer.peer.witness == ["restored-from-existing-row"]
+        assert result["status"] == "ok"
+        feature._load_via_container.assert_awaited_once_with("org/img:1", None)
+        assert writes == []
+        assert [(r["name"], r["state"], r["metadata"]) for r in await read("mcp_server")] == rows
+    finally:
+        await feature.shutdown()
+        store.close()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_post_ack_mount_rejection_discloses_saved_enablement(remote_peer):
+    host = RegistryHost()
+    register = host.register_dynamic_tools
+    def reject(owner, tools):
+        raise ValueError("Host rejected the advertised catalog")
+    host.register_dynamic_tools = reject
+    feature = MCPAgent(host)
+    try:
+        loaded = await feature.load_tool(remote_peer.url)
+        assert remote_peer.peer.witness == []
+        assert loaded.status is ToolResultStatus.ERROR
+        assert host.saved and not host.registered and not feature._remote_connections
+        host.register_dynamic_tools = register
+        await feature.post_all_features_loaded()
+        wrapper = next(t for ts in host.registered.values() for t in ts if t._real_name == "echo")
+        result = await wrapper.execute(text="restored-after-rejected-mount")
+        assert remote_peer.peer.witness == ["restored-after-rejected-mount"]
+        assert result["status"] == "ok"
+        assert "enablement remains saved" in loaded.error
+        assert "restore after restart" in loaded.error
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_restore_rechecks_enablement_removed_during_discovery(remote_peer, monkeypatch, caplog):
+    from kestrel_feature_mcp.connection import MCPConnection
+    from kestrel_feature_mcp.remote import remote_name_for_url
+    host = RegistryHost()
+    name = remote_name_for_url(remote_peer.url, host.agent_id)
+    host.saved[name] = {"name": name, "state": "enabled", "metadata": {
+        "mode": "remote", "url": remote_peer.url, "auth": "none"}}
+    connect = MCPConnection.connect
+    async def remove_during_discovery(connection):
+        tools = await connect(connection)
+        await host.clear_feature_enablement("mcp_server", name)
+        return tools
+    monkeypatch.setattr(MCPConnection, "connect", remove_during_discovery)
+    feature = MCPAgent(host)
+    try:
+        await feature.initialize()
+        await feature.post_all_features_loaded()
+        assert remote_peer.peer.witness == []
+        assert not host.saved and not host.registered and not feature._remote_connections
+        assert "did not retain MCP enablement" in caplog.text
+        assert "enablement remains saved" not in caplog.text
+    finally:
         await feature.shutdown()
 
 
@@ -566,6 +679,7 @@ async def test_mismatched_enablement_readback_never_publishes_a_catalog(remote_p
         assert remote_peer.peer.witness == []
         assert result.status is ToolResultStatus.ERROR
         assert "did not retain" in result.error
+        assert "enablement remains saved" not in result.error
         assert not host.registered and not feature._remote_connections
     finally:
         await feature.shutdown()
