@@ -88,6 +88,15 @@ def _is_remote_selector(selector: str) -> bool:
     return "://" in selector or selector.lower().startswith(("http:", "https:"))
 
 
+def _load_failure_message(message: str, persistent: bool, *, gateway_replaced: bool = False) -> str:
+    """Report confirmed durable intent separately from connection publication."""
+    if persistent:
+        message += "; enablement remains saved and will restore after restart. Unload the saved connection to disable it."
+        if gateway_replaced:
+            message += " The saved gateway server set was replaced."
+    return message
+
+
 def _loaded_tool_result(confirmation: str, *, data: dict) -> ToolResult:
     """Discovery succeeds independently of the host retaining callable handles."""
     if data["mounted"] < len(data["tools"]):
@@ -283,6 +292,7 @@ class MCPAgent(Feature):
         await self.agent.persist_feature_enablement(
             "mcp_server", name, state, actor="agent", metadata=metadata,
         )
+        await self._require_saved_configuration(name, state, metadata)
         return True
 
     async def _forget_server(self, name: str) -> None:
@@ -310,7 +320,7 @@ class MCPAgent(Feature):
             if (d.get("metadata") or {}).get("mode") == "gateway":
                 await self._forget_server(d["name"])
 
-    async def _reconcile_gateway_persistence(self, server_list) -> None:
+    async def _reconcile_gateway_persistence(self, server_list) -> bool:
         """Make persisted gateway servers reflect EXACTLY ``server_list``.
 
         ``gateway_start`` replaces the running gateway, so it is authoritative
@@ -320,13 +330,9 @@ class MCPAgent(Feature):
         stays additive.
         """
         if not self._supports_enablement_persistence():
-            return
+            return False
         desired = set(server_list)
-        try:
-            prior = await self.agent.get_enablement_deltas("mcp_server")
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Could not read prior MCP servers for reconcile: %s", e)
-            prior = []
+        prior = await self.agent.get_enablement_deltas("mcp_server")
         prior_gateway = {
             d["name"] for d in prior
             if (d.get("metadata") or {}).get("mode") == "gateway"
@@ -335,6 +341,14 @@ class MCPAgent(Feature):
             await self._forget_server(stale)
         for srv in server_list:
             await self._persist_server(srv, "enabled", metadata={"mode": "gateway"})
+        saved = await self.agent.get_enablement_deltas("mcp_server")
+        saved_gateway = {
+            row["name"] for row in saved
+            if (row.get("metadata") or {}).get("mode") == "gateway"
+        }
+        if saved_gateway != desired:
+            raise RemoteMCPError("Host did not retain the requested gateway server set")
+        return True
 
     def _mount_gateway_tools(self) -> int:
         """(Re)mount the connected gateway's full tool set under the gateway owner.
@@ -447,6 +461,12 @@ class MCPAgent(Feature):
             raise RemoteMCPError("Host enablement API cannot confirm its saved connection")
         return next((row for row in await reader("mcp_server") if row["name"] == name), None)
 
+    async def _require_saved_configuration(self, name: str, state: str, metadata) -> None:
+        """A completed host call is not an acknowledgement until its row matches."""
+        saved = await self._read_server_delta(name)
+        if saved is None or saved["state"] != state or saved.get("metadata") != metadata:
+            raise RemoteMCPError("Host did not retain MCP enablement; initialize its durable store")
+
     async def _load_remote_connection(self, url: str, expected_name: str | None) -> ToolResult:
         invalid = _selector_failure(url)
         if invalid is not None:
@@ -478,14 +498,11 @@ class MCPAgent(Feature):
                 metadata = {"mode": "remote", "url": endpoint.url, "auth": "none"}
                 # Restore reads existing desired state; it must not require a
                 # redundant write or change the saved row's audit metadata.
-                persisted = (expected_name is not None or
-                             await self._persist_server(name, "enabled", metadata=metadata))
-                if persisted:
-                    saved = await self._read_server_delta(name)
-                    if (saved is None or saved["state"] != "enabled"
-                            or saved.get("metadata") != metadata):
-                        raise RemoteMCPError("Host did not retain MCP enablement; initialize its durable store")
-                persistent = persisted
+                if expected_name is not None:
+                    await self._require_saved_configuration(name, "enabled", metadata)
+                    persistent = True
+                else:
+                    persistent = await self._persist_server(name, "enabled", metadata=metadata)
                 self._require_open()
                 record.tools = discovered
                 caller = bind_tool_caller(
@@ -510,8 +527,7 @@ class MCPAgent(Feature):
             except* _REMOTE_LOAD_ERRORS as errors:
                 if persistent:
                     raise RemoteMCPError(
-                        f"{connection_error_message(errors)}; enablement remains saved and will "
-                        "restore after restart. Unload the saved connection to disable it."
+                        _load_failure_message(connection_error_message(errors), persistent)
                     ) from errors
                 raise
             finally:
@@ -567,6 +583,7 @@ class MCPAgent(Feature):
         self._unmount_tools(_container_owner(requested_name))
         failure_context = {"container": requested_name, "image": image_name}
         published = False
+        persistent = False
         try:
             container_name = await self.manager.start_tool_container(
                 image_name, container_name=requested_name, command=args,
@@ -584,7 +601,7 @@ class MCPAgent(Feature):
             tool_names = [tool.name for tool in tools]
             owner = _container_owner(container_name)
             # Persist so this container is auto-restored on restart.
-            await self._persist_server(
+            persistent = await self._persist_server(
                 container_name, "enabled",
                 metadata={"mode": "container", "image": image_name, "args": args},
             )
@@ -616,10 +633,10 @@ class MCPAgent(Feature):
             )
         except (TimeoutError, RuntimeError, ValueError) as e:
             logger.error(f"Failed to load tool {image_name}: {e}")
-            return ToolResult.failed(f"Failed to load MCP tool: {str(e)}", data=failure_context)
+            return ToolResult.failed(_load_failure_message(f"Failed to load MCP tool: {str(e)}", persistent), data=failure_context)
         except Exception as e:
             logger.error(f"Unexpected error loading tool {image_name}: {e}", exc_info=True)
-            return ToolResult.failed(f"Failed to load MCP tool: {str(e)}", data=failure_context)
+            return ToolResult.failed(_load_failure_message(f"Failed to load MCP tool: {str(e)}", persistent), data=failure_context)
 
         finally:
             if not published:
@@ -656,6 +673,7 @@ class MCPAgent(Feature):
             return rejection
 
         published = False
+        persistent = False
         changed = False
         try:
             from .manager import MCPGatewayManager
@@ -678,7 +696,7 @@ class MCPAgent(Feature):
             self._require_open()
             tool_names = [t.name for t in tools]
             new_tools = sorted(set(tool_names) - before)
-            await self._persist_server(
+            persistent = await self._persist_server(
                 server_name, "enabled", metadata={"mode": "gateway"},
             )
             self._require_open()
@@ -712,13 +730,13 @@ class MCPAgent(Feature):
             )
         except (DockerMCPGatewayError, DockerMCPNotInstalledError) as e:
             logger.error(f"Gateway load failed for {server_name}: {e}")
-            return ToolResult.failed(f"Failed to load {server_name}: {str(e)}")
+            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {str(e)}", persistent))
         except asyncio.TimeoutError:
             logger.error(f"Timeout loading {server_name} via gateway")
-            return ToolResult.failed(f"Failed to load {server_name}: Connection timeout")
+            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: Connection timeout", persistent))
         except Exception as e:
             logger.error(f"Unexpected error loading {server_name} via gateway: {e}", exc_info=True)
-            return ToolResult.failed(f"Failed to load {server_name}: {str(e)}")
+            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {str(e)}", persistent))
 
         finally:
             if changed and not published:
@@ -1108,6 +1126,7 @@ class MCPAgent(Feature):
             )
 
         published = False
+        persistent = False
         changed = False
         try:
             from .manager import MCPGatewayManager
@@ -1138,7 +1157,7 @@ class MCPAgent(Feature):
             # Docker exposes an aggregated tool catalog, not per-server
             # readiness. Persist desired configuration, never an invented
             # observed-enabled set.
-            await self._reconcile_gateway_persistence(server_list)
+            persistent = await self._reconcile_gateway_persistence(server_list)
             self._require_open()
             mounted = self._mount_gateway_tools()
 
@@ -1178,13 +1197,13 @@ class MCPAgent(Feature):
 
         except (DockerMCPGatewayError, DockerMCPNotInstalledError) as e:
             logger.error(f"Gateway error: {e}")
-            return ToolResult.failed(f"Failed to start gateway: {str(e)}")
+            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {str(e)}", persistent, gateway_replaced=True))
         except asyncio.TimeoutError as e:
             logger.error(f"Timeout starting gateway: {e}")
-            return ToolResult.failed("Failed to start gateway: Connection timeout")
+            return ToolResult.failed(_load_failure_message("Failed to start gateway: Connection timeout", persistent, gateway_replaced=True))
         except Exception as e:
             logger.error(f"Unexpected error starting gateway: {e}", exc_info=True)
-            return ToolResult.failed(f"Failed to start gateway: {str(e)}")
+            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {str(e)}", persistent, gateway_replaced=True))
 
         finally:
             if changed and not published:

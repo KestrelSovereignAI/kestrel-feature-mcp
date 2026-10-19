@@ -74,6 +74,12 @@ serialized per feature; remote connections keep their separate connection gates.
 If container removal fails, the feature retains its resource record and Docker
 client for cleanup retry. Re-enabling the same feature instance completes that
 cleanup before allowing a fresh manager and restoring saved connections.
+Across connection modes, a host that supports enablement persistence must
+confirm the saved state and configuration by readback before publication.
+Gateway start also confirms that its complete saved server set matches the
+requested replacement. If publication fails after that acknowledgement, the
+error discloses the retained enablement and, for gateway start, the replaced
+server set. Unload the saved connection to disable restoration.
 
 This release supports `auth="none"` only. It does not accept token headers or
 start OAuth registration/consent when a server challenges for authentication.

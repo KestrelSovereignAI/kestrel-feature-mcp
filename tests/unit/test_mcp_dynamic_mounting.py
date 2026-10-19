@@ -80,9 +80,12 @@ async def test_empty_container_catalog_reports_no_tools_without_misdiagnosing_th
     ("private.registry:5000/native:v2", "private.registry:5000/native:v2", "private.registry:5000/native:v2"),
 ])
 async def test_container_unload_accepts_the_image_reference_used_to_load_it(mcp_http_server, selector, image, unload_alias):
+    from tests.unit.test_remote_mcp import RegistryHost
+
     feature, manager, name = _native_container_feature(mcp_http_server, image)
-    feature.agent.persist_feature_enablement = AsyncMock()
-    feature.agent.clear_feature_enablement = AsyncMock()
+    feature.agent = RegistryHost(manager.owner_did)
+    feature.agent.persist_feature_enablement = AsyncMock(wraps=feature.agent.persist_feature_enablement)
+    feature.agent.clear_feature_enablement = AsyncMock(wraps=feature.agent.clear_feature_enablement)
     try:
         loaded = await feature.load_tool(selector)
         assert loaded.status is ToolResultStatus.OK
@@ -98,6 +101,7 @@ async def test_container_unload_accepts_the_image_reference_used_to_load_it(mcp_
         assert result.data["container"] == name
         assert manager.owned_containers == {}
         assert feature.agent.registered == {}
+        assert not feature.agent.saved
         feature.agent.clear_feature_enablement.assert_awaited_once_with("mcp_server", name)
     finally:
         await feature.shutdown()

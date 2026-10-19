@@ -276,3 +276,192 @@ async def test_explicit_gateway_cleanup_joins_a_start_and_removes_its_saved_inte
         release.set()
         await asyncio.gather(*(t for t in (loading, stopping) if t is not None), return_exceptions=True)
         await feature.shutdown()
+
+
+@pytest.mark.parametrize("producer,stage", [
+    ("container", "create"), ("container", "discover"), ("container", "persist"),
+    ("gateway", "start"), ("gateway", "persist"),
+    ("gateway-add", "start"), ("gateway-add", "persist"),
+])
+async def test_shutdown_rechecks_each_docker_producer_await_and_discloses_saved_intent(monkeypatch, producer, stage):
+    from mcp import types
+    from kestrel_feature_mcp import manager as manager_module
+
+    host = RegistryHost()
+    feature = MCPAgent(host)
+    await feature.initialize()
+    entered, release = asyncio.Event(), asyncio.Event()
+    name = container_name_for_image("custom:latest", host.agent_id)
+    advertised = [types.Tool(name="echo", description="", inputSchema={"type": "object", "properties": {}})]
+    writes, mounted, removed = [], [], []
+
+    async def checkpoint(current):
+        if stage == current:
+            entered.set()
+            await release.wait()
+
+    async def start_container(*args, **kwargs):
+        manager.owned_containers[name] = {"tools": advertised}
+        await checkpoint("create")
+        return name
+
+    async def discover(*args):
+        await checkpoint("discover")
+        return advertised
+
+    async def stop_container(container):
+        removed.append(container)
+        del manager.owned_containers[container]
+        return True
+
+    manager = SimpleNamespace(
+        owner_did=host.agent_id, owned_containers={}, aclose=AsyncMock(),
+        start_tool_container=start_container, connect_to_tool=discover, stop_tool=stop_container,
+        get_all_tools=lambda: [{"container": name, "name": "echo", "description": "", "inputSchema": {}}],
+        tool_caller=lambda container: AsyncMock(),
+    )
+    monkeypatch.setattr(MCPToolManager, "create", AsyncMock(return_value=manager))
+    gateway = SimpleNamespace(tools={}, is_connected=producer == "gateway-add", stop=AsyncMock(),
+                              get_all_tools=lambda: [{"name": "echo", "description": "", "inputSchema": {}}],
+                              tool_caller=lambda: AsyncMock())
+
+    async def start_gateway(*args):
+        await checkpoint("start")
+        return advertised
+
+    gateway.start = gateway.enable_server = start_gateway
+    monkeypatch.setattr(manager_module, "MCPGatewayManager", lambda: gateway)
+    monkeypatch.setattr(feature_module, "check_docker_mcp_available", lambda: True)
+    monkeypatch.setattr(feature, "_reject_unknown_servers", AsyncMock(return_value=None))
+    if producer == "gateway-add":
+        feature.gateway_manager = gateway
+    original_persist = feature._persist_server
+
+    async def persist(*args, **kwargs):
+        outcome = await original_persist(*args, **kwargs)
+        writes.append(args[0])
+        await checkpoint("persist")
+        return outcome
+
+    monkeypatch.setattr(feature, "_persist_server", persist)
+    original_mount = host.register_dynamic_tools
+
+    def mount(*args, **kwargs):
+        mounted.append(args[0])
+        return original_mount(*args, **kwargs)
+
+    monkeypatch.setattr(host, "register_dynamic_tools", mount)
+    if producer == "container":
+        operation = feature.load_tool("custom:latest")
+    elif producer == "gateway":
+        operation = feature.gateway_start("time")
+    else:
+        operation = feature._load_via_gateway("time")
+    loading = asyncio.create_task(operation)
+    stopping = None
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        stopping = asyncio.create_task(feature.shutdown())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert feature._closing and not stopping.done()
+        release.set()
+        result = await loading
+        await stopping
+        assert result.status is ToolResultStatus.ERROR
+        assert "shutting down" in result.error
+        assert not mounted, "a closing producer published callable tools"
+        assert not host.registered
+        if producer == "container":
+            assert removed == [name] and not manager.owned_containers
+            manager.aclose.assert_awaited_once()
+        else:
+            gateway.stop.assert_awaited_once()
+        if stage == "persist":
+            assert writes and all(row["state"] == "enabled" for row in host.saved.values())
+            assert "remains saved" in result.error, result.to_dict()
+            assert "Unload" in result.error
+            if producer == "gateway":
+                assert "server set was replaced" in result.error
+        else:
+            assert not writes and not host.saved, "a retired producer persisted enablement"
+            assert "remains saved" not in result.error
+    finally:
+        release.set()
+        await asyncio.gather(*(task for task in (loading, stopping) if task is not None), return_exceptions=True)
+        await feature.shutdown()
+
+
+async def test_queued_start_rechecks_closing_before_probes_catalog_or_gateway_retirement(monkeypatch):
+    host = RegistryHost()
+    feature = MCPAgent(host)
+    await feature.initialize()
+    check = MagicMock(return_value=True)
+    catalog = AsyncMock(return_value=None)
+    retired_by = []
+
+    async def retire():
+        retired_by.append(asyncio.current_task())
+
+    feature.gateway_manager = SimpleNamespace(stop=retire)
+    monkeypatch.setattr(feature_module, "check_docker_mcp_available", check)
+    monkeypatch.setattr(feature, "_known_catalog_servers", catalog)
+    await feature._docker_operations.acquire()
+    released = False
+    queued = asyncio.create_task(feature.gateway_start("time"))
+    stopping = None
+    try:
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not queued.done() and not feature._closing
+        stopping = asyncio.create_task(feature.shutdown())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert feature._closing and not stopping.done()
+        feature._docker_operations.release()
+        released = True
+        result = await queued
+        await stopping
+        assert result.status is ToolResultStatus.ERROR
+        check.assert_not_called()
+        catalog.assert_not_awaited()
+        assert retired_by == [stopping], "the queued start retired a live gateway"
+        assert not host.saved and not host.registered
+    finally:
+        if not released:
+            feature._docker_operations.release()
+        await asyncio.gather(*(task for task in (queued, stopping) if task is not None), return_exceptions=True)
+        await feature.shutdown()
+
+
+async def test_settled_shutdown_restore_cannot_acquire_a_container_manager(monkeypatch):
+    from kestrel_feature_mcp.feature import MCPFeatureClosingError
+
+    host = RegistryHost()
+    name = container_name_for_image("custom:latest", host.agent_id)
+    host.saved[name] = {"name": name, "state": "enabled", "metadata": {"mode": "container", "image": "custom:latest"}}
+    feature = MCPAgent(host)
+    await feature.initialize()
+    await feature.shutdown()
+    create = AsyncMock(side_effect=AssertionError("settled feature acquired a Docker client"))
+    monkeypatch.setattr(MCPToolManager, "create", create)
+    with pytest.raises(MCPFeatureClosingError, match="shutting down"):
+        await feature.post_all_features_loaded()
+    create.assert_not_awaited()
+    assert feature.manager is None and not host.registered
+    assert set(host.saved) == {name}
+
+
+async def test_explicit_gateway_unload_remains_available_while_feature_is_closing(monkeypatch):
+    host = RegistryHost()
+    host.saved["time"] = {"name": "time", "state": "enabled", "metadata": {"mode": "gateway"}}
+    feature = MCPAgent(host)
+    await feature.initialize()
+    gateway = SimpleNamespace(is_connected=True, gateway=SimpleNamespace(requested_servers={"time"}), stop=AsyncMock())
+    feature.gateway_manager = gateway
+    monkeypatch.setattr(feature, "_resolve_load_route", AsyncMock(return_value=("gateway", "time")))
+    feature._closing = True
+    result = await feature.unload_tool("time")
+    assert result.status is ToolResultStatus.OK, result.to_dict()
+    gateway.stop.assert_awaited_once()
+    assert not host.saved and feature.gateway_manager is None
