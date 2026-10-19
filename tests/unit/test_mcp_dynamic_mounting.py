@@ -536,7 +536,12 @@ class TestMounting:
 async def test_shutdown_attempts_every_resource_and_propagates_cleanup_errors():
     manager = MagicMock()
     manager.owned_containers = {"a": {}, "b": {}}
-    manager.stop_tool = AsyncMock(side_effect=[TimeoutError("a close failed"), True])
+    async def stop(name):
+        if name == "a":
+            raise TimeoutError("a close failed")
+        del manager.owned_containers[name]
+        return True
+    manager.stop_tool = AsyncMock(side_effect=stop)
     manager.aclose = AsyncMock()
     gateway = MagicMock()
     gateway.is_connected = False
@@ -545,7 +550,9 @@ async def test_shutdown_attempts_every_resource_and_propagates_cleanup_errors():
     with pytest.raises(TimeoutError, match="a close failed"):
         await feature.shutdown()
     assert [call.args[0] for call in manager.stop_tool.await_args_list] == ["a", "b"]
-    manager.aclose.assert_awaited_once()
+    # The failed resource still owns the client required to retry its removal.
+    manager.aclose.assert_not_awaited()
+    assert set(manager.owned_containers) == {"a"}
     gateway.stop.assert_awaited_once()
 
 

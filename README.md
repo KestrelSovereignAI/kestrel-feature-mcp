@@ -68,6 +68,13 @@ invalidates the catalog before waiting on storage removal.
 Configuration changes for one remote connection are serialized without locking
 ordinary calls or unrelated connections.
 
+Feature shutdown refuses new connection starts and joins admitted Docker starts
+before reporting that resources are released. Docker configuration changes are
+serialized per feature; remote connections keep their separate connection gates.
+If container removal fails, the feature retains its resource record and Docker
+client for cleanup retry. Re-enabling the same feature instance completes that
+cleanup before allowing a fresh manager and restoring saved connections.
+
 This release supports `auth="none"` only. It does not accept token headers or
 start OAuth registration/consent when a server challenges for authentication.
 Saved authentication modes or fields it cannot implement are refused. Vendor

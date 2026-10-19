@@ -32,6 +32,61 @@ from kestrel_feature_mcp.registry import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+@pytest.mark.parametrize("stage", ["closed", "starting"])
+@pytest.mark.timeout(60)
+async def test_feature_shutdown_fences_real_gateway_publication(docker_mcp_available, monkeypatch, stage):
+    import uuid
+    from kestrel_feature_mcp.feature import MCPAgent
+    from kestrel_sdk.tools.result import ToolResultStatus
+    from tests.unit.test_remote_mcp import RegistryHost
+
+    host = RegistryHost(f"did:test:gateway-shutdown-{uuid.uuid4().hex}")
+    feature = MCPAgent(host)
+    await feature.initialize()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_start = MCPGatewayManager.start
+    managers = []
+
+    async def start(manager, servers):
+        managers.append(manager)
+        tools = await original_start(manager, servers)
+        entered.set()
+        await release.wait()
+        return tools
+
+    monkeypatch.setattr(MCPGatewayManager, "start", start)
+    loading = stopping = None
+    try:
+        if stage == "closed":
+            await feature.shutdown()
+            result = await feature.gateway_start("time")
+            assert not managers
+        else:
+            loading = asyncio.create_task(feature.gateway_start("time"))
+            await asyncio.wait_for(entered.wait(), 30)
+            assert managers[0].is_connected and managers[0].gateway.is_running
+            stopping = asyncio.create_task(feature.shutdown())
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert not stopping.done(), "feature released custody before its real gateway start settled"
+            release.set()
+            result = await loading
+            await stopping
+        assert result.status is ToolResultStatus.ERROR, result.to_dict()
+        assert "shutting down" in result.error
+        assert feature.gateway_manager is None
+        assert all(not manager.gateway.is_running and not manager.is_connected for manager in managers)
+        assert not host.registered and not host.saved
+    finally:
+        release.set()
+        await asyncio.gather(*(task for task in (loading, stopping) if task is not None), return_exceptions=True)
+        try:
+            await feature.shutdown()
+        finally:
+            for manager in managers:
+                await manager.stop()
+
 # Test timeout
 GATEWAY_TIMEOUT = 60  # seconds
 
