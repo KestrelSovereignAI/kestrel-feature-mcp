@@ -59,6 +59,8 @@ without that capability explicitly report that connections last for the session.
 Saved state is read back before persistence or removal is reported. A host
 that silently ignores an enablement write fails explicitly. Storage errors
 fail the operation; a failed remote load withdraws handles and closes its transport. Reload, unload and shutdown invalidate old bound callers.
+New catalogs become callable only after persistence is confirmed. Unload
+invalidates the catalog before waiting on storage removal.
 Configuration changes for one remote connection are serialized without locking
 ordinary calls or unrelated connections.
 
@@ -188,6 +190,11 @@ The connection does not replay that call. A retry needs policy approval and an
 explicit idempotency or safe-repeat guarantee; an error is not evidence that
 nothing executed. Standard pre-execution JSON-RPC rejections retain their
 original error. Caller cancellation remains cancellation.
+Operator-input continuations are not implemented yet. The native client's
+automatic input loop is disabled; an input-required response produces an
+unknown-outcome error without another tool request. Managed container and gateway
+HTTP connections also ignore environment proxies, including for gateway bearer
+headers.
 Tool discovery follows pagination and fails on repeated cursors. Negotiation
 uses the connection deadline, then discovery uses the whole-call deadline.
 Cancelled startup joins its transport owner before returning. Shutdown has its

@@ -603,3 +603,39 @@ async def test_container_retains_startup_owner_without_admitting_calls_before_di
     finally:
         await asyncio.wait({startup}, timeout=2)
         await manager._drop_connection("test")
+
+
+@pytest.mark.parametrize("headers", [
+    pytest.param(None, id="container"),
+    pytest.param({"Authorization": "Bearer synthetic-private-gateway-token"}, id="gateway"),
+])
+async def test_managed_http_does_not_send_requests_or_gateway_tokens_to_environment_proxies(mcp_http_server, monkeypatch, headers):
+    received = []
+    async def proxy(reader, writer):
+        try:
+            received.append(await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 2))
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    server = await asyncio.start_server(proxy, "127.0.0.1", 0)
+    proxy_url = "http://127.0.0.1:" + str(server.sockets[0].getsockname()[1])
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(name, proxy_url)
+        monkeypatch.delenv(name.lower(), raising=False)
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.delenv("no_proxy", raising=False)
+    connection = MCPConnection(mcp_http_server.url, headers=headers)
+    try:
+        await connection.connect()
+        result = await connection.call_tool("echo", {"text": "managed-direct-connection"})
+        assert mcp_http_server.witness == ["managed-direct-connection"]
+        assert result.content[0].text == "managed-direct-connection"
+    finally:
+        try:
+            await connection.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+            assert received == [], received

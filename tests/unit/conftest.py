@@ -32,6 +32,7 @@ class HTTPMCPServer:
 async def mcp_http_server(request, tmp_path):
     settings = getattr(request, "param", {})
     settings["discover_started"] = asyncio.Event()
+    settings["input_witness_file"] = tmp_path / "input-execution-witness"
 
     class TestServer(MCPServer):
         async def _handle_list_tools(self, ctx, params):
@@ -60,6 +61,26 @@ async def mcp_http_server(request, tmp_path):
         raise ValueError("test tool failure")
 
     async def discover_behavior(ctx, call_next):
+        if ctx.method == "tools/call" and settings.get("input_required"):
+            with settings["input_witness_file"].open("a") as stream:
+                stream.write("executed-before-input\n")
+            kind = settings["input_required"]
+            requests = {}
+            if kind == "sampling":
+                requests["input"] = types.CreateMessageRequest(
+                    method="sampling/createMessage",
+                    params=types.CreateMessageRequestParams(
+                        messages=[types.SamplingMessage(role="user", content=types.TextContent(type="text", text="input"))],
+                        maxTokens=16))
+            elif kind == "roots":
+                requests["input"] = types.ListRootsRequest(method="roots/list")
+            elif kind == "elicitation":
+                requests["input"] = types.ElicitRequest(method="elicitation/create",
+                    params=types.ElicitRequestParams(message="Input needed",
+                        requestedSchema={"type": "object", "properties": {}}))
+            else:
+                assert kind == "state"
+            return types.InputRequiredResult(input_requests=requests, request_state="peer-work-started")
         if ctx.method == "tools/call" and settings.get("reject_call"):
             raise MCPError(types.INVALID_PARAMS, "Tool arguments rejected before execution")
         if ctx.method == "server/discover":

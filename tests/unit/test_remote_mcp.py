@@ -267,20 +267,16 @@ async def test_saved_unauthenticated_endpoint_restores_and_explicit_unload_clear
         await restored.shutdown()
 
 
-@pytest.mark.parametrize("metadata", [
-    {"mode": "remote", "url": "https://remote.example/mcp", "auth": "oauth"},
-    {"mode": "remote", "url": "https://remote.example/mcp", "auth": "none", "headers": {"Authorization": "secret"}},
-    {"mode": "remote", "url": None, "auth": "none"},
-])
-async def test_restore_rejects_unsupported_auth_or_invalid_saved_url(metadata, caplog):
+async def test_restore_rejects_invalid_saved_url(caplog):
     host = RegistryHost()
-    host.saved["mcp-remote-forged"] = {"name": "mcp-remote-forged", "state": "enabled", "metadata": metadata}
+    host.saved["mcp-remote-forged"] = {"name": "mcp-remote-forged", "state": "enabled",
+        "metadata": {"mode": "remote", "url": None, "auth": "none"}}
     feature = MCPAgent(host)
     await feature.initialize()
     try:
         await feature.post_all_features_loaded()
         assert not feature._remote_connections and not host.registered
-        assert "Refusing unsupported" in caplog.text or "Failed to restore remote" in caplog.text
+        assert "Failed to restore remote" in caplog.text
     finally:
         await feature.shutdown()
 
@@ -455,3 +451,146 @@ async def test_lost_tool_response_is_unknown_and_is_never_replayed(remote_peer):
         except* httpx2.RemoteProtocolError:
             await feature.shutdown()
         assert not feature._remote_connections
+
+
+@pytest.mark.parametrize("mcp_http_server", [
+    {"tls": True, "input_required": kind}
+    for kind in ("sampling", "roots", "elicitation", "state")
+], indirect=True)
+async def test_unsupported_input_never_continues_or_loses_the_unknown_outcome(remote_peer):
+    feature = MCPAgent(RegistryHost())
+    try:
+        assert (await feature.load_tool(remote_peer.url)).status is ToolResultStatus.OK
+        wrapper = next(t for ts in feature.agent.registered.values() for t in ts if t._real_name == "echo")
+        result = await wrapper.execute(text="work-before-input")
+        assert remote_peer.peer.settings["input_witness_file"].read_text().splitlines() == ["executed-before-input"]
+        calls = [json.loads(body) for scope, body in remote_peer.peer.requests
+                 if body and json.loads(body)["method"] == "tools/call"]
+        assert len(calls) == 1
+        assert result["status"] == "error"
+        assert result["data"]["execution_outcome"] == "unknown"
+        assert "Do not replay" in result["error"]
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_unload_with_slow_store_invalidates_captured_remote_before_io(remote_peer):
+    host = RegistryHost()
+    feature = MCPAgent(host)
+    entered, release = asyncio.Event(), asyncio.Event()
+    unloading = None
+    original_clear = host.clear_feature_enablement
+    try:
+        loaded = await feature.load_tool(remote_peer.url)
+        assert loaded.status.value == "ok"
+        wrapper = next(t for ts in host.registered.values() for t in ts if t._real_name == "echo")
+        async def slow_clear(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            await original_clear(*args, **kwargs)
+        host.clear_feature_enablement = slow_clear
+        unloading = asyncio.create_task(feature.unload_tool(loaded.data["connection"]))
+        await asyncio.wait_for(entered.wait(), 2)
+        result = await wrapper.execute(text="executed-during-unload")
+        assert remote_peer.peer.witness == []
+        assert result["status"] == "error" and "changed; rediscover" in result["error"]
+    finally:
+        release.set()
+        if unloading is not None:
+            await unloading
+        await feature.shutdown()
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+@pytest.mark.parametrize("shutdown", [False, True])
+async def test_catalog_is_not_callable_before_persistence_ack(remote_peer, shutdown):
+    host = RegistryHost()
+    feature = MCPAgent(host)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_persist = host.persist_feature_enablement
+    async def slow_persist(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        await original_persist(*args, **kwargs)
+    host.persist_feature_enablement = slow_persist
+    loading = asyncio.create_task(feature.load_tool(remote_peer.url))
+    closing = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        captured = [t for ts in host.registered.values() for t in ts if t._real_name == "echo"]
+        if shutdown:
+            closing = asyncio.create_task(feature.shutdown())
+            async def await_closing():
+                while not feature._closing:
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(await_closing(), 2)
+        if captured:
+            await captured[0].execute(text="executed-before-persistence-ack")
+        assert remote_peer.peer.witness == []
+        assert not host.registered
+        release.set()
+        loaded = await loading
+        if shutdown:
+            await closing
+            assert loaded.status.value == "error" and "shutting down" in loaded.error
+            assert not host.registered and not feature._remote_connections
+        else:
+            assert loaded.status.value == "ok"
+            wrapper = next(t for ts in host.registered.values() for t in ts if t._real_name == "echo")
+            called = await wrapper.execute(text="executed-after-persistence-ack")
+            assert remote_peer.peer.witness == ["executed-after-persistence-ack"]
+            assert called["status"] == "ok"
+    finally:
+        release.set()
+        await loading
+        if closing is not None:
+            await closing
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+@pytest.mark.parametrize("field", ["state", "metadata"])
+async def test_mismatched_enablement_readback_never_publishes_a_catalog(remote_peer, field):
+    host = RegistryHost()
+    original_persist = host.persist_feature_enablement
+    async def corrupting_persist(kind, name, state, *, actor, metadata):
+        await original_persist(kind, name, state, actor=actor, metadata=metadata)
+        if field == "state":
+            host.saved[name]["state"] = "disabled"
+        else:
+            host.saved[name]["metadata"] = {**metadata, "auth": "oauth"}
+    host.persist_feature_enablement = corrupting_persist
+    feature = MCPAgent(host)
+    try:
+        result = await feature.load_tool(remote_peer.url)
+        assert remote_peer.peer.witness == []
+        assert result.status is ToolResultStatus.ERROR
+        assert "did not retain" in result.error
+        assert not host.registered and not feature._remote_connections
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+@pytest.mark.parametrize("unsupported", [
+    {"auth": "oauth"}, {"auth": None}, {"headers": {"Authorization": "synthetic-secret"}},
+])
+async def test_restore_refuses_unsupported_saved_configuration_before_dns(remote_peer, unsupported, caplog):
+    host = RegistryHost()
+    first = MCPAgent(host)
+    loaded = await first.load_tool(remote_peer.url)
+    assert loaded.status is ToolResultStatus.OK
+    await first.shutdown()
+    name = loaded.data["connection"]
+    host.saved[name]["metadata"] = {**host.saved[name]["metadata"], **unsupported}
+    before = len(remote_peer.resolutions)
+    restored = MCPAgent(host)
+    try:
+        await restored.initialize()
+        await restored.post_all_features_loaded()
+        assert remote_peer.peer.witness == []
+        assert not host.registered and not restored._remote_connections
+        assert len(remote_peer.resolutions) == before
+        assert "Refusing unsupported" in caplog.text
+    finally:
+        await restored.shutdown()

@@ -15,6 +15,7 @@ import httpx2
 from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 from pydantic import ValidationError
 from mcp.shared.exceptions import MCPError
+from mcp.client import InputRequiredRoundsExceededError
 from mcp import Client, types
 from mcp.client.streamable_http import streamable_http_client
 from kestrel_sdk.security.outbound import ValidatedOutboundURL, pinned_httpx2_async_transport
@@ -25,7 +26,7 @@ from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSI
 logger = logging.getLogger(__name__)
 
 MCP_CONNECTION_ERRORS = (
-    MCPError, httpx2.HTTPError, TimeoutError, OSError, ValidationError,
+    MCPError, InputRequiredRoundsExceededError, httpx2.HTTPError, TimeoutError, OSError, ValidationError,
     BrokenResourceError, ClosedResourceError, EndOfStream,
 )
 
@@ -206,6 +207,9 @@ class MCPConnection:
                 client = await resources.enter_async_context(Client(
                     transport,
                     cache=None,
+                    # Operator-input continuations need the host's governed
+                    # surface. Never let the SDK reissue a tool call implicitly.
+                    input_required_max_rounds=0,
                 ))
                 self._client = client
                 if self._ready is not None and not self._ready.done():

@@ -420,9 +420,19 @@ class MCPAgent(Feature):
             self._remote_connections[name] = record
             published = False
             try:
-                record.tools = await record.connection.connect()
+                discovered = await record.connection.connect()
                 if self._closing:
                     raise RemoteMCPError("MCP feature is shutting down")
+                metadata = {"mode": "remote", "url": endpoint.url, "auth": "none"}
+                persistent = await self._persist_server(name, "enabled", metadata=metadata)
+                if persistent:
+                    saved = await self._read_server_delta(name)
+                    if (saved is None or saved["state"] != "enabled"
+                            or saved.get("metadata") != metadata):
+                        raise RemoteMCPError("Host did not retain MCP enablement; initialize its durable store")
+                if self._closing:
+                    raise RemoteMCPError("MCP feature is shutting down")
+                record.tools = discovered
                 caller = bind_tool_caller(
                     record.connection,
                     lambda: (self._remote_connections.get(name) is record and record.tools is not None),
@@ -431,13 +441,6 @@ class MCPAgent(Feature):
                 mounted = self._mount_tools(
                     owner, f"remote_{name[-12:]}", record.tool_descriptions(), caller,
                 )
-                metadata = {"mode": "remote", "url": endpoint.url, "auth": "none"}
-                persistent = await self._persist_server(name, "enabled", metadata=metadata)
-                if persistent:
-                    saved = await self._read_server_delta(name)
-                    if (saved is None or saved["state"] != "enabled"
-                            or saved.get("metadata") != metadata):
-                        raise RemoteMCPError("Host did not retain MCP enablement; initialize its durable store")
                 tools = [tool.name for tool in record.tools]
                 data = {"connection": name, "url": endpoint.url, "via": "remote", "auth": "none",
                         "tools": tools, "mounted": mounted, "persistent": persistent,
@@ -471,6 +474,8 @@ class MCPAgent(Feature):
             record = self._remote_connections.get(name)
             retained = False
             try:
+                if record is not None:
+                    record.tools = None
                 unmounted = self._unmount_tools(remote_owner(name))
                 await self._forget_server(name)
                 if self._supports_enablement_persistence():
