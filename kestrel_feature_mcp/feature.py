@@ -400,6 +400,8 @@ class MCPAgent(Feature):
         invalid = _selector_failure(url)
         if invalid is not None:
             raise RemoteMCPError(invalid.error)
+        if not self._host_supports_dynamic_tools():
+            raise RemoteMCPError("MCP execution requires the host's governed dynamic tool registry")
         if urlsplit(url).fragment:
             raise RemoteMCPError("Remote MCP endpoints must not contain URL fragments")
         owner_did = self._connection_owner_did()

@@ -594,3 +594,32 @@ async def test_restore_refuses_unsupported_saved_configuration_before_dns(remote
         assert "Refusing unsupported" in caplog.text
     finally:
         await restored.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+@pytest.mark.parametrize("producer", ["load", "restore"])
+@pytest.mark.parametrize("missing", ["register_dynamic_tools", "unregister_dynamic_tools"])
+async def test_unsupported_remote_host_is_refused_before_dns_or_persistence(remote_peer, producer, missing, caplog):
+    from kestrel_feature_mcp.remote import remote_name_for_url
+    host = RegistryHost()
+    setattr(host, missing, None)
+    if producer == "restore":
+        name = remote_name_for_url(remote_peer.url, host.agent_id)
+        host.saved[name] = {"name": name, "state": "enabled", "metadata": {
+            "mode": "remote", "url": remote_peer.url, "auth": "none"}}
+    saved = dict(host.saved)
+    feature = MCPAgent(host)
+    try:
+        if producer == "load":
+            result = await feature.load_tool(remote_peer.url)
+            assert result.status is ToolResultStatus.ERROR
+            assert "governed dynamic tool registry" in result.error
+        else:
+            await feature.post_all_features_loaded()
+            assert "governed dynamic tool registry" in caplog.text
+    finally:
+        await feature.shutdown()
+        assert remote_peer.peer.witness == []
+        assert not remote_peer.resolutions and not remote_peer.dials
+        assert host.saved == saved
+        assert not host.registered and not feature._remote_connections
