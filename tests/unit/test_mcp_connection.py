@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, AsyncMock
 import pytest
 from mcp.shared.exceptions import MCPError
 
-from kestrel_feature_mcp.connection import MCPConnection
+from kestrel_feature_mcp.connection import MCPConnection, MCPCallOutcomeUnknownError
 from mcp_types.version import LATEST_PROTOCOL_VERSION
 from kestrel_feature_mcp.manager import DockerMCPGatewayError, MCPGatewayManager, MCPToolManager
 
@@ -89,7 +89,7 @@ async def test_failed_startup_joins_owner_and_can_retry(mcp_http_server):
 @pytest.mark.asyncio
 async def test_calls_on_closed_connection_fail_clearly():
     connection = MCPConnection("http://127.0.0.1:1/mcp")
-    with pytest.raises(RuntimeError, match="not connected"):
+    with pytest.raises(ConnectionError, match="not connected"):
         await connection.call_tool("echo")
     await connection.close()
 
@@ -416,7 +416,7 @@ async def test_cancelled_close_propagates_and_retains_the_owner_for_rejoin(mcp_h
             await closing
         assert connection._task is owner
         assert not connection.is_connected
-        with pytest.raises(RuntimeError, match="not connected"):
+        with pytest.raises(ConnectionError, match="not connected"):
             await connection.call_tool("echo", {"text": "closing"})
     finally:
         await connection.close()
@@ -487,8 +487,9 @@ async def test_close_of_a_dead_transport_does_not_rethrow_its_historical_failure
     await connection.connect()
     owner = connection._task
     await mcp_http_server.stop()
-    with pytest.raises((MCPError, ExceptionGroup)):
+    with pytest.raises(MCPCallOutcomeUnknownError) as caught:
         await connection.call_tool("echo", {"text": "unreachable"})
+    assert isinstance(caught.value.__cause__, (MCPError, ExceptionGroup))
     async with asyncio.timeout(2):
         while not owner.done():
             await asyncio.sleep(0)

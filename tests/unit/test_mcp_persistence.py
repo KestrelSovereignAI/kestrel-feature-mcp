@@ -149,8 +149,10 @@ class TestRestoreOnStartup:
             "metadata": {"mode": "container", "image": "org/img:1"},
         }]
         feature = _feature(host)
+        feature._ensure_container_manager = AsyncMock(return_value=False)
         feature._load_via_container = AsyncMock()
         await feature.post_all_features_loaded(host)
+        feature._ensure_container_manager.assert_awaited_once()
         feature._load_via_container.assert_not_awaited()
         assert "agent-bound container manager is unavailable" in caplog.text
 

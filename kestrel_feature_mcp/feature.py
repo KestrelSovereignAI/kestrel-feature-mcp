@@ -1,26 +1,25 @@
 """
 MCP Feature Agent - Manages Model Context Protocol (MCP) tools.
 
-This feature provides two modes of operation:
-
-1. **Gateway Mode (Recommended)**: Uses Docker MCP Gateway for unified access
-   to 311+ MCP servers. Commands: !mcp-gateway-start, !mcp-gateway-stop
-
-2. **Container Mode**: Direct container management for custom servers.
-   Commands: !mcp-load, !mcp-unload
-
-Gateway mode is recommended as it provides access to all servers regardless
-of their native transport protocol.
+This feature connects to public HTTPS endpoints, Docker MCP gateways, and
+custom container servers through the official MCP client. All discovered tools
+mount through the host's governed dynamic-tool registry.
 """
 
 import asyncio
 from contextlib import AsyncExitStack
 import logging
 import json
+from urllib.parse import urlsplit
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+from kestrel_sdk.security.exceptions import SSRFError
+from kestrel_sdk.security.outbound import assert_safe_url
+from .connection import MCPConnection, MCP_CONNECTION_ERRORS, bind_tool_caller, connection_lifecycle, require_owner_did
+from .constants import SESSION_CONNECT_TIMEOUT_DEFAULT
+from .remote import RemoteMCPServer, RemoteMCPError, connection_error_message, remote_name_for_url, remote_owner
 from .dynamic_tools import build_wrappers
 from .images import normalize_image_ref
 from .registry import (
@@ -32,8 +31,7 @@ from .registry import (
     DockerCatalogError,
 )
 
-# Lazy import to avoid loading MCP/anyio at module import time
-# This prevents pytest from hanging due to anyio event loop issues
+# Docker managers are imported only when their mode is requested.
 if TYPE_CHECKING:
     from .manager import MCPToolManager, MCPGatewayManager
     from .official_registry import OfficialRegistryClient
@@ -54,6 +52,10 @@ def _selector_failure(selector: str) -> Optional[ToolResult]:
     if not isinstance(selector, str) or not selector or selector != selector.strip():
         return ToolResult.failed("An MCP server selector must be a non-empty string without surrounding whitespace")
     return None
+
+
+def _is_remote_selector(selector: str) -> bool:
+    return "://" in selector or selector.lower().startswith(("http:", "https:"))
 
 
 def _loaded_tool_result(confirmation: str, *, data: dict) -> ToolResult:
@@ -103,29 +105,40 @@ class MCPAgent(Feature):
     def __init__(self, agent):
         super().__init__(agent)
         self._official_registry: OfficialRegistryClient | None = None
+        self.manager = None
+        self.gateway_manager: Optional["MCPGatewayManager"] = None
+        self._remote_connections: dict[str, RemoteMCPServer] = {}
+        self._remote_lifecycle: dict = {}
+        self._docker_initialization = asyncio.Lock()
+        self._owner_did: str | None = None
+        self._closing = False
 
     @property
     def tool_description(self) -> str:
         return (
             "Discover MCP servers in the official Registry, Docker and local catalogs; "
-            "load MCP tools from Docker images, "
+            "load MCP tools from HTTPS endpoints or Docker images, "
             "list available tools, call tools on running servers, and unload servers"
         )
 
     async def initialize(self):
-        self.manager = None
-        self.gateway_manager: Optional["MCPGatewayManager"] = None
-        # A broken required Python dependency must fail startup clearly.
-        from .manager import MCPToolManager, DockerDaemonUnavailableError
+        self._owner_did = require_owner_did(self.agent.agent_id)
+        logger.info("MCPAgent initialized; Docker connects only for container operations.")
 
-        try:
-            # Connect the Docker client off the event loop (F397) — the sync
-            # from_env()/ping() in the constructor would stall every agent on
-            # the host until the daemon socket responds.
-            self.manager = await MCPToolManager.create(owner_did=self.agent.agent_id)
-            logger.info("MCPAgent initialized.")
-        except DockerDaemonUnavailableError as e:
-            logger.warning("Local Docker daemon unavailable; Docker MCP tools are disabled: %s", e)
+    def _connection_owner_did(self) -> str:
+        return self._owner_did or require_owner_did(self.agent.agent_id)
+
+    async def _ensure_container_manager(self) -> bool:
+        async with self._docker_initialization:
+            if self.manager is None:
+                from .manager import MCPToolManager, DockerDaemonUnavailableError
+
+                try:
+                    self.manager = await MCPToolManager.create(owner_did=self._connection_owner_did())
+                except DockerDaemonUnavailableError as error:
+                    logger.warning("Local Docker daemon unavailable; Docker MCP tools are disabled: %s", error)
+                    return False
+            return True
 
     # =========================================================================
     # Dynamic tool mounting — make a server's tools first-class LLM tools
@@ -215,27 +228,20 @@ class MCPAgent(Feature):
         agent = getattr(self, "agent", None)
         return agent is not None and hasattr(agent, "persist_feature_enablement")
 
-    async def _persist_server(self, name: str, state: str, *, metadata=None) -> None:
-        """Record an MCP server's enablement (kind='mcp_server') so a restart
-        can auto-restore it. Best-effort: never fail the tool call on a
-        persistence error."""
+    async def _persist_server(self, name: str, state: str, *, metadata=None) -> bool:
+        """Record desired state; storage errors must not claim persistence."""
         if not self._supports_enablement_persistence():
-            return
-        try:
-            await self.agent.persist_feature_enablement(
-                "mcp_server", name, state, actor="agent", metadata=metadata,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Failed to persist MCP server '%s' (%s): %s", name, state, e)
+            return False
+        await self.agent.persist_feature_enablement(
+            "mcp_server", name, state, actor="agent", metadata=metadata,
+        )
+        return True
 
     async def _forget_server(self, name: str) -> None:
         """Drop an MCP server's persisted enablement (explicit removal)."""
         if not self._supports_enablement_persistence():
             return
-        try:
-            await self.agent.clear_feature_enablement("mcp_server", name)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Failed to clear persisted MCP server '%s': %s", name, e)
+        await self.agent.clear_feature_enablement("mcp_server", name)
 
     async def _forget_all_gateway_servers(self) -> None:
         """Clear every persisted gateway-mode server (explicit gateway disable).
@@ -320,6 +326,8 @@ class MCPAgent(Feature):
           catalog is unverifiable, default to the container path so an offline
           host never misroutes a valid local image to the gateway.
         """
+        if _is_remote_selector(server):
+            return ("remote", server)
         registry = get_registry()
         entry = registry.get(server)
         if entry is None and ("/" in server or ":" in server):
@@ -347,8 +355,8 @@ class MCPAgent(Feature):
         name="mcp_load_server",
         description=(
             "Load an MCP server by catalog name (e.g. 'time', 'fetch', "
-            "'sequentialthinking') or Docker image. Stdio servers load via the "
-            "gateway; native-HTTP images run as their own container."
+            "'sequentialthinking'), Docker image, or public HTTPS endpoint. "
+            "Remote endpoints use native Streamable HTTP without Docker."
         ),
         category=ToolCategory.SYSTEM,
         command_prefix="!mcp-load"
@@ -363,13 +371,123 @@ class MCPAgent(Feature):
         invalid = _selector_failure(server)
         if invalid is not None:
             return invalid
-        if self.manager is None:
+        if not _is_remote_selector(server) and not await self._ensure_container_manager():
             return ToolResult.failed("MCP tools are not available (Docker not accessible)")
 
         route, target = await self._resolve_load_route(server)
+        if route == "remote":
+            if args is not None:
+                return ToolResult.failed("Remote MCP endpoints do not accept container command arguments")
+            return await self._load_via_remote(target)
         if route == "gateway":
             return await self._load_via_gateway(target)
         return await self._load_via_container(target, args)
+
+    async def _retire_remote(self, name: str) -> None:
+        record = self._remote_connections.get(name)
+        if record is not None:
+            record.tools = None
+            await record.connection.close()
+            del self._remote_connections[name]
+
+    async def _read_server_delta(self, name: str) -> dict | None:
+        reader = getattr(self.agent, "get_enablement_deltas", None)
+        if not callable(reader):
+            raise RemoteMCPError("Host enablement API cannot confirm its saved connection")
+        return next((row for row in await reader("mcp_server") if row["name"] == name), None)
+
+    async def _load_remote_connection(self, url: str, expected_name: str | None) -> ToolResult:
+        invalid = _selector_failure(url)
+        if invalid is not None:
+            raise RemoteMCPError(invalid.error)
+        if urlsplit(url).fragment:
+            raise RemoteMCPError("Remote MCP endpoints must not contain URL fragments")
+        owner_did = self._connection_owner_did()
+        if expected_name is not None and remote_name_for_url(url, owner_did) != expected_name:
+            raise RemoteMCPError("Stored MCP connection identifier does not match this agent's ownership")
+        async with asyncio.timeout(SESSION_CONNECT_TIMEOUT_DEFAULT):
+            endpoint = await assert_safe_url(url, allowed_schemes=("https",))
+        name = remote_name_for_url(endpoint.url, owner_did)
+        if expected_name is not None and name != expected_name:
+            raise RemoteMCPError("Stored MCP endpoint is not canonical; reconnect it explicitly")
+        async with connection_lifecycle(self._remote_lifecycle, name):
+            if self._closing:
+                raise RemoteMCPError("MCP feature is shutting down")
+            owner = remote_owner(name)
+            self._unmount_tools(owner)
+            await self._retire_remote(name)
+            record = RemoteMCPServer(name, endpoint, MCPConnection(endpoint))
+            self._remote_connections[name] = record
+            published = False
+            try:
+                record.tools = await record.connection.connect()
+                if self._closing:
+                    raise RemoteMCPError("MCP feature is shutting down")
+                caller = bind_tool_caller(
+                    record.connection,
+                    lambda: (self._remote_connections.get(name) is record and record.tools is not None),
+                    name,
+                )
+                mounted = self._mount_tools(
+                    owner, f"remote_{name[-12:]}", record.tool_descriptions(), caller,
+                )
+                metadata = {"mode": "remote", "url": endpoint.url, "auth": "none"}
+                persistent = await self._persist_server(name, "enabled", metadata=metadata)
+                if persistent:
+                    saved = await self._read_server_delta(name)
+                    if (saved is None or saved["state"] != "enabled"
+                            or saved.get("metadata") != metadata):
+                        raise RemoteMCPError("Host did not retain MCP enablement; initialize its durable store")
+                tools = [tool.name for tool in record.tools]
+                data = {"connection": name, "url": endpoint.url, "via": "remote", "auth": "none",
+                        "tools": tools, "mounted": mounted, "persistent": persistent,
+                        "protocol_version": record.connection.protocol_version}
+                published = True
+                summary = f"Connected to {endpoint.url}. Tools: {', '.join(tools)}. Mounted {mounted}."
+                if not persistent:
+                    summary += " This host does not persist enablement; this connection lasts for this session."
+                if not tools:
+                    return ToolResult.partial(summary, "The server advertised an empty tool catalog.", data=data)
+                return _loaded_tool_result(summary, data=data)
+            finally:
+                if not published:
+                    try:
+                        self._unmount_tools(owner)
+                    finally:
+                        await self._retire_remote(name)
+
+    async def _load_via_remote(self, url: str, *, expected_name: str | None = None) -> ToolResult:
+        failure = None
+        try:
+            result = await self._load_remote_connection(url, expected_name)
+        except* (MCP_CONNECTION_ERRORS + (SSRFError, ValueError, RemoteMCPError)) as errors:
+            failure = connection_error_message(errors)
+        if failure is not None:
+            return ToolResult.failed(f"Failed to connect remote MCP server: {failure}")
+        return result
+
+    async def _unload_remote(self, name: str) -> ToolResult:
+        async with connection_lifecycle(self._remote_lifecycle, name):
+            record = self._remote_connections.get(name)
+            retained = False
+            try:
+                unmounted = self._unmount_tools(remote_owner(name))
+                await self._forget_server(name)
+                if self._supports_enablement_persistence():
+                    retained = await self._read_server_delta(name) is not None
+            finally:
+                await self._retire_remote(name)
+            if retained:
+                return ToolResult.failed(
+                    "Remote connection closed, but the host did not remove its saved enablement; "
+                    "it could reconnect after restart. Repair the store and unload it again.",
+                    data={"connection": name, "unmounted": unmounted},
+                )
+            if record is None:
+                return ToolResult.failed(f"No remote MCP server named '{name}' is loaded.",
+                                         data={"connection": name, "unmounted": unmounted})
+            return ToolResult.ok(f"Disconnected {record.endpoint.url}",
+                                 data={"connection": name, "unmounted": unmounted})
 
     async def _load_via_container(self, image_name: str, args: List[str] = None) -> ToolResult:
         """Per-container load path for native-HTTP MCP images."""
@@ -378,6 +496,7 @@ class MCPAgent(Feature):
         requested_name = container_name_for_image(image_name, self.manager.owner_did)
         self._unmount_tools(_container_owner(requested_name))
         failure_context = {"container": requested_name, "image": image_name}
+        published = False
         try:
             container_name = await self.manager.start_tool_container(
                 image_name, container_name=requested_name, command=args,
@@ -405,6 +524,7 @@ class MCPAgent(Feature):
                 "container": container_name, "image": image_name,
                 "tools": tool_names, "mounted": mounted,
             }
+            published = True
             if not tool_names:
                 return ToolResult.partial(
                     f"Connected to {image_name} as {container_name}; no tools were advertised.",
@@ -427,6 +547,10 @@ class MCPAgent(Feature):
         except Exception as e:
             logger.error(f"Unexpected error loading tool {image_name}: {e}", exc_info=True)
             return ToolResult.failed(f"Failed to load MCP tool: {str(e)}", data=failure_context)
+
+        finally:
+            if not published:
+                self._unmount_tools(_container_owner(requested_name))
 
     async def _retire_gateway(self):
         """Retire an owned gateway even when its MCP transport already died."""
@@ -457,10 +581,13 @@ class MCPAgent(Feature):
         if rejection is not None:
             return rejection
 
+        published = False
+        changed = False
         try:
             from .manager import MCPGatewayManager
             from .gateway import DockerMCPGatewayError, DockerMCPNotInstalledError
 
+            changed = True
             if self.gateway_manager is not None and self.gateway_manager.is_connected:
                 # The gateway reports a flat aggregated tool list, so the only
                 # honest per-server signal is the before/after delta.
@@ -486,6 +613,7 @@ class MCPAgent(Feature):
                 "mounted": mounted,
                 "via": "gateway",
             }
+            published = True
             # A real load that adds no NEW tools is indistinguishable from a
             # no-op unless we say so — surface it as PARTIAL, not a confident
             # "Loaded" (#9 honesty contract).
@@ -515,6 +643,10 @@ class MCPAgent(Feature):
             logger.error(f"Unexpected error loading {server_name} via gateway: {e}", exc_info=True)
             return ToolResult.failed(f"Failed to load {server_name}: {str(e)}")
 
+        finally:
+            if changed and not published:
+                self._unmount_tools(_GATEWAY_OWNER)
+
     @tool(
         name="mcp_list_servers",
         description="List all running MCP servers and their tools.",
@@ -525,46 +657,43 @@ class MCPAgent(Feature):
         """
         Lists all currently loaded MCP tools.
         """
-        if self.manager is None:
-            return ToolResult.failed("MCP tools are not available (Docker not accessible)")
-
-        # Both load paths count: per-container tools AND gateway-loaded tools
-        # (mcp_load_server now routes stdio servers through the gateway, so a
-        # listing that ignored the gateway would falsely read as empty).
-        tools = list(self.manager.get_all_tools() or [])
+        tools = list(self.manager.get_all_tools() or []) if self.manager is not None else []
         if self.gateway_manager is not None and self.gateway_manager.is_connected:
-            for t in self.gateway_manager.get_all_tools():
-                tools.append({**t, "container": "gateway"})
-
+            tools.extend({**tool, "container": "gateway"}
+                         for tool in self.gateway_manager.get_all_tools())
         containers = []
-        for name, info in self.manager.owned_containers.items():
-            connection = info["connection"]
-            catalog = info["tools"]
-            containers.append({
-                "container": name, "catalog_ready": catalog is not None,
-                "connected": bool(connection is not None and connection.is_connected),
-                "tool_count": len(catalog) if catalog is not None else None,
-            })
-        data = {"tools": tools, "containers": containers}
-        container_summary = "".join(
-            f"- [{item['container']}] "
-            f"{'connected' if item['connected'] else 'disconnected'}, "
-            f"{item['tool_count'] if item['catalog_ready'] else 'unknown'} tool(s)\n"
-            for item in containers
-        )
-
-        if not tools:
-            if containers:
-                summary = "MCP containers:\n" + container_summary + "No tools are available."
-                if any(not item["connected"] or not item["catalog_ready"] for item in containers):
-                    return ToolResult.partial(summary, "An owned container is not ready for tool calls.", data=data)
-                return ToolResult.ok(summary, data=data)
-            return ToolResult.ok("No MCP tools loaded.", data=data)
-
-        response = "Available MCP Tools:\n"
-        for t in tools:
-            response += f"- [{t.get('container', '?')}] {t['name']}: {t.get('description', '')}\n"
-        return ToolResult.ok(response + ("\nMCP containers:\n" + container_summary if containers else ""), data=data)
+        if self.manager is not None:
+            for name, info in self.manager.owned_containers.items():
+                connection, catalog = info["connection"], info["tools"]
+                containers.append({
+                    "container": name, "catalog_ready": catalog is not None,
+                    "connected": bool(connection is not None and connection.is_connected),
+                    "tool_count": len(catalog) if catalog is not None else None,
+                })
+        remotes = []
+        for name, record in self._remote_connections.items():
+            tools.extend(record.tool_descriptions())
+            remotes.append({"connection": name, "url": record.endpoint.url,
+                            "catalog_ready": record.tools is not None,
+                            "connected": record.connection.is_connected,
+                            "protocol_version": record.connection.protocol_version,
+                            "tool_count": len(record.tools) if record.tools is not None else None})
+        data = {"tools": tools, "containers": containers, "remotes": remotes}
+        response = "Available MCP Tools:\n" if tools else "No MCP tools loaded.\n"
+        for tool in tools:
+            identity = tool.get("connection", tool.get("container", "?"))
+            response += f"- [{identity}] {tool['name']}: {tool.get('description', '')}\n"
+        for title, records, field in (("MCP containers", containers, "container"),
+                                      ("Remote MCP servers", remotes, "connection")):
+            if records:
+                response += "\n" + title + ":\n"
+                for record in records:
+                    count = record["tool_count"] if record["catalog_ready"] else "unknown"
+                    state = "connected" if record["connected"] else "disconnected"
+                    response += f"- [{record[field]}] {state}, {count} tool(s)\n"
+        if any(not record["connected"] or not record["catalog_ready"] for record in containers + remotes):
+            return ToolResult.partial(response, "An owned MCP connection is not ready for tool calls.", data=data)
+        return ToolResult.ok(response, data=data)
 
     @tool(
         name="mcp_unload_server",
@@ -581,6 +710,14 @@ class MCPAgent(Feature):
         invalid = _selector_failure(container_name)
         if invalid is not None:
             return invalid
+        remote = next((name for name, record in self._remote_connections.items()
+                       if container_name in (name, record.endpoint.url)), None)
+        if remote is not None:
+            return await self._unload_remote(remote)
+        if container_name.startswith("mcp-remote-"):
+            return await self._unload_remote(container_name)
+        if _is_remote_selector(container_name):
+            return ToolResult.failed("No loaded remote MCP connection has that endpoint")
         if self.manager is None:
             return ToolResult.failed("MCP tools are not available (Docker not accessible)")
 
@@ -884,6 +1021,8 @@ class MCPAgent(Feature):
                 "See: https://docs.docker.com/desktop/extensions/mcp/"
             )
 
+        published = False
+        changed = False
         try:
             from .manager import MCPGatewayManager
             from .gateway import DockerMCPGatewayError, DockerMCPNotInstalledError
@@ -902,6 +1041,7 @@ class MCPAgent(Feature):
             if rejection is not None:
                 return rejection
 
+            changed = True
             await self._retire_gateway()
             self.gateway_manager = MCPGatewayManager()
             tools = await self.gateway_manager.start(server_list)
@@ -933,6 +1073,7 @@ class MCPAgent(Feature):
                 f"**Requested:** {', '.join(server_list)}\n"
                 f"{tools_line}" + mount_note
             )
+            published = True
             if not tool_names:
                 return ToolResult.partial(
                     f"Gateway started but mounted 0 tools from "
@@ -955,6 +1096,10 @@ class MCPAgent(Feature):
         except Exception as e:
             logger.error(f"Unexpected error starting gateway: {e}", exc_info=True)
             return ToolResult.failed(f"Failed to start gateway: {str(e)}")
+
+        finally:
+            if changed and not published:
+                self._unmount_tools(_GATEWAY_OWNER)
 
     @tool(
         name="mcp_gateway_stop",
@@ -1102,6 +1247,15 @@ class MCPAgent(Feature):
 
         gateway_servers = [d["name"] for d in enabled if _mode(d) == "gateway"]
         containers = [d for d in enabled if _mode(d) == "container"]
+        for saved in (d for d in enabled if _mode(d) == "remote"):
+            metadata = saved["metadata"]
+            if (metadata.get("auth") != "none"
+                    or set(metadata) - {"mode", "url", "auth"}):
+                logger.error("Refusing unsupported authentication/configuration for remote MCP %s", saved["name"])
+                continue
+            result = await self._load_via_remote(metadata.get("url"), expected_name=saved["name"])
+            if result.status.value == "error":
+                logger.error("Failed to restore remote MCP %s: %s", saved["name"], result.error)
 
         if gateway_servers and check_docker_mcp_available():
             try:
@@ -1114,7 +1268,7 @@ class MCPAgent(Feature):
                 logger.warning("Failed to restore MCP gateway servers %s: %s",
                                gateway_servers, e)
 
-        if containers and self.manager is None:
+        if containers and not await self._ensure_container_manager():
             logger.warning("Cannot restore MCP containers: agent-bound container manager is unavailable")
             return
 
@@ -1138,7 +1292,16 @@ class MCPAgent(Feature):
 
     async def shutdown(self):
         """Attempt every owned cleanup, then propagate any cleanup failure."""
+        self._closing = True
         manager = self.manager
+
+        async def stop_remote(name):
+            async with connection_lifecycle(self._remote_lifecycle, name):
+                try:
+                    await self._retire_remote(name)
+                finally:
+                    self._unmount_tools(remote_owner(name))
+
         async def stop_container(name):
             try:
                 await manager.stop_tool(name)
@@ -1152,4 +1315,6 @@ class MCPAgent(Feature):
                 cleanup.push_async_callback(manager.aclose)
                 for name in reversed(list(manager.owned_containers)):
                     cleanup.push_async_callback(stop_container, name)
+            for name in reversed(list(self._remote_connections)):
+                cleanup.push_async_callback(stop_remote, name)
             cleanup.push_async_callback(self._retire_gateway)

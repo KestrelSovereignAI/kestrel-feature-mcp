@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import inspect
 from typing import get_type_hints
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -20,7 +20,7 @@ from kestrel_feature_mcp.feature import MCPAgent
 
 
 def _make_feature(*, manager=None, gateway=None) -> MCPAgent:
-    """Build an MCPAgent without running initialize() (which imports Docker)."""
+    """Build an MCPAgent with explicit manager state."""
     feat = MCPAgent(MagicMock())
     feat.manager = manager
     feat.gateway_manager = gateway
@@ -80,15 +80,22 @@ class TestRegistryTools:
 # ---------------------------------------------------------------------------
 class TestDockerUnavailableFails:
     @pytest.mark.asyncio
-    async def test_load_tool_without_manager(self):
-        result = await _make_feature(manager=None).load_tool("some/image")
+    async def test_load_tool_without_manager(self, monkeypatch):
+        from kestrel_feature_mcp.manager import MCPToolManager, DockerDaemonUnavailableError
+        create = AsyncMock(side_effect=DockerDaemonUnavailableError("test daemon unavailable"))
+        monkeypatch.setattr(MCPToolManager, "create", create)
+        feature = _make_feature(manager=None)
+        feature.agent.agent_id = "did:test:unavailable"
+        result = await feature.load_tool("some/image")
+        create.assert_awaited_once_with(owner_did="did:test:unavailable")
         assert result.status is ToolResultStatus.ERROR
         assert "not available" in (result.error or "")
 
     @pytest.mark.asyncio
     async def test_list_tools_without_manager(self):
         result = await _make_feature(manager=None).list_tools()
-        assert result.status is ToolResultStatus.ERROR
+        assert result.status is ToolResultStatus.OK
+        assert result.data == {"tools": [], "containers": [], "remotes": []}
 
     @pytest.mark.asyncio
     async def test_gateway_stop_when_idle_is_ok(self):

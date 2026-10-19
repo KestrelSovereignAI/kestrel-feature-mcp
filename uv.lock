@@ -437,7 +437,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-mcp"
-version = "0.6.0"
+version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -451,6 +451,7 @@ dependencies = [
 
 [package.optional-dependencies]
 test = [
+    { name = "cryptography" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
@@ -459,6 +460,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "anyio", specifier = ">=4.7,<5" },
+    { name = "cryptography", marker = "extra == 'test'", specifier = ">=46" },
     { name = "docker", specifier = ">=7.1.0" },
     { name = "jsonschema", specifier = ">=4.26,<5" },
     { name = "kestrel-sovereign-sdk", extras = ["httpx2"], specifier = ">=0.39.2,<1" },

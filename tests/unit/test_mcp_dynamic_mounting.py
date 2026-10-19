@@ -283,11 +283,31 @@ class TestWrapper:
 
     @pytest.mark.asyncio
     async def test_execute_exception_is_failed(self):
-        caller = AsyncMock(side_effect=RuntimeError("transport down"))
+        caller = AsyncMock(side_effect=ConnectionError("transport down"))
         w = MCPToolWrapper(handle_name="h", real_name="fetch",
                            description="", input_schema=None, caller=caller)
         res = await w.execute()
         assert isinstance(res, dict) and res["status"] == "error" and "transport down" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_programming_errors_are_not_transport_failures(self):
+        async def broken_caller(name, arguments):
+            raise RuntimeError("broken caller invariant")
+        wrapper = MCPToolWrapper(handle_name="h", real_name="echo",
+                                 description="", input_schema=None, caller=broken_caller)
+        with pytest.raises(RuntimeError, match="broken caller invariant"):
+            await wrapper.execute()
+
+    @pytest.mark.asyncio
+    async def test_disconnected_native_connection_is_a_known_failure(self):
+        from kestrel_feature_mcp.connection import MCPConnection
+        connection = MCPConnection("http://127.0.0.1:1/mcp")
+        wrapper = MCPToolWrapper(handle_name="h", real_name="echo",
+                                 description="", input_schema=None, caller=connection.call_tool)
+        result = await wrapper.execute()
+        assert result["status"] == "error"
+        assert "not connected" in result["error"]
+        assert result.get("data", {}).get("execution_outcome") != "unknown"
 
     def test_schema_uses_input_schema_as_parameters(self):
         schema = {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}

@@ -1,0 +1,457 @@
+"""Remote loading uses native TLS/MCP and the existing governed mount surface."""
+
+import asyncio
+import json
+import socket
+from types import SimpleNamespace
+
+import httpcore2
+import httpx2
+import pytest
+
+from kestrel_feature_mcp.feature import MCPAgent
+from kestrel_sdk.tools.result import ToolResultStatus
+
+
+class RegistryHost:
+    def __init__(self, did="did:test:remote"):
+        self.agent_id = did
+        self.registered = {}
+        self.saved = {}
+
+    def register_dynamic_tools(self, owner, tools):
+        self.registered[owner] = list(tools)
+        return len(tools)
+
+    def unregister_dynamic_tools(self, owner):
+        return len(self.registered.pop(owner, []))
+
+    async def persist_feature_enablement(self, kind, name, state, *, actor, metadata):
+        self.saved[name] = {"name": name, "state": state, "metadata": metadata}
+
+    async def clear_feature_enablement(self, kind, name):
+        self.saved.pop(name, None)
+
+    async def get_enablement_deltas(self, kind):
+        return list(self.saved.values())
+
+
+@pytest.fixture
+async def remote_peer(mcp_http_server, monkeypatch):
+    peer = mcp_http_server
+    port = int(peer.url.split(":")[-1].split("/")[0])
+    state = SimpleNamespace(peer=peer, url=f"https://remote.example:{port}/mcp",
+                            dials=[], resolutions=[], answers=["8.8.8.8"])
+    def dns(host, requested_port, *, type, proto):
+        assert host == "remote.example" and requested_port == port
+        state.resolutions.append((host, requested_port))
+        return [(socket.AF_INET, type, proto, "", (answer, requested_port))
+                for answer in state.answers]
+    original = httpcore2.AnyIOBackend.connect_tcp
+    server_port = port
+    async def dial(backend, host, port, **kwargs):
+        state.dials.append((host, port))
+        assert host == "8.8.8.8" and port == server_port
+        return await original(backend, "127.0.0.1", port, **kwargs)
+    monkeypatch.setattr(socket, "getaddrinfo", dns)
+    monkeypatch.setattr(httpcore2.AnyIOBackend, "connect_tcp", dial)
+    monkeypatch.setenv("SSL_CERT_FILE", peer.settings["certificate_file"])
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "")
+    return state
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_remote_load_call_list_and_unload_need_no_docker(remote_peer, monkeypatch):
+    import docker
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Remote MCP touched Docker")
+    monkeypatch.setattr(docker, "from_env", forbidden)
+    host = RegistryHost()
+    feature = MCPAgent(host)
+    await feature.initialize()
+    try:
+        result = await feature.load_tool(remote_peer.url)
+        assert result.status is ToolResultStatus.OK, result.to_dict()
+        assert feature.manager is None
+        assert result.data["via"] == "remote"
+        assert result.data["protocol_version"] == "2026-07-28"
+        owner = next(iter(host.registered))
+        assert owner.startswith("mcp:remote:")
+        wrapper = next(t for t in host.registered[owner] if t._real_name == "echo")
+        called = await wrapper.execute(text="real remote side effect")
+        assert remote_peer.peer.witness == ["real remote side effect"]
+        assert called["status"] == "ok"
+        listed = await feature.list_tools()
+        assert listed.status is ToolResultStatus.OK
+        assert {t["name"] for t in listed.data["tools"]} == {"echo", "fail"}
+        assert listed.data["remotes"][0]["connected"]
+        assert (await feature.unload_tool(result.data["connection"])).status is ToolResultStatus.OK
+        assert not host.registered and not host.saved
+    finally:
+        await feature.shutdown()
+    assert remote_peer.dials and len(remote_peer.resolutions) == 1
+    assert set(remote_peer.peer.server_names) == {"remote.example"}
+    messages = []
+    for scope, raw in remote_peer.peer.requests:
+        if not raw:
+            continue
+        message = json.loads(raw)
+        headers = dict(scope["headers"])
+        assert headers[b"host"].decode() == remote_peer.url.split("/")[2]
+        assert headers[b"mcp-method"].decode() == message["method"]
+        assert b"mcp-session-id" not in headers
+        assert b"authorization" not in headers
+        if message["method"] == "tools/call":
+            assert headers[b"mcp-name"] == b"echo"
+        messages.append(message["method"])
+    assert messages == ["server/discover", "tools/list", "tools/call"]
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+@pytest.mark.parametrize("selector", [
+    "http://remote.example/mcp", "https://127.0.0.1/mcp", "https://169.254.169.254/mcp",
+    "https://user:password@remote.example/mcp", "https://[not-ipv6]/mcp",
+    "file:///etc/passwd", "https:relative", "https://remote.example/mcp#fragment",
+])
+async def test_unsafe_remote_endpoint_never_dials_or_mounts(remote_peer, selector):
+    feature = MCPAgent(RegistryHost())
+    await feature.initialize()
+    try:
+        result = await feature.load_tool(selector)
+        assert result.status is ToolResultStatus.ERROR
+        assert remote_peer.dials == remote_peer.resolutions == []
+        assert remote_peer.peer.witness == []
+        assert not feature._remote_connections and not feature.agent.registered
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+@pytest.mark.parametrize("answers", [["127.0.0.1"], ["8.8.8.8", "127.0.0.1"]])
+async def test_any_nonpublic_dns_answer_refuses_the_whole_endpoint(remote_peer, answers):
+    remote_peer.answers = answers
+    feature = MCPAgent(RegistryHost())
+    try:
+        result = await feature.load_tool(remote_peer.url)
+        assert result.status is ToolResultStatus.ERROR
+        assert "non-public" in result.error
+        assert remote_peer.resolutions and remote_peer.dials == []
+        assert not feature._remote_connections and not feature.agent.registered
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_dns_rebinding_after_connection_cannot_change_the_dial(remote_peer):
+    feature = MCPAgent(RegistryHost())
+    try:
+        assert (await feature.load_tool(remote_peer.url)).status is ToolResultStatus.OK
+        remote_peer.answers = ["127.0.0.1"]
+        wrapper = next(t for ts in feature.agent.registered.values() for t in ts if t._real_name == "echo")
+        result = await wrapper.execute(text="pinned request")
+        assert remote_peer.peer.witness == ["pinned request"]
+        assert result["status"] == "ok"
+        assert len(remote_peer.resolutions) == 1
+        assert {ip for ip, port in remote_peer.dials} == {"8.8.8.8"}
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "certificate_host": "wrong.example"}], indirect=True)
+async def test_wrong_certificate_fails_before_http_and_retires_owner(remote_peer):
+    feature = MCPAgent(RegistryHost())
+    try:
+        result = await feature.load_tool(remote_peer.url)
+        assert result.status is ToolResultStatus.ERROR
+        assert not feature._remote_connections and not feature.agent.registered
+        assert remote_peer.peer.requests == []
+        assert remote_peer.peer.witness == []
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [
+    {"tls": True, "http_status": 401}, {"tls": True, "http_status": 307},
+], indirect=True)
+async def test_auth_challenge_and_redirect_do_not_start_an_auth_flow_or_follow(remote_peer):
+    feature = MCPAgent(RegistryHost())
+    try:
+        result = await feature.load_tool(remote_peer.url)
+        assert result.status is ToolResultStatus.ERROR
+        assert not feature._remote_connections and not feature.agent.registered
+        assert remote_peer.peer.requests
+        assert all(scope["method"] == "POST" and scope["path"] == "/mcp"
+                   for scope, body in remote_peer.peer.requests)
+        assert {host for host, port in remote_peer.resolutions} == {"remote.example"}
+        assert remote_peer.peer.witness == []
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "empty_tools": True}], indirect=True)
+async def test_empty_remote_catalog_is_partial_but_connected(remote_peer):
+    feature = MCPAgent(RegistryHost())
+    try:
+        result = await feature.load_tool(remote_peer.url)
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["tools"] == []
+        listed = await feature.list_tools()
+        assert listed.status is ToolResultStatus.OK
+        assert listed.data["remotes"][0]["connected"]
+        assert listed.data["remotes"][0]["tool_count"] == 0
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_reload_retires_the_original_bound_caller(remote_peer):
+    host = RegistryHost()
+    feature = MCPAgent(host)
+    try:
+        first = await feature.load_tool(remote_peer.url)
+        old = next(t for ts in host.registered.values() for t in ts if t._real_name == "echo")
+        original = feature._remote_connections[first.data["connection"]].connection
+        second = await feature.load_tool(remote_peer.url)
+        assert second.data["connection"] == first.data["connection"]
+        assert original._task is None and not original.is_connected
+        result = await old.execute(text="stale")
+        assert remote_peer.peer.witness == []
+        assert result["status"] == "error" and "changed; rediscover" in result["error"]
+        current = next(t for ts in host.registered.values() for t in ts if t._real_name == "echo")
+        result = await current.execute(text="fresh")
+        assert remote_peer.peer.witness == ["fresh"]
+        assert result["status"] == "ok"
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_same_endpoint_has_independent_agent_owners(remote_peer):
+    first = MCPAgent(RegistryHost("did:test:first"))
+    second = MCPAgent(RegistryHost("did:test:second"))
+    try:
+        one = await first.load_tool(remote_peer.url)
+        two = await second.load_tool(remote_peer.url)
+        assert one.data["connection"] != two.data["connection"]
+        assert set(first.agent.registered).isdisjoint(second.agent.registered)
+        assert (await first.unload_tool(remote_peer.url)).status is ToolResultStatus.OK
+        wrapper = next(t for ts in second.agent.registered.values() for t in ts if t._real_name == "echo")
+        result = await wrapper.execute(text="other agent remains connected")
+        assert remote_peer.peer.witness == ["other agent remains connected"]
+        assert result["status"] == "ok"
+    finally:
+        await first.shutdown()
+        await second.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_saved_unauthenticated_endpoint_restores_and_explicit_unload_clears_it(remote_peer):
+    host = RegistryHost()
+    first, restored = MCPAgent(host), MCPAgent(host)
+    try:
+        await first.initialize()
+        one = await first.load_tool(remote_peer.url)
+        await first.shutdown()
+        assert host.saved and not host.registered
+        await restored.initialize()
+        await restored.post_all_features_loaded()
+        assert set(restored._remote_connections) == {one.data["connection"]}
+        assert len(host.registered) == 1
+        assert (await restored.unload_tool(remote_peer.url)).status is ToolResultStatus.OK
+        assert not host.saved and not restored._remote_connections
+    finally:
+        await first.shutdown()
+        await restored.shutdown()
+
+
+@pytest.mark.parametrize("metadata", [
+    {"mode": "remote", "url": "https://remote.example/mcp", "auth": "oauth"},
+    {"mode": "remote", "url": "https://remote.example/mcp", "auth": "none", "headers": {"Authorization": "secret"}},
+    {"mode": "remote", "url": None, "auth": "none"},
+])
+async def test_restore_rejects_unsupported_auth_or_invalid_saved_url(metadata, caplog):
+    host = RegistryHost()
+    host.saved["mcp-remote-forged"] = {"name": "mcp-remote-forged", "state": "enabled", "metadata": metadata}
+    feature = MCPAgent(host)
+    await feature.initialize()
+    try:
+        await feature.post_all_features_loaded()
+        assert not feature._remote_connections and not host.registered
+        assert "Refusing unsupported" in caplog.text or "Failed to restore remote" in caplog.text
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_wrong_agent_saved_identity_is_refused_before_dns(remote_peer, caplog):
+    first = MCPAgent(RegistryHost("did:test:first"))
+    second = MCPAgent(RegistryHost("did:test:second"))
+    try:
+        assert (await first.load_tool(remote_peer.url)).status is ToolResultStatus.OK
+        second.agent.saved = dict(first.agent.saved)
+        before = list(remote_peer.resolutions)
+        await second.post_all_features_loaded()
+        assert remote_peer.resolutions == before
+        assert not second._remote_connections and not second.agent.registered
+        assert "does not match this agent" in caplog.text
+    finally:
+        await first.shutdown()
+        await second.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_persistence_error_withdraws_handles_and_closes_transport(remote_peer):
+    host = RegistryHost()
+    async def broken(*args, **kwargs):
+        raise OSError("enablement storage is unavailable")
+    host.persist_feature_enablement = broken
+    feature = MCPAgent(host)
+    try:
+        result = await feature.load_tool(remote_peer.url)
+        assert result.status is ToolResultStatus.ERROR
+        assert "enablement storage" in result.error
+        assert not feature._remote_connections and not host.registered
+        assert remote_peer.peer.witness == []
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_unmount_failure_still_closes_transport_and_invalidates_caller(remote_peer):
+    host = RegistryHost()
+    feature = MCPAgent(host)
+    try:
+        result = await feature.load_tool(remote_peer.url)
+        wrapper = next(t for ts in host.registered.values() for t in ts if t._real_name == "echo")
+        connection = feature._remote_connections[result.data["connection"]].connection
+        original = host.unregister_dynamic_tools
+        def broken(owner):
+            raise OSError("registry unavailable")
+        host.unregister_dynamic_tools = broken
+        with pytest.raises(OSError, match="registry unavailable"):
+            await feature.unload_tool(result.data["connection"])
+        assert connection._task is None and not feature._remote_connections
+        failed = await wrapper.execute(text="must not execute")
+        assert remote_peer.peer.witness == []
+        assert failed["status"] == "error"
+        host.unregister_dynamic_tools = original
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "discover_delay": 0.2}], indirect=True)
+@pytest.mark.parametrize("shutdown", [False, True])
+async def test_abandoned_remote_startup_cannot_publish_or_leak_an_owner(remote_peer, shutdown):
+    feature = MCPAgent(RegistryHost())
+    loading = asyncio.create_task(feature.load_tool(remote_peer.url))
+    await asyncio.wait_for(remote_peer.peer.settings["discover_started"].wait(), 2)
+    connection = next(iter(feature._remote_connections.values())).connection
+    try:
+        if shutdown:
+            closing = asyncio.create_task(feature.shutdown())
+            result = await loading
+            await closing
+            assert result.status is ToolResultStatus.ERROR
+        else:
+            loading.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await loading
+        assert connection._task is None
+        assert not feature._remote_connections and not feature.agent.registered
+        assert not feature._remote_lifecycle
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_concurrent_reloads_leave_only_one_published_connection(remote_peer):
+    feature = MCPAgent(RegistryHost())
+    try:
+        results = await asyncio.gather(*(feature.load_tool(remote_peer.url) for _ in range(3)))
+        assert all(result.status is ToolResultStatus.OK for result in results)
+        assert len({result.data["connection"] for result in results}) == 1
+        assert len(feature._remote_connections) == len(feature.agent.registered) == 1
+        assert not feature._remote_lifecycle
+        wrapper = next(t for ts in feature.agent.registered.values() for t in ts if t._real_name == "echo")
+        result = await wrapper.execute(text="latest concurrent connection")
+        assert remote_peer.peer.witness == ["latest concurrent connection"]
+        assert result["status"] == "ok"
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_noop_host_write_is_not_reported_as_persisted(remote_peer):
+    host = RegistryHost()
+    async def noop(*args, **kwargs):
+        return None
+    host.persist_feature_enablement = noop
+    feature = MCPAgent(host)
+    try:
+        result = await feature.load_tool(remote_peer.url)
+        assert result.status is ToolResultStatus.ERROR
+        assert "did not retain" in result.error
+        assert not feature._remote_connections and not host.registered
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_noop_host_removal_cannot_claim_the_connection_will_stay_disabled(remote_peer):
+    host = RegistryHost()
+    feature = MCPAgent(host)
+    try:
+        loaded = await feature.load_tool(remote_peer.url)
+        async def noop(*args, **kwargs):
+            return None
+        host.clear_feature_enablement = noop
+        result = await feature.unload_tool(loaded.data["connection"])
+        assert result.status is ToolResultStatus.ERROR
+        assert "did not remove" in result.error
+        assert not feature._remote_connections and not host.registered
+        assert host.saved
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "reject_call": True}], indirect=True)
+async def test_native_rpc_rejection_before_execution_has_a_known_outcome(remote_peer):
+    feature = MCPAgent(RegistryHost())
+    try:
+        assert (await feature.load_tool(remote_peer.url)).status is ToolResultStatus.OK
+        wrapper = next(t for ts in feature.agent.registered.values() for t in ts if t._real_name == "echo")
+        result = await wrapper.execute(text="must-not-execute")
+        assert remote_peer.peer.witness == []
+        assert result["status"] == "error"
+        assert "rejected before execution" in result["error"]
+        assert result.get("data", {}).get("execution_outcome") != "unknown"
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "drop_tool_result": True}], indirect=True)
+async def test_lost_tool_response_is_unknown_and_is_never_replayed(remote_peer):
+    feature = MCPAgent(RegistryHost())
+    try:
+        assert (await feature.load_tool(remote_peer.url)).status is ToolResultStatus.OK
+        wrapper = next(t for ts in feature.agent.registered.values() for t in ts if t._real_name == "echo")
+        result = await wrapper.execute(text="executed-but-response-lost")
+        assert remote_peer.peer.witness == ["executed-but-response-lost"]
+        assert result["status"] == "error"
+        assert result["data"]["execution_outcome"] == "unknown"
+        assert "do not replay" in result["error"].lower()
+        calls = [json.loads(body) for scope, body in remote_peer.peer.requests
+                 if body and json.loads(body)["method"] == "tools/call"]
+        assert len(calls) == 1
+    finally:
+        # A real truncated response may also surface its original protocol
+        # error while the SDK owner exits. Rejoin only that finished owner;
+        # deadline and programming failures must still fail this test.
+        try:
+            await feature.shutdown()
+        except* httpx2.RemoteProtocolError:
+            await feature.shutdown()
+        assert not feature._remote_connections

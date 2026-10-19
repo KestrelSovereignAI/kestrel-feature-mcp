@@ -1,6 +1,6 @@
 # kestrel-feature-mcp
 
-Model Context Protocol (MCP) server management and tool bridging for Kestrel Sovereign. Discover servers in the official MCP Registry, Docker's catalog, or the bundled local catalog. Run Docker MCP gateways and custom container servers through the native MCP client.
+Model Context Protocol (MCP) server management and tool bridging for Kestrel Sovereign. Discover servers in the official MCP Registry, Docker's catalog, or the bundled local catalog. Connect to public HTTPS endpoints, Docker MCP gateways and custom container servers through the native MCP client.
 
 ## Installation
 
@@ -26,13 +26,52 @@ Once installed, the `MCPAgent` feature is automatically discovered by kestrel-so
 
 - `!mcp-gateway-start <servers>` — Start Docker MCP Gateway
 - `!mcp-gateway-stop` — Stop gateway
-- `!mcp-load <image>` — Load MCP server from Docker image
-- `!mcp-unload <container>` — Unload a container and remove its saved connection
+- `!mcp-load <HTTPS-URL|catalog-name|image>` — Connect a remote endpoint or load a Docker server
+- `!mcp-unload <connection|HTTPS-URL|container>` — Disconnect a server and remove its saved connection
 - `!mcp-list` — List running MCP servers
 - `!mcp-search <query>` — Search official registry server names
 - `!mcp-catalog` — List one page of the official registry
 - `!mcp-info <name>` — Inspect an official namespaced server and version
 - `!mcp-docker-catalog <query>` — Search Docker's catalog
+
+## Remote HTTPS servers
+
+Use the normal load/list/unload commands for an unauthenticated public server:
+
+```text
+!mcp-load https://learn.microsoft.com/api/mcp
+!mcp-list
+!mcp-unload https://learn.microsoft.com/api/mcp
+```
+
+Remote mode never probes the Docker daemon. Docker connects lazily on the first
+container operation. HTTPS endpoints use the SDK's public-address validation
+and DNS-pinned native transport, including certificate/hostname verification;
+redirects and environment proxy routing are refused. URL credentials, fragments,
+non-public addresses and mixed public/private DNS answers are rejected. Container
+command arguments are invalid for a remote endpoint.
+
+Load results include the canonical endpoint, DID-bound connection identifier,
+negotiated `protocol_version`, mounted count and `persistent` status. Unload
+accepts that identifier or the canonical endpoint returned by load. Enabled
+connections are restored from the host's agent-scoped enablement store. Hosts
+without that capability explicitly report that connections last for the session.
+Saved state is read back before persistence or removal is reported. A host
+that silently ignores an enablement write fails explicitly. Storage errors
+fail the operation; a failed remote load withdraws handles and closes its transport. Reload, unload and shutdown invalidate old bound callers.
+Configuration changes for one remote connection are serialized without locking
+ordinary calls or unrelated connections.
+
+This release supports `auth="none"` only. It does not accept token headers or
+start OAuth registration/consent when a server challenges for authentication.
+Saved authentication modes or fields it cannot implement are refused. Vendor
+OAuth, encrypted grants and refresh after restart remain part of
+[Kestrel #3679](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3679),
+including the native SDK gate in
+[#3690](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3690).
+Connecting to a public documentation server is not the three-vendor OAuth
+acceptance experiment. Remote write scopes remain gated on
+[#596](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/596).
 
 ## Calling tools
 
@@ -142,7 +181,13 @@ newer revision is tracked in
 [Kestrel #3683](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3683).
 Features requiring newer capabilities must check the negotiated connection.
 Gateway server lists describe requested configuration; observed tools do not
-prove readiness of every requested server.
+prove readiness of every requested server. A call that loses its response or
+times out has an unconfirmed execution outcome, because the server may have
+already produced effects. Its tool error carries `data.execution_outcome="unknown"`.
+The connection does not replay that call. A retry needs policy approval and an
+explicit idempotency or safe-repeat guarantee; an error is not evidence that
+nothing executed. Standard pre-execution JSON-RPC rejections retain their
+original error. Caller cancellation remains cancellation.
 Tool discovery follows pagination and fails on repeated cursors. Negotiation
 uses the connection deadline, then discovery uses the whole-call deadline.
 Cancelled startup joins its transport owner before returning. Shutdown has its
@@ -169,12 +214,11 @@ The current unload result does not distinguish saved-configuration removal
 from live-process removal; outcome reporting is tracked in
 [#26](https://github.com/KestrelSovereignAI/kestrel-feature-mcp/issues/26).
 Shut down the old feature before upgrading to release the processes it owns.
-Hosts expose their agent DID through `agent_id`. Missing required Python
-dependencies, invalid identities and unexpected initialization failures stop
-startup. An unavailable local Docker daemon disables local Docker operations;
-it is handled separately from an invalid installation. This includes Docker SDK
-errors and its Requests transport failures during connection or ping. Other
-implementation errors still fail startup. Saved container connections retain
+Hosts expose their agent DID through `agent_id`; invalid identities fail startup.
+The first container operation acquires the Docker client off the event loop.
+An unavailable local daemon disables that operation and leaves remote mode
+available. Missing Docker dependencies and programming errors propagate at
+that first container use, independently of typed daemon connection failures. Saved container connections retain
 their container mode when restored, even if the Docker catalog changes. Server
 selectors and image references reject surrounding whitespace before routing.
 

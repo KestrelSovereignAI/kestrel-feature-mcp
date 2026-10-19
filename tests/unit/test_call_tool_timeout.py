@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kestrel_feature_mcp.connection import MCPConnection
+from kestrel_feature_mcp.connection import MCPConnection, MCPCallOutcomeUnknownError
 from kestrel_feature_mcp.manager import MCPGatewayManager, MCPToolManager
 
 
@@ -26,8 +26,9 @@ async def test_call_timeout_uses_the_real_connection(kind, mcp_http_server):
             manager.connection = connection
             manager.tools = {"echo": SimpleNamespace()}
             call = manager.call_tool("echo", {"text": "slow"})
-        with pytest.raises(TimeoutError):
+        with pytest.raises(MCPCallOutcomeUnknownError, match="execution outcome is unknown") as caught:
             await call
+        assert isinstance(caught.value.__cause__, TimeoutError)
         assert connection.is_connected
     finally:
         await connection.close()
