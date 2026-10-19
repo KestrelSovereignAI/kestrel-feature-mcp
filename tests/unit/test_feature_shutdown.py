@@ -293,7 +293,7 @@ async def test_shutdown_rechecks_each_docker_producer_await_and_discloses_saved_
     entered, release = asyncio.Event(), asyncio.Event()
     name = container_name_for_image("custom:latest", host.agent_id)
     advertised = [types.Tool(name="echo", description="", inputSchema={"type": "object", "properties": {}})]
-    writes, mounted, removed = [], [], []
+    writes, mounted, removed, discoveries = [], [], [], []
 
     async def checkpoint(current):
         if stage == current:
@@ -306,6 +306,7 @@ async def test_shutdown_rechecks_each_docker_producer_await_and_discloses_saved_
         return name
 
     async def discover(*args):
+        discoveries.append(args[0])
         await checkpoint("discover")
         return advertised
 
@@ -375,6 +376,7 @@ async def test_shutdown_rechecks_each_docker_producer_await_and_discloses_saved_
         if producer == "container":
             assert removed == [name] and not manager.owned_containers
             manager.aclose.assert_awaited_once()
+            assert discoveries == ([] if stage == "create" else [name])
         else:
             gateway.stop.assert_awaited_once()
         if stage == "persist":
@@ -465,3 +467,16 @@ async def test_explicit_gateway_unload_remains_available_while_feature_is_closin
     assert result.status is ToolResultStatus.OK, result.to_dict()
     gateway.stop.assert_awaited_once()
     assert not host.saved and feature.gateway_manager is None
+
+
+async def test_already_closing_start_is_refused_without_waiting_for_docker_cleanup():
+    feature = MCPAgent(RegistryHost())
+    await feature.initialize()
+    feature._closing = True
+    try:
+        async with feature._docker_operations:
+            result = await asyncio.wait_for(feature.gateway_start("time"), 1)
+            assert result.status is ToolResultStatus.ERROR
+            assert "shutting down" in result.error
+    finally:
+        await feature.shutdown()
