@@ -17,6 +17,7 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sdk.security.exceptions import SSRFError
 from kestrel_sdk.security.outbound import assert_safe_url
+from kestrel_sdk.storage.database import DatabaseError
 from .connection import MCPConnection, MCP_CONNECTION_ERRORS, bind_tool_caller, connection_lifecycle, require_owner_did
 from .constants import SESSION_CONNECT_TIMEOUT_DEFAULT
 from .remote import RemoteMCPServer, RemoteMCPError, connection_error_message, remote_name_for_url, remote_owner
@@ -123,7 +124,14 @@ class MCPAgent(Feature):
         )
 
     async def initialize(self):
-        self._owner_did = require_owner_did(self.agent.agent_id)
+        owner_did = require_owner_did(self.agent.agent_id)
+        if self._closing:
+            # A soft disable retains this instance. Finish any failed cleanup
+            # before reopening it; live repeated initialization keeps custody.
+            await self.shutdown()
+            self.manager = None
+        self._owner_did = owner_did
+        self._closing = False
         logger.info("MCPAgent initialized; Docker connects only for container operations.")
 
     def _connection_owner_did(self) -> str:
@@ -1246,9 +1254,10 @@ class MCPAgent(Feature):
 
         Reads the persisted ``mcp_server`` enablement deltas (foundation) and
         re-starts the gateway / re-loads containers so an ``enable`` survives a
-        restart. Best-effort and fully guarded: a host without the enablement
-        store, or without Docker MCP, simply restores nothing — startup is never
-        blocked.
+        restart. A host without the enablement store restores nothing. Known
+        database failures are reported without blocking unrelated remote rows
+        or later gateway/container restore. Unexpected remote errors and
+        cancellation propagate.
         """
         if not self._supports_enablement_persistence():
             return
@@ -1273,9 +1282,13 @@ class MCPAgent(Feature):
                     or set(metadata) - {"mode", "url", "auth"}):
                 logger.error("Refusing unsupported authentication/configuration for remote MCP %s", saved["name"])
                 continue
-            result = await self._load_via_remote(metadata.get("url"), expected_name=saved["name"])
-            if result.status.value == "error":
-                logger.error("Failed to restore remote MCP %s: %s", saved["name"], result.error)
+            try:
+                result = await self._load_via_remote(metadata.get("url"), expected_name=saved["name"])
+                if result.status.value == "error":
+                    logger.error("Failed to restore remote MCP %s: %s", saved["name"], result.error)
+            except* DatabaseError as errors:
+                logger.error("Failed to restore remote MCP %s: %s",
+                             saved["name"], connection_error_message(errors))
 
         if gateway_servers and check_docker_mcp_available():
             try:

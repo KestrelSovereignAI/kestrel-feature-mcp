@@ -113,6 +113,39 @@ async def test_remote_load_call_list_and_unload_need_no_docker(remote_peer, monk
 
 
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_same_instance_reenable_restores_remote_and_retires_old_callers(remote_peer):
+    host = RegistryHost()
+    feature = MCPAgent(host)
+    await feature.initialize()
+    try:
+        loaded = await feature.load_tool(remote_peer.url)
+        assert loaded.status is ToolResultStatus.OK
+        name = loaded.data["connection"]
+        owner = "mcp:remote:" + name
+        old_connection = feature._remote_connections[name].connection
+        old_wrapper = next(t for t in host.registered[owner] if t._real_name == "echo")
+        # Repeated initialization of a live instance must preserve custody.
+        await feature.initialize()
+        assert feature._remote_connections[name].connection is old_connection
+        await feature.shutdown()
+        assert not old_connection.is_connected and not host.registered
+        assert name in host.saved
+        await feature.initialize()
+        await feature.post_all_features_loaded()
+        assert set(feature._remote_connections) == {name}
+        assert feature._remote_connections[name].connection is not old_connection
+        rejected = await old_wrapper.execute(text="stale-before-reenable")
+        assert remote_peer.peer.witness == []
+        assert rejected["status"] == "error"
+        wrapper = next(t for t in host.registered[owner] if t._real_name == "echo")
+        result = await wrapper.execute(text="after-same-instance-reenable")
+        assert remote_peer.peer.witness == ["after-same-instance-reenable"]
+        assert result["status"] == "ok"
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
 @pytest.mark.parametrize("selector", [
     "http://remote.example/mcp", "https://127.0.0.1/mcp", "https://169.254.169.254/mcp",
     "https://user:password@remote.example/mcp", "https://[not-ipv6]/mcp",
@@ -565,13 +598,18 @@ async def test_catalog_is_not_callable_before_persistence_ack(remote_peer, shutd
 
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
 @pytest.mark.parametrize("readonly", [False, True])
-async def test_restore_reads_existing_enablement_without_rewriting_it(remote_peer, tmp_path, readonly):
+@pytest.mark.parametrize("read_failure", [False, pytest.param(True, id="read-fails")])
+async def test_restore_reads_existing_enablement_without_rewriting_it(
+    remote_peer, tmp_path, readonly, read_failure, monkeypatch, caplog,
+):
+    from kestrel_sdk.storage.database import QueryError
     from kestrel_feature_mcp.manager import container_name_for_image
     from kestrel_feature_mcp.remote import remote_name_for_url
     host = RegistryHost()
     remote_name = remote_name_for_url(remote_peer.url, host.agent_id)
     rows = [
         (remote_name, "enabled", {"mode": "remote", "url": remote_peer.url, "auth": "none"}),
+        ("gateway-next", "enabled", {"mode": "gateway"}),
         (container_name_for_image("org/img:1", host.agent_id), "enabled",
          {"mode": "container", "image": "org/img:1", "args": None}),
     ]
@@ -582,7 +620,16 @@ async def test_restore_reads_existing_enablement_without_rewriting_it(remote_pee
                           [(name, state, json.dumps(metadata)) for name, state, metadata in rows])
     store = sqlite3.connect(f"{path.as_uri()}?mode={'ro' if readonly else 'rw'}", uri=True)
     writes = []
+    reads = 0
     async def read(kind):
+        nonlocal reads
+        reads += 1
+        if read_failure and reads == 2:
+            # Real SQL failure, exposed through the SDK's backend error contract.
+            try:
+                store.execute("SELECT * FROM unavailable_enablement_table")
+            except sqlite3.Error as error:
+                raise QueryError(str(error)) from error
         return [{"name": name, "state": state, "metadata": json.loads(metadata)}
                 for name, state, metadata in store.execute("SELECT name, state, metadata FROM enablement ORDER BY rowid")]
     async def persist(kind, name, state, *, actor, metadata):
@@ -594,20 +641,94 @@ async def test_restore_reads_existing_enablement_without_rewriting_it(remote_pee
     host.persist_feature_enablement = persist
     feature = MCPAgent(host)
     feature.manager = SimpleNamespace(owner_did=host.agent_id, owned_containers={}, aclose=AsyncMock())
+    monkeypatch.setattr("kestrel_feature_mcp.feature.check_docker_mcp_available", lambda: True)
+    feature.gateway_start = AsyncMock()
     feature._load_via_container = AsyncMock()
     try:
         await feature.initialize()
         await feature.post_all_features_loaded()
-        wrapper = next(t for ts in host.registered.values() for t in ts if t._real_name == "echo")
-        result = await wrapper.execute(text="restored-from-existing-row")
-        assert remote_peer.peer.witness == ["restored-from-existing-row"]
-        assert result["status"] == "ok"
+        if read_failure:
+            assert not host.registered and not feature._remote_connections
+            assert remote_peer.peer.witness == []
+            assert "Failed to restore remote MCP " + remote_name in caplog.text
+            assert "unavailable_enablement_table" in caplog.text
+        else:
+            wrapper = next(t for ts in host.registered.values() for t in ts if t._real_name == "echo")
+            result = await wrapper.execute(text="restored-from-existing-row")
+            assert remote_peer.peer.witness == ["restored-from-existing-row"]
+            assert result["status"] == "ok"
+        # These spies prove branch ordering; separate Docker suites prove I/O.
+        feature.gateway_start.assert_awaited_once_with("gateway-next")
         feature._load_via_container.assert_awaited_once_with("org/img:1", None)
         assert writes == []
         assert [(r["name"], r["state"], r["metadata"]) for r in await read("mcp_server")] == rows
     finally:
         await feature.shutdown()
         store.close()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+async def test_reenable_does_not_abandon_failed_shutdown_custody(remote_peer, monkeypatch):
+    feature = MCPAgent(RegistryHost())
+    await feature.initialize()
+    loaded = await feature.load_tool(remote_peer.url)
+    assert loaded.status is ToolResultStatus.OK
+    name = loaded.data["connection"]
+    connection = feature._remote_connections[name].connection
+    close = connection.close
+
+    async def cannot_close():
+        raise RuntimeError("Owned transport close has not settled")
+
+    monkeypatch.setattr(connection, "close", cannot_close)
+    try:
+        with pytest.raises(RuntimeError, match="has not settled"):
+            await feature.shutdown()
+        with pytest.raises(RuntimeError, match="has not settled"):
+            await feature.initialize()
+        assert feature._remote_connections[name].connection is connection
+        assert feature._closing and not feature.agent.registered
+        monkeypatch.setattr(connection, "close", close)
+        await feature.initialize()
+        assert not connection.is_connected and not feature._remote_connections
+        await feature.post_all_features_loaded()
+        wrapper = next(t for ts in feature.agent.registered.values() for t in ts if t._real_name == "echo")
+        result = await wrapper.execute(text="after-custody-settled")
+        assert remote_peer.peer.witness == ["after-custody-settled"]
+        assert result["status"] == "ok"
+    finally:
+        monkeypatch.setattr(connection, "close", close)
+        await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_restore_does_not_suppress_programming_errors_or_cancellation(remote_peer, error_type):
+    from kestrel_feature_mcp.remote import remote_name_for_url
+
+    host = RegistryHost()
+    name = remote_name_for_url(remote_peer.url, host.agent_id)
+    host.saved[name] = {"name": name, "state": "enabled", "metadata": {
+        "mode": "remote", "url": remote_peer.url, "auth": "none"}}
+    reads = 0
+
+    async def read(kind):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise error_type("Unexpected restore interruption")
+        return list(host.saved.values())
+
+    host.get_enablement_deltas = read
+    feature = MCPAgent(host)
+    await feature.initialize()
+    try:
+        with pytest.raises(error_type, match="Unexpected restore interruption"):
+            await feature.post_all_features_loaded()
+        assert not feature._remote_connections and not host.registered
+        assert remote_peer.peer.witness == []
+    finally:
+        await feature.shutdown()
 
 
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
