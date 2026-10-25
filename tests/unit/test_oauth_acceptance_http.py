@@ -162,6 +162,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             resource=resource_id, issuer=state.issuer, access_token=state.access_token,
             metadata=resource_url.replace("/mcp", "/.well-known/oauth-protected-resource/mcp"),
             challenge_scope=options.get("challenge_scope", "read"),
+            denied_authenticated_get=options.get("denied_authenticated_get"),
         )
         if options.get("redirect_resource"):
             resource_peer.settings["oauth"]["redirect_to"] = resource_url
@@ -307,6 +308,18 @@ async def test_human_consent_wait_is_separate_from_each_network_exchange(oauth_p
     result = await drive(oauth_peers, network_timeout=2)
     assert result["stage"] == "authorized_and_discovered" and result["grant_obtained"]
     assert oauth_peers.requests.count(("POST", "/token")) == 1
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
+@pytest.mark.parametrize("oauth_peers", [{"denied_authenticated_get": 401},
+                                         {"denied_authenticated_get": 403}], indirect=True)
+async def test_completed_exchange_does_not_hide_resource_authorization_denial(oauth_peers):
+    with pytest.raises(GrantRejected, match="resource rejected the completed initial authorization"):
+        await drive(oauth_peers)
+    assert oauth_peers.requests.count(("POST", "/token")) == 1
+    assert len(oauth_peers.browser_requests) == 1
+    assert all(not body for _, body in oauth_peers.resource.requests)
+    assert oauth_peers.resource.witness == []
 
 
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)

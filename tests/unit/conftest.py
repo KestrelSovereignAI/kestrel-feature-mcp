@@ -132,6 +132,9 @@ async def mcp_http_server(request, tmp_path):
                 return await Response(status_code=401, headers={
                     "WWW-Authenticate": challenge,
                 })(scope, receive, send)
+            if scope["method"] == "GET" and oauth.get("denied_authenticated_get"):
+                requests.append((scope, b""))
+                return await Response(status_code=oauth["denied_authenticated_get"])(scope, receive, send)
         if settings.get("http_status"):
             body = bytearray()
             while True:
