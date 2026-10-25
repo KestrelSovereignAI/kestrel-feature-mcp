@@ -107,7 +107,8 @@ class LoopbackCallback:
                 or "transfer-encoding" in headers
                 or any(len(values) != 1 for values in query.values())
                 or not self._state or len(query.get("state", [])) != 1
-                or not secrets.compare_digest(query["state"][0], self._state)
+                or not secrets.compare_digest(
+                    query["state"][0].encode("utf-8"), self._state.encode("utf-8"))
                 or query.get("iss") != [self.issuer]):
             return 400, b"Callback rejected."
         assert self._result is not None

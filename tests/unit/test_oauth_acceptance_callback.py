@@ -65,7 +65,7 @@ async def test_listener_must_be_owned_before_arming_and_busy_port_never_moves(re
 
 
 @pytest.mark.parametrize("change", [
-    "state", "issuer", "missing-issuer", "code", "duplicate-code", "duplicate-state",
+    "state", "state-unicode", "state-invalid-utf8", "issuer", "missing-issuer", "code", "duplicate-code", "duplicate-state",
     "path", "host", "duplicate-host", "body", "transfer", "absolute", "fragment",
     "malformed-query",
 ])
@@ -75,6 +75,10 @@ async def test_invalid_http_callback_cannot_consume_the_valid_attempt(redirect_u
     headers = None
     if change == "state":
         fields["state"] = "other-attempt"
+    elif change == "state-unicode":
+        fields["state"] = "caf\u00e9"
+    elif change == "state-invalid-utf8":
+        target = "/oauth/callback?" + urlencode(fields).replace("state=" + STATE, "state=%FF")
     elif change == "issuer":
         fields["iss"] = "https://other-issuer.example"
     elif change == "missing-issuer":
