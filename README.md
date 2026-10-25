@@ -183,6 +183,12 @@ relaxed to accept it.
 
 ## Development
 
+The [manual vendor OAuth acceptance spike](tests/oauth_acceptance/README.md)
+drives initial consent with the native SDK and a published Kestrel client
+identity. It has separate discovery and authorization modes and keeps tokens
+in memory. It does not enable production OAuth connections or establish refresh
+after restart.
+
 ```bash
 uv pip install -e ".[test]"
 uv run pytest
