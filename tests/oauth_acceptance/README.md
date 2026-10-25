@@ -81,7 +81,8 @@ cross the cap before it is refused; this is not a claim about total process
 memory or decompression allocation. The final protocol connection is owned by
 the existing `MCPConnection`, using the obtained bearer grant under the same
 role policy. The SDK's interactive OAuth provider is confined to acquisition:
-its per-response lock cannot serialize concurrent protocol requests and replies.
+holding its auth-flow lock across each response can deadlock a request waiting
+for a concurrent protocol reply that needs the same lock.
 The resource phase performs no refresh or renewed consent. This spike does not
 establish an in-memory refresh or restart contract.
 No default client registration, borrowed product identity, token header input

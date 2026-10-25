@@ -221,7 +221,7 @@ async def run(selection: GrantSelection, *, mode: str, browser_timeout: float,
         # Grant acquisition is complete. The resource phase uses the obtained
         # bearer grant with the same role guard, without an interactive OAuth
         # flow around concurrent protocol requests. The SDK's OAuth provider
-        # holds its discovery lock while awaiting each HTTP response; retaining
+        # holds its auth-flow lock while awaiting each HTTP response; retaining
         # it here deadlocks a server ping against the request it is checking.
         connection = MCPConnection(
             server, headers={"Authorization": "Bearer " + tokens.access_token},

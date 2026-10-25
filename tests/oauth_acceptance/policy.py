@@ -12,6 +12,7 @@ from mcp.client.auth.utils import create_client_info_from_metadata_url
 from mcp.shared.auth import OAuthClientInformationFull, OAuthMetadata, OAuthToken, ProtectedResourceMetadata
 from mcp.shared.auth_utils import check_resource_allowed, resource_url_from_server_url
 from mcp_types import JSONRPCError, JSONRPCResponse, jsonrpc_message_adapter
+from pydantic import ValidationError
 
 DEFAULT_RESPONSE_MAX_BYTES = 65536
 
@@ -102,8 +103,11 @@ class GrantPolicy:
             if request.method in {"GET", "DELETE"}:
                 return
             if request.method == "POST":
-                message = json.loads(await request.aread())
-                envelope = jsonrpc_message_adapter.validate_python(message)
+                try:
+                    message = json.loads(await request.aread())
+                    envelope = jsonrpc_message_adapter.validate_python(message)
+                except (json.JSONDecodeError, ValidationError):
+                    raise GrantRejected("Discovery requests require a valid JSON-RPC envelope") from None
                 if ("method" not in message and isinstance(envelope, (JSONRPCResponse, JSONRPCError))
                         and set(message) <= type(envelope).model_fields.keys()):
                     # Standard SDK replies (for example a server ping) do not

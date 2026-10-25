@@ -199,6 +199,16 @@ async def test_a_response_shape_cannot_hide_an_unapproved_operation(selection, f
                                            json={"jsonrpc": "2.0", "id": 7, **fields}))
 
 
+@pytest.mark.parametrize("body", [
+    b"not-json", b"[]", b'{"jsonrpc":"1.0","id":7,"result":{}}',
+    b'{"jsonrpc":"2.0","id":{},"result":{}}',
+])
+async def test_invalid_rpc_envelopes_have_a_safe_policy_error(selection, body):
+    policy = GrantPolicy(selection)
+    with pytest.raises(GrantRejected, match="valid JSON-RPC envelope"):
+        await policy.request(httpx2.Request("POST", selection.server_url, content=body))
+
+
 @pytest.mark.parametrize("change", ["client_id", "resource", "client_secret", "redirect_uri",
                                     "scope", "client_assertion", "audience"])
 async def test_token_request_cannot_change_the_native_binding(selection, change):
