@@ -11,6 +11,7 @@ import httpx2
 from mcp.client.auth.utils import create_client_info_from_metadata_url
 from mcp.shared.auth import OAuthClientInformationFull, OAuthMetadata, OAuthToken, ProtectedResourceMetadata
 from mcp.shared.auth_utils import check_resource_allowed, resource_url_from_server_url
+from mcp_types import JSONRPCError, JSONRPCResponse, jsonrpc_message_adapter
 
 DEFAULT_RESPONSE_MAX_BYTES = 65536
 
@@ -102,6 +103,12 @@ class GrantPolicy:
                 return
             if request.method == "POST":
                 message = json.loads(await request.aread())
+                envelope = jsonrpc_message_adapter.validate_python(message)
+                if ("method" not in message and isinstance(envelope, (JSONRPCResponse, JSONRPCError))
+                        and set(message) <= type(envelope).model_fields.keys()):
+                    # Standard SDK replies (for example a server ping) do not
+                    # initiate a tool call. Keep the exact envelope unchanged.
+                    return
                 if message.get("method") in {
                     "server/discover", "initialize", "notifications/initialized", "tools/list",
                     "ping", "notifications/cancelled",
@@ -238,7 +245,8 @@ class GuardedAuth(httpx2.Auth):
 
     The original requests and responses pass through unchanged. The SDK owns
     discovery, PKCE, callback validation, token exchange and authentication.
-    This guard also follows the same provider into the production connection.
+    The resource phase retains this policy with its obtained bearer grant;
+    interactive grant acquisition is separate from concurrent MCP traffic.
     """
 
     def __init__(self, provider: httpx2.Auth, policy: GrantPolicy):

@@ -79,9 +79,11 @@ human consent deadline. `response_max_bytes` caps raw response streaming before
 buffering and also the accepted decoded metadata size. A response chunk can
 cross the cap before it is refused; this is not a claim about total process
 memory or decompression allocation. The final protocol connection is owned by
-the existing `MCPConnection`. A separate issuer's refresh during that connection
-is refused by its resource-pinned transport; this spike does not establish an
-in-memory refresh or restart contract.
+the existing `MCPConnection`, using the obtained bearer grant under the same
+role policy. The SDK's interactive OAuth provider is confined to acquisition:
+its per-response lock cannot serialize concurrent protocol requests and replies.
+The resource phase performs no refresh or renewed consent. This spike does not
+establish an in-memory refresh or restart contract.
 No default client registration, borrowed product identity, token header input
 or scope expansion substitutes for the selected grant.
 
@@ -121,6 +123,10 @@ With MCP SDK 2.3.0 on 2026-10-25:
 Vendor references: [Notion client guide](https://developers.notion.com/guides/mcp/build-mcp-client),
 [Linear MCP](https://linear.app/docs/mcp),
 [GitHub host integration](https://github.com/github/github-mcp-server/blob/main/docs/host-integration.md).
+The configured client probes Linear's `/mcp` endpoint and stops on GitHub's
+missing CIMD advertisement. The `/mcp/readonly` challenge and GitHub's S256
+advertisement above were separate public metadata observations; the client
+result does not establish those additional checks.
 Keep the three-vendor acceptance item open until the real account flows and
 their limitations are recorded. Remote write scopes remain gated on
 [#596](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/596).
@@ -132,6 +138,11 @@ resource and authorization servers with real certificates and PKCE checking,
 then exercises the same production MCP connection and loopback callback.
 The authenticated bootstrap GET reaches the SDK's real modern or handshake-era
 transport (405 or 406); native discovery/negotiation then proves readiness.
+An independent streaming peer proves the bootstrap closes after headers rather
+than waiting for event-stream EOF. A native SDK server ping during tool listing
+proves that concurrent method-less JSON-RPC replies reach the server without
+re-entering the interactive OAuth provider. The browser launcher selects one
+controller and fails if it fails; it does not try another browser implicitly.
 It checks disclosure before result shapes: a scope or identity refusal must
 produce no browser/token request, and an overgranted token must never reach
 the resource. A corrupted public SDK request is stopped before the independent

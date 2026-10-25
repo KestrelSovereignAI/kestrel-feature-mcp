@@ -11,7 +11,7 @@ from mcp_types.version import LATEST_PROTOCOL_VERSION
 from mcp.server import MCPServer
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.shared.exceptions import MCPError
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from tests.http_peers import serve_http
 
 
@@ -35,6 +35,11 @@ class HTTPMCPServer:
 async def mcp_http_server(request, tmp_path):
     settings = deepcopy(getattr(request, "param", {}))
     settings["discover_started"] = asyncio.Event()
+    settings["standalone_ready"] = asyncio.Event()
+    settings["ping_requested"] = asyncio.Event()
+    settings["ping_answered"] = asyncio.Event()
+    settings["bootstrap_body_started"] = asyncio.Event()
+    settings["release_bootstrap_body"] = asyncio.Event()
     settings["input_witness_file"] = tmp_path / "input-execution-witness"
 
     class TestServer(MCPServer):
@@ -86,6 +91,12 @@ async def mcp_http_server(request, tmp_path):
             return types.InputRequiredResult(input_requests=requests, request_state="peer-work-started")
         if ctx.method == "tools/call" and settings.get("reject_call"):
             raise MCPError(types.INVALID_PARAMS, "Tool arguments rejected before execution")
+        if ctx.method == "tools/list" and settings.get("server_ping"):
+            async with asyncio.timeout(3):
+                await settings["standalone_ready"].wait()
+                settings["ping_requested"].set()
+                await ctx.session.send_ping()
+            settings["ping_answered"].set()
         if ctx.method == "server/discover":
             settings["discover_started"].set()
             await asyncio.sleep(settings.get("discover_delay", 0))
@@ -135,6 +146,17 @@ async def mcp_http_server(request, tmp_path):
             if scope["method"] == "GET" and oauth.get("denied_authenticated_get"):
                 requests.append((scope, b""))
                 return await Response(status_code=oauth["denied_authenticated_get"])(scope, receive, send)
+            if (settings.get("bootstrap_event_stream") and scope["method"] == "GET"
+                    and headers.get(b"accept") == b"application/json"):
+                async def held_event_stream():
+                    settings["bootstrap_body_started"].set()
+                    yield b": keep-alive\n\n"
+                    await settings["release_bootstrap_body"].wait()
+                try:
+                    return await StreamingResponse(held_event_stream(), media_type="text/event-stream")(
+                        scope, receive, send)
+                finally:
+                    requests.append((scope, b""))
         if settings.get("http_status"):
             body = bytearray()
             while True:
@@ -175,6 +197,9 @@ async def mcp_http_server(request, tmp_path):
                     await send({"type": "http.response.body", "body": b"{", "more_body": True})
                     raise ConnectionResetError("Test peer lost the response after executing its tool")
             await send(message)
+            if (message["type"] == "http.response.start" and scope["method"] == "GET"
+                    and dict(message.get("headers", [])).get(b"content-type", b"").startswith(b"text/event-stream")):
+                settings["standalone_ready"].set()
             if (message["type"] == "http.response.start" and body
                     and b'"initialize"' in body):
                 await asyncio.sleep(settings.get("initialize_body_delay", 0))

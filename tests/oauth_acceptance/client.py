@@ -85,7 +85,7 @@ async def open_authorization(url: str):
     """Own and join the launcher; the user's browser retains its normal lifetime."""
     child = await asyncio.create_subprocess_exec(
         sys.executable, "-I", "-c",
-        "import sys,webbrowser;sys.exit(0 if webbrowser.open(sys.argv[1],new=1) else 1)",
+        "import sys,webbrowser;sys.exit(0 if webbrowser.get().open(sys.argv[1],new=1) else 1)",
         url, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -202,24 +202,30 @@ async def run(selection: GrantSelection, *, mode: str, browser_timeout: float,
             follow_redirects=False, trust_env=False, timeout=network_timeout,
         ) as client:
             try:
-                response = await client.get(selection.server_url, headers={
+                async with client.stream("GET", selection.server_url, headers={
                     "Accept": "application/json", "MCP-Protocol-Version": LATEST_PROTOCOL_VERSION,
-                })
+                }) as response:
+                    # Headers complete this OAuth probe. Do not consume a
+                    # long-lived resource stream before native MCP discovery.
+                    if response.status_code in {401, 403}:
+                        raise GrantRejected("The resource rejected the completed initial authorization")
             except AuthorizationReady:
                 return {**public, "stage": "authorization_ready", "grant_obtained": False,
                         "scope": "Native discovery and request validation only; no vendor consent"}
             # This GET drives OAuth, not MCP version negotiation. A handshake
             # peer can answer 406 because this request does not open SSE.
             # The canonical connection below must prove protocol readiness.
-            if response.status_code in {401, 403}:
-                raise GrantRejected("The resource rejected the completed initial authorization")
         tokens = await storage.get_tokens()
         if tokens is None:
             raise GrantRejected("No native OAuth token exchange completed")
-        # Reuse the feature's sole protocol implementation and lifecycle owner.
-        # The same public auth guard/provider retains the in-memory grant.
+        # Grant acquisition is complete. The resource phase uses the obtained
+        # bearer grant with the same role guard, without an interactive OAuth
+        # flow around concurrent protocol requests. The SDK's OAuth provider
+        # holds its discovery lock while awaiting each HTTP response; retaining
+        # it here deadlocks a server ping against the request it is checking.
         connection = MCPConnection(
-            server, auth=auth, connect_timeout=connect_timeout,
+            server, headers={"Authorization": "Bearer " + tokens.access_token},
+            auth=GuardedAuth(httpx2.Auth(), policy), connect_timeout=connect_timeout,
             call_timeout=call_timeout, close_timeout=close_timeout,
         )
         try:
