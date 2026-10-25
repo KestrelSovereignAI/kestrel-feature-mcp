@@ -1,15 +1,18 @@
 """Real HTTP fixtures shared by native MCP lifecycle and deadline tests."""
 
 import asyncio
+from copy import deepcopy
 from dataclasses import dataclass
-import socket
 
 import pytest_asyncio
 import uvicorn
 from mcp import types
 from mcp_types.version import LATEST_PROTOCOL_VERSION
 from mcp.server import MCPServer
+from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.shared.exceptions import MCPError
+from starlette.responses import JSONResponse, Response
+from tests.http_peers import serve_http
 
 
 @dataclass
@@ -30,7 +33,7 @@ class HTTPMCPServer:
 
 @pytest_asyncio.fixture
 async def mcp_http_server(request, tmp_path):
-    settings = getattr(request, "param", {})
+    settings = deepcopy(getattr(request, "param", {}))
     settings["discover_started"] = asyncio.Event()
     settings["input_witness_file"] = tmp_path / "input-execution-witness"
 
@@ -108,6 +111,30 @@ async def mcp_http_server(request, tmp_path):
     async def recorded(scope, receive, send):
         if scope["type"] != "http":
             return await app(scope, receive, send)
+        oauth = settings.get("oauth")
+        if oauth is not None:
+            if oauth.get("redirect_to"):
+                requests.append((scope, b""))
+                return await Response(status_code=307, headers={
+                    "Location": oauth["redirect_to"],
+                })(scope, receive, send)
+            if scope["path"] == "/.well-known/oauth-protected-resource/mcp":
+                requests.append((scope, b""))
+                document = {"resource": oauth.get("advertised_resource", oauth["resource"]),
+                            "authorization_servers": [oauth.get("advertised_issuer", oauth["issuer"])],
+                            "scopes_supported": ["read", "write"]}
+                return await JSONResponse(document)(scope, receive, send)
+            headers = dict(scope["headers"])
+            if headers.get(b"authorization") != ("Bearer " + oauth["access_token"]).encode():
+                requests.append((scope, b""))
+                challenge = (f'Bearer resource_metadata="{oauth["metadata"]}", '
+                             f'scope="{oauth.get("challenge_scope", "read")}"')
+                return await Response(status_code=401, headers={
+                    "WWW-Authenticate": challenge,
+                })(scope, receive, send)
+            if scope["method"] == "GET" and oauth.get("denied_authenticated_get"):
+                requests.append((scope, b""))
+                return await Response(status_code=oauth["denied_authenticated_get"])(scope, receive, send)
         if settings.get("http_status"):
             body = bytearray()
             while True:
@@ -135,6 +162,9 @@ async def mcp_http_server(request, tmp_path):
             return message
 
         async def write(message):
+            if message["type"] == "http.response.start":
+                settings.setdefault("responses", []).append(
+                    (scope["method"], scope["path"], message["status"]))
             if settings.get("drop_tool_result") and b'"tools/call"' in body:
                 if message["type"] == "http.response.start":
                     await send({"type": "http.response.start", "status": 200,
@@ -150,58 +180,26 @@ async def mcp_http_server(request, tmp_path):
                 await asyncio.sleep(settings.get("initialize_body_delay", 0))
 
         try:
-            await app(scope, read, write)
+            if (settings.get("legacy") and oauth is not None and scope["method"] == "GET"
+                    and headers.get(b"accept") == b"application/json"):
+                # A 2025-only peer has the SDK's handshake-era GET transport;
+                # it does not select the 2026 handler from the request header.
+                transport = StreamableHTTPServerTransport(
+                    mcp_session_id=None, is_json_response_enabled=True)
+                async with transport.connect():
+                    try:
+                        await transport.handle_request(scope, read, write)
+                    finally:
+                        await transport.terminate()
+            else:
+                await app(scope, read, write)
         finally:
             requests.append((scope, bytes(body)))
 
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
     tls = settings.get("tls", False)
-    tls_options = {}
-    if tls:
-        from datetime import datetime, timedelta, timezone
-        from cryptography import x509
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.x509.oid import NameOID
-
-        hostname = settings.get("certificate_host", "remote.example")
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
-        now = datetime.now(timezone.utc)
-        cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
-                .public_key(key.public_key()).serial_number(x509.random_serial_number())
-                .not_valid_before(now - timedelta(minutes=1)).not_valid_after(now + timedelta(days=1))
-                .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
-                .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False)
-                .sign(key, hashes.SHA256()))
-        cert_path, key_path = tmp_path / "certificate.pem", tmp_path / "key.pem"
-        cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-        key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM,
-                             serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
-        tls_options = {"ssl_certfile": str(cert_path), "ssl_keyfile": str(key_path)}
-        settings["certificate_file"] = str(cert_path)
-    server = uvicorn.Server(uvicorn.Config(recorded, log_level="error", **tls_options))
-    task = asyncio.create_task(server.serve(sockets=[sock]))
-
-    async def ready():
-        while not server.started:
-            if task.done():
-                await task
-                raise RuntimeError("test HTTP server exited before startup")
-            await asyncio.sleep(0.01)
-
-    try:
-        await asyncio.wait_for(ready(), 5)
-        server_names = []
+    certificate_host = settings.get("certificate_host", "remote.example") if tls else None
+    async with serve_http(recorded, tmp_path, certificate_host=certificate_host) as peer:
         if tls:
-            server.config.ssl.set_servername_callback(
-                lambda _socket, name, _context: server_names.append(name))
-        scheme = "https" if tls else "http"
-        yield HTTPMCPServer(f"{scheme}://127.0.0.1:{port}/mcp", requests, server, task,
-                            settings, mcp, server_names, witness)
-    finally:
-        server.should_exit = True
-        await asyncio.wait_for(task, 5)
-        sock.close()
+            settings["certificate_file"] = peer.certificate_file
+        yield HTTPMCPServer(peer.url + "/mcp", requests, peer.server, peer.task,
+                            settings, mcp, peer.server_names, witness)

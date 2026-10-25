@@ -1,0 +1,36 @@
+{
+  "client_id": "https://agents.kestrelsovereign.com/oauth/kestrel-local-client.json",
+  "redirect_uri": "http://127.0.0.1:44721/oauth/callback",
+  "browser_timeout": 300,
+  "network_timeout": 20,
+  "connect_timeout": 30,
+  "call_timeout": 30,
+  "close_timeout": 15,
+  "response_max_bytes": 65536,
+  "vendors": {
+    "notion": {
+      "server_url": "https://mcp.notion.com/mcp",
+      "resource": "https://mcp.notion.com/mcp",
+      "issuer": "https://mcp.notion.com",
+      "protected_metadata": "https://mcp.notion.com/.well-known/oauth-protected-resource/mcp",
+      "authorization_metadata": "https://mcp.notion.com/.well-known/oauth-authorization-server",
+      "scopes": ["default"]
+    },
+    "linear": {
+      "server_url": "https://mcp.linear.app/mcp",
+      "resource": "https://mcp.linear.app/mcp",
+      "issuer": "https://mcp.linear.app",
+      "protected_metadata": "https://mcp.linear.app/.well-known/oauth-protected-resource/mcp",
+      "authorization_metadata": "https://mcp.linear.app/.well-known/oauth-authorization-server",
+      "scopes": ["read"]
+    },
+    "github": {
+      "server_url": "https://api.githubcopilot.com/mcp/",
+      "resource": "https://api.githubcopilot.com/mcp/",
+      "issuer": "https://github.com/login/oauth",
+      "protected_metadata": "https://api.githubcopilot.com/.well-known/oauth-protected-resource/mcp/",
+      "authorization_metadata": "https://github.com/.well-known/oauth-authorization-server/login/oauth",
+      "scopes": ["read:user"]
+    }
+  }
+}
