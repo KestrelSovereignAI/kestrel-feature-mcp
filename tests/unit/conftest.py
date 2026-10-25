@@ -9,6 +9,7 @@ import uvicorn
 from mcp import types
 from mcp_types.version import LATEST_PROTOCOL_VERSION
 from mcp.server import MCPServer
+from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.shared.exceptions import MCPError
 from starlette.responses import JSONResponse, Response
 from tests.http_peers import serve_http
@@ -131,9 +132,6 @@ async def mcp_http_server(request, tmp_path):
                 return await Response(status_code=401, headers={
                     "WWW-Authenticate": challenge,
                 })(scope, receive, send)
-            if scope["method"] == "GET":
-                requests.append((scope, b""))
-                return await JSONResponse({"authenticated": True})(scope, receive, send)
         if settings.get("http_status"):
             body = bytearray()
             while True:
@@ -161,6 +159,9 @@ async def mcp_http_server(request, tmp_path):
             return message
 
         async def write(message):
+            if message["type"] == "http.response.start":
+                settings.setdefault("responses", []).append(
+                    (scope["method"], scope["path"], message["status"]))
             if settings.get("drop_tool_result") and b'"tools/call"' in body:
                 if message["type"] == "http.response.start":
                     await send({"type": "http.response.start", "status": 200,
@@ -176,7 +177,19 @@ async def mcp_http_server(request, tmp_path):
                 await asyncio.sleep(settings.get("initialize_body_delay", 0))
 
         try:
-            await app(scope, read, write)
+            if (settings.get("legacy") and oauth is not None and scope["method"] == "GET"
+                    and headers.get(b"accept") == b"application/json"):
+                # A 2025-only peer has the SDK's handshake-era GET transport;
+                # it does not select the 2026 handler from the request header.
+                transport = StreamableHTTPServerTransport(
+                    mcp_session_id=None, is_json_response_enabled=True)
+                async with transport.connect():
+                    try:
+                        await transport.handle_request(scope, read, write)
+                    finally:
+                        await transport.terminate()
+            else:
+                await app(scope, read, write)
         finally:
             requests.append((scope, bytes(body)))
 

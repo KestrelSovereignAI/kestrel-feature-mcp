@@ -12,9 +12,17 @@ from mcp.client.auth.utils import create_client_info_from_metadata_url
 from mcp.shared.auth import OAuthClientInformationFull, OAuthMetadata, OAuthToken, ProtectedResourceMetadata
 from mcp.shared.auth_utils import check_resource_allowed, resource_url_from_server_url
 
+DEFAULT_RESPONSE_MAX_BYTES = 65536
+
 
 class GrantRejected(ValueError):
     """Safe diagnostic; never interpolate a token, callback or response body."""
+
+
+def response_budget(value: int) -> int:
+    if type(value) is not int or value < 1:
+        raise GrantRejected("Acceptance response budget must be a positive integer")
+    return value
 
 
 def _origin(url: str) -> str:
@@ -62,7 +70,7 @@ class GrantSelection:
             raise GrantRejected("The public CIMD client ID must name a document")
         if (not self.scopes or not isinstance(self.scopes, frozenset)
                 or any(not isinstance(scope, str) or not scope
-                       or any(c.isspace() or ord(c) < 33 or ord(c) > 126
+                       or any(c in {'"', '\\'} or c.isspace() or ord(c) < 33 or ord(c) > 126
                                         for c in scope) for scope in self.scopes)):
             raise GrantRejected("Select explicit immutable OAuth scopes")
 
@@ -70,8 +78,9 @@ class GrantSelection:
 class GrantPolicy:
     """No client identity, resource, issuer or scope switch during one attempt."""
 
-    def __init__(self, selection: GrantSelection):
+    def __init__(self, selection: GrantSelection, *, response_max_bytes=DEFAULT_RESPONSE_MAX_BYTES):
         self.selection = selection
+        self.response_max_bytes = response_budget(response_max_bytes)
         self.authorization_endpoint: str | None = None
         self.token_endpoint: str | None = None
         self.resource_verified = False
@@ -135,13 +144,13 @@ class GrantPolicy:
         if response.status_code != 200:
             raise GrantRejected("The selected OAuth metadata endpoint did not return 200")
         body = await response.aread()
-        if len(body) > 65536:
+        if len(body) > self.response_max_bytes:
             raise GrantRejected("OAuth metadata exceeded the spike's response budget")
         document = json.loads(body)
         if url == selected.protected_metadata:
-            resource = ProtectedResourceMetadata.model_validate(document)
+            ProtectedResourceMetadata.model_validate(document)
             issuers = document.get("authorization_servers")
-            if (str(resource.resource) != selected.resource
+            if (document.get("resource") != selected.resource
                     or not issuers or issuers[0] != selected.issuer):
                 raise GrantRejected("Resource metadata changed the selected resource or issuer")
             self.resource_verified = True

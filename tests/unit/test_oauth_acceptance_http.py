@@ -5,6 +5,7 @@ vendor credentials are involved; actual vendor acceptance remains a manual gate.
 """
 
 import base64
+import asyncio
 from dataclasses import dataclass
 import hashlib
 import json
@@ -18,7 +19,7 @@ import httpcore2
 import httpx2
 import pytest
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, RedirectResponse
+from starlette.responses import JSONResponse, RedirectResponse, StreamingResponse
 from starlette.routing import Route
 from mcp.client.auth import OAuthTokenError
 
@@ -36,9 +37,11 @@ class OAuthPeers:
     resource: object
     requests: list
     browser_requests: list
+    release_body: asyncio.Event
 
     async def browser(self, url):
         self.browser_requests.append(url)
+        await asyncio.sleep(self.options.get("browser_delay", 0))
         approved = await assert_safe_url(url, allowed_schemes=("https",))
         async with httpx2.AsyncClient(
             transport=pinned_httpx2_async_transport(approved), follow_redirects=False,
@@ -66,10 +69,17 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         callback_port = reservation.getsockname()[1]
     callback = f"http://127.0.0.1:{callback_port}/oauth/callback"
     state = SimpleNamespace(issuer=None, client_id=None, access_token="native-fixture-access",
-                            codes={}, requests=[])
+                            codes={}, requests=[], release_body=asyncio.Event())
+
+    async def held_body(content):
+        # Only the test/fixture releases EOF; refusal must finish first.
+        yield content
+        await state.release_body.wait()
 
     async def identity(_request):
         state.requests.append(("GET", "/client.json"))
+        if options.get("oversized") == "identity":
+            return StreamingResponse(held_body(b"X" * 65537), media_type="application/json")
         return JSONResponse({
             "client_id": state.client_id, "client_name": "Kestrel OAuth wire fixture",
             "application_type": "native", "redirect_uris": [callback],
@@ -79,7 +89,9 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
 
     async def metadata(_request):
         state.requests.append(("GET", "/.well-known/oauth-authorization-server"))
-        return JSONResponse({
+        if options.get("oversized") == "authorization":
+            return StreamingResponse(held_body(b"X" * 65537), media_type="application/json")
+        document = {
             "issuer": (state.issuer.replace("issuer.example", "ISSUER.example")
                        if options.get("wrong_issuer_spelling") else state.issuer),
             "authorization_endpoint": state.issuer + "/authorize",
@@ -91,7 +103,11 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             "code_challenge_methods_supported": ["S256"],
             "authorization_response_iss_parameter_supported": True,
             "client_id_metadata_document_supported": not options.get("no_cimd", False),
-        })
+        }
+        if options.get("stall_metadata"):
+            return StreamingResponse(held_body(json.dumps(document).encode()),
+                                     media_type="application/json")
+        return JSONResponse(document)
 
     async def authorize(request):
         state.requests.append(("GET", "/authorize"))
@@ -152,6 +168,9 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         if options.get("wrong_resource_issuer_spelling"):
             resource_peer.settings["oauth"]["advertised_issuer"] = state.issuer.replace(
                 "issuer.example", "ISSUER.example")
+        if options.get("wrong_resource_spelling"):
+            resource_peer.settings["oauth"]["advertised_resource"] = resource_id.replace(
+                "remote.example", "REMOTE.example")
         selection = GrantSelection(
             server_url=resource_url, resource=resource_id, issuer=state.issuer,
             protected_metadata=resource_peer.settings["oauth"]["metadata"],
@@ -186,12 +205,16 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
         monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:1")
         monkeypatch.setenv("NO_PROXY", "")
-        yield OAuthPeers(selection, options, issuer_peer, resource_peer, state.requests, [])
+        try:
+            yield OAuthPeers(selection, options, issuer_peer, resource_peer, state.requests, [],
+                             state.release_body)
+        finally:
+            state.release_body.set()
 
 
-async def drive(peers, mode="authorize"):
+async def drive(peers, mode="authorize", *, network_timeout=5):
     return await run(peers.selection, mode=mode, browser_timeout=0.3 if peers.options.get(
-        "wrong_callback_state") else 5, network_timeout=5, connect_timeout=5,
+        "wrong_callback_state") else 5, network_timeout=network_timeout, connect_timeout=5,
         call_timeout=5, close_timeout=5, browser_opener=peers.browser)
 
 
@@ -215,6 +238,75 @@ async def test_actual_native_initial_grant_and_canonical_mcp_discovery(oauth_pee
     methods = [json.loads(body)["method"] for _, body in oauth_peers.resource.requests if body]
     assert methods == ["server/discover", "tools/list"]
     assert "native-fixture-access" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("mcp_http_server,protocol,get_status", [
+    ({"tls": True, "oauth": {}}, "2026-07-28", 405),
+    ({"tls": True, "oauth": {}, "legacy": True}, "2025-11-25", 406),
+], indirect=["mcp_http_server"])
+async def test_native_get_status_does_not_replace_mcp_negotiation(oauth_peers, protocol, get_status):
+    result = error = None
+    try:
+        result = await drive(oauth_peers)
+    except GrantRejected as caught:
+        error = caught
+    # Observe the actual SDK transport's response and real token exchange
+    # before inspecting the acceptance result.
+    assert ("GET", "/mcp", get_status) in oauth_peers.resource.settings["responses"]
+    assert oauth_peers.requests.count(("POST", "/token")) == 1
+    assert error is None
+    assert result["stage"] == "authorized_and_discovered"
+    assert result["protocol_version"] == protocol and result["tools"] == 2
+    assert result["tool_calls"] == 0 and oauth_peers.resource.witness == []
+    methods = [json.loads(body)["method"] for _, body in oauth_peers.resource.requests if body]
+    assert ("initialize" in methods) == (protocol == "2025-11-25")
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
+@pytest.mark.parametrize("oauth_peers", [{"oversized": "identity"},
+                                         {"oversized": "authorization"}], indirect=True)
+async def test_oversized_stream_is_refused_before_waiting_for_its_end(oauth_peers):
+    async def attempt():
+        with pytest.raises(GrantRejected, match="response budget"):
+            await drive(oauth_peers)
+
+    task = asyncio.create_task(attempt())
+    try:
+        # A missing byte guard fails this test deadline, not pytest's timeout.
+        # Always release the independent peer and join the original attempt.
+        async with asyncio.timeout(2):
+            await asyncio.shield(task)
+    finally:
+        oauth_peers.release_body.set()
+        await task
+    assert oauth_peers.browser_requests == []
+    assert ("GET", "/authorize") not in oauth_peers.requests
+    assert ("POST", "/token") not in oauth_peers.requests
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
+@pytest.mark.parametrize("oauth_peers", [{"stall_metadata": True}], indirect=True)
+async def test_native_auth_metadata_body_has_its_own_network_deadline(oauth_peers):
+    task = asyncio.create_task(drive(oauth_peers, network_timeout=2))
+    try:
+        done, _ = await asyncio.wait({task}, timeout=4)
+        assert task in done, "Native metadata response outlived its network deadline"
+        with pytest.raises(TimeoutError):
+            await task
+        assert ("GET", "/.well-known/oauth-authorization-server") in oauth_peers.requests
+        assert oauth_peers.browser_requests == []
+        assert ("POST", "/token") not in oauth_peers.requests
+    finally:
+        oauth_peers.release_body.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
+@pytest.mark.parametrize("oauth_peers", [{"browser_delay": 2.5}], indirect=True)
+async def test_human_consent_wait_is_separate_from_each_network_exchange(oauth_peers):
+    result = await drive(oauth_peers, network_timeout=2)
+    assert result["stage"] == "authorized_and_discovered" and result["grant_obtained"]
+    assert oauth_peers.requests.count(("POST", "/token")) == 1
 
 
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
@@ -244,6 +336,7 @@ async def test_actual_resource_redirect_is_rejected_without_another_request(oaut
     ({"challenge_scope": "read write"}, "outside the approved grant"),
     pytest.param({"wrong_issuer_spelling": True}, "changed the selected issuer", id="issuer_literal"),
     pytest.param({"wrong_resource_issuer_spelling": True}, "Resource metadata changed", id="resource_issuer_literal"),
+    pytest.param({"wrong_resource_spelling": True}, "Resource metadata changed", id="resource_literal"),
     ({"confidential_only": True}, "public-client token authentication"),
 ], indirect=["oauth_peers"])
 async def test_native_sdk_refusals_happen_before_the_browser_or_token_post(oauth_peers, reason):

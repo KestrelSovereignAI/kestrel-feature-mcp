@@ -74,6 +74,14 @@ directly, before URL parsing can normalize their spelling.
 The native HTTP transports validate and pin public addresses, verify TLS,
 refuse HTTP redirects and ignore environment proxies. Authorization opens in
 the user's browser, where the vendor can perform its normal login redirects.
+Each bootstrap HTTP exchange has its own network deadline, separate from the
+human consent deadline. `response_max_bytes` caps raw response streaming before
+buffering and also the accepted decoded metadata size. A response chunk can
+cross the cap before it is refused; this is not a claim about total process
+memory or decompression allocation. The final protocol connection is owned by
+the existing `MCPConnection`. A separate issuer's refresh during that connection
+is refused by its resource-pinned transport; this spike does not establish an
+in-memory refresh or restart contract.
 No default client registration, borrowed product identity, token header input
 or scope expansion substitutes for the selected grant.
 
@@ -122,6 +130,8 @@ their limitations are recorded. Remote write scopes remain gated on
 The unit suite runs the actual native OAuth client against separate HTTPS
 resource and authorization servers with real certificates and PKCE checking,
 then exercises the same production MCP connection and loopback callback.
+The authenticated bootstrap GET reaches the SDK's real modern or handshake-era
+transport (405 or 406); native discovery/negotiation then proves readiness.
 It checks disclosure before result shapes: a scope or identity refusal must
 produce no browser/token request, and an overgranted token must never reach
 the resource. A corrupted public SDK request is stopped before the independent

@@ -26,7 +26,8 @@ from mcp_types.version import LATEST_PROTOCOL_VERSION
 
 from kestrel_feature_mcp.connection import MCPConnection
 from .callback import CallbackRejected, LoopbackCallback
-from .policy import GrantPolicy, GrantRejected, GrantSelection, GuardedAuth, MemoryGrant
+from .policy import (DEFAULT_RESPONSE_MAX_BYTES, GrantPolicy, GrantRejected, GrantSelection,
+                     GuardedAuth, MemoryGrant, response_budget)
 
 
 class AuthorizationReady(Exception):
@@ -38,10 +39,52 @@ class RefuseUnselectedOrigin(httpx2.AsyncBaseTransport):
         raise GrantRejected("No transport is available for an unselected origin")
 
 
+class _BudgetedStream(httpx2.AsyncByteStream):
+    def __init__(self, stream, limit, deadline):
+        self.stream, self.limit, self.deadline = stream, limit, deadline
+
+    async def __aiter__(self):
+        total = 0
+        try:
+            async with asyncio.timeout_at(self.deadline):
+                async for chunk in self.stream:
+                    total += len(chunk)
+                    if total > self.limit:
+                        raise GrantRejected("OAuth HTTP response budget exceeded")
+                    yield chunk
+        finally:
+            await self.stream.aclose()
+
+    async def aclose(self):
+        await self.stream.aclose()
+
+
+class _BudgetedTransport(httpx2.AsyncBaseTransport):
+    """Keep native pinning; bound every bootstrap HTTP exchange before buffering.
+
+    SDK auth-generated requests need their own deadline: they do not inherit
+    the HTTP client's request extensions. Browser consent has a separate clock.
+    No request, response object, header or content is replaced.
+    """
+
+    def __init__(self, transport, limit, timeout):
+        self.transport, self.limit, self.timeout = transport, limit, timeout
+
+    async def handle_async_request(self, request):
+        deadline = asyncio.get_running_loop().time() + self.timeout
+        async with asyncio.timeout_at(deadline):
+            response = await self.transport.handle_async_request(request)
+        response.stream = _BudgetedStream(response.stream, self.limit, deadline)
+        return response
+
+    async def aclose(self):
+        await self.transport.aclose()
+
+
 async def open_authorization(url: str):
     """Own and join the launcher; the user's browser retains its normal lifetime."""
     child = await asyncio.create_subprocess_exec(
-        sys.executable, "-c",
+        sys.executable, "-I", "-c",
         "import sys,webbrowser;sys.exit(0 if webbrowser.open(sys.argv[1],new=1) else 1)",
         url, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
@@ -66,10 +109,11 @@ async def open_authorization(url: str):
         raise GrantRejected("The browser launcher could not open the authorization page")
 
 
-async def client_metadata(selection: GrantSelection, *, timeout: float):
+async def client_metadata(selection: GrantSelection, *, timeout: float, response_max_bytes: int):
     endpoint = await assert_safe_url(selection.client_id, allowed_schemes=("https",))
     async with httpx2.AsyncClient(
-        transport=pinned_httpx2_async_transport(endpoint), trust_env=False,
+        transport=_BudgetedTransport(pinned_httpx2_async_transport(endpoint), response_max_bytes, timeout),
+        trust_env=False,
         follow_redirects=False, timeout=timeout,
     ) as client:
         response = await client.get(endpoint.url)
@@ -77,7 +121,7 @@ async def client_metadata(selection: GrantSelection, *, timeout: float):
                 or response.headers.get("Content-Type", "").split(";", 1)[0] != "application/json"):
             raise GrantRejected("The public CIMD document did not return 200 application/json")
         body = await response.aread()
-        if len(body) > 65536:
+        if len(body) > response_max_bytes:
             raise GrantRejected("The CIMD document exceeded the acceptance response budget")
         document = json.loads(body)
     metadata = OAuthClientMetadata.model_validate(document)
@@ -95,7 +139,8 @@ async def client_metadata(selection: GrantSelection, *, timeout: float):
 
 async def run(selection: GrantSelection, *, mode: str, browser_timeout: float,
               network_timeout: float, connect_timeout: float, call_timeout: float,
-              close_timeout: float, browser_opener=open_authorization):
+              close_timeout: float, response_max_bytes=DEFAULT_RESPONSE_MAX_BYTES,
+              browser_opener=open_authorization):
     if mode not in {"discover", "authorize"}:
         raise GrantRejected("Select discovery or initial authorization explicitly")
     if any(not 0 < value < float("inf") for value in (
@@ -104,8 +149,9 @@ async def run(selection: GrantSelection, *, mode: str, browser_timeout: float,
     callback_candidate = LoopbackCallback(
         selection.redirect_uri, selection.issuer, timeout=browser_timeout,
     )
-    metadata, identity_sha256 = await client_metadata(selection, timeout=network_timeout)
-    policy = GrantPolicy(selection)
+    policy = GrantPolicy(selection, response_max_bytes=response_max_bytes)
+    metadata, identity_sha256 = await client_metadata(
+        selection, timeout=network_timeout, response_max_bytes=response_max_bytes)
     storage = MemoryGrant(policy)
     public = {"client_id": selection.client_id, "server_url": selection.server_url,
               "resource": selection.resource,
@@ -144,7 +190,8 @@ async def run(selection: GrantSelection, *, mode: str, browser_timeout: float,
             origin = parsed.scheme + "://" + parsed.netloc
             if origin not in mounts:
                 approved = await assert_safe_url(url, allowed_schemes=("https",))
-                mounts[origin] = pinned_httpx2_async_transport(approved)
+                mounts[origin] = _BudgetedTransport(
+                    pinned_httpx2_async_transport(approved), response_max_bytes, network_timeout)
                 if url == selection.server_url:
                     server = approved
         assert server is not None
@@ -161,7 +208,10 @@ async def run(selection: GrantSelection, *, mode: str, browser_timeout: float,
             except AuthorizationReady:
                 return {**public, "stage": "authorization_ready", "grant_obtained": False,
                         "scope": "Native discovery and request validation only; no vendor consent"}
-            if response.status_code not in {200, 405}:
+            # This GET drives OAuth, not MCP version negotiation. A handshake
+            # peer can answer 406 because this request does not open SSE.
+            # The canonical connection below must prove protocol readiness.
+            if response.status_code in {401, 403}:
                 raise GrantRejected("The resource rejected the completed initial authorization")
         tokens = await storage.get_tokens()
         if tokens is None:
@@ -184,7 +234,7 @@ async def run(selection: GrantSelection, *, mode: str, browser_timeout: float,
 
 def load_selection(config: dict, vendor: str):
     timeout_names = ("browser_timeout", "network_timeout", "connect_timeout", "call_timeout", "close_timeout")
-    if set(config) != {"client_id", "redirect_uri", "vendors"} | set(timeout_names):
+    if set(config) != {"client_id", "redirect_uri", "vendors", "response_max_bytes"} | set(timeout_names):
         raise GrantRejected("Acceptance configuration contains unsupported or missing fields")
     if not isinstance(config["vendors"], dict) or vendor not in config["vendors"]:
         raise GrantRejected("The selected vendor is missing from the acceptance configuration")
@@ -201,7 +251,7 @@ def load_selection(config: dict, vendor: str):
     if any(type(config[name]) not in {int, float} for name in timeout_names):
         raise GrantRejected("Acceptance timeouts must be numbers")
     timeouts = {name: float(config[name]) for name in timeout_names}
-    return selected, timeouts
+    return selected, {**timeouts, "response_max_bytes": response_budget(config["response_max_bytes"])}
 
 
 def main():

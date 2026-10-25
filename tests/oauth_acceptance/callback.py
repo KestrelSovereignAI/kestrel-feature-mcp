@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import secrets
 from urllib.parse import parse_qs, urlsplit
 
@@ -43,7 +44,10 @@ class LoopbackCallback:
         # A busy published port is a failure; a different redirect is a new client.
         self._server = await asyncio.start_server(
             self._connected, "127.0.0.1", self._url.port, limit=8192,
-            reuse_address=False,
+            # POSIX TIME_WAIT from our completed connection must not prevent
+            # retrying the published port. Active listeners remain exclusive;
+            # SO_REUSEPORT is never enabled. Windows keeps its safer default.
+            reuse_address=os.name == "posix",
         )
         return self
 

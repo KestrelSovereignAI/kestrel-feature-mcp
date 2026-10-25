@@ -1,5 +1,6 @@
 """Policy-only checks; these do not claim a vendor grant or wire acceptance."""
 
+from dataclasses import replace
 from urllib.parse import urlencode
 
 import httpx2
@@ -7,6 +8,12 @@ import pytest
 from mcp.shared.auth import OAuthToken
 
 from tests.oauth_acceptance.policy import GrantPolicy, GrantRejected, GrantSelection, MemoryGrant
+
+
+@pytest.mark.parametrize("scope", ['read"write', r"read\write"])
+def test_selected_scope_uses_rfc6749_scope_tokens(selection, scope):
+    with pytest.raises(GrantRejected, match="OAuth scopes"):
+        replace(selection, scopes=frozenset({scope}))
 
 
 @pytest.fixture

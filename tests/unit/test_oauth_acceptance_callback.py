@@ -1,6 +1,7 @@
 """Actual loopback HTTP checks for the manual vendor-consent receiver."""
 
 import asyncio
+import os
 import socket
 from urllib.parse import urlencode, urlsplit
 
@@ -62,6 +63,15 @@ async def test_listener_must_be_owned_before_arming_and_busy_port_never_moves(re
         assert (await request(redirect_uri)).startswith(b"HTTP/1.1 409")
     assert not callback._server.is_serving()
     assert all(task.done() for task in callback._tasks)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX TIME_WAIT and SO_REUSEADDR contract")
+async def test_completed_attempt_can_retry_the_published_callback_port(redirect_uri):
+    for _ in range(3):
+        async with LoopbackCallback(redirect_uri, ISSUER, timeout=5) as callback:
+            callback.arm(STATE)
+            assert (await request(redirect_uri)).startswith(b"HTTP/1.1 200")
+            assert (await callback.result()).code == CODE
 
 
 @pytest.mark.parametrize("change", [
