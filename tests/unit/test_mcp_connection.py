@@ -701,3 +701,4 @@ def test_server_extensions_cannot_supply_host_connection_labels():
     assert record["protocol_version"] == LATEST_PROTOCOL_VERSION
     assert not {"connection", "url", "via"}.intersection(record)
     assert record["_meta"] == tool.meta
+    assert "description" not in record, "an absent optional description stays omitted"
