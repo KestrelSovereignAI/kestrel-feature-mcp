@@ -80,8 +80,12 @@ async def connection_lifecycle(gates: dict, name: str):
 
 def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, tool_names=None):
     """Bind the advertised connection, never a later replacement's transport."""
+    incarnation = connection.incarnation
+    if incarnation is None:
+        raise ConnectionError("MCP connection is not connected")
+
     async def call(tool_name: str, arguments: dict | None = None):
-        if not is_current():
+        if not is_current() or connection.incarnation is not incarnation:
             raise ValueError(f"MCP connection {name} changed; rediscover its tools before calling")
         if tool_names is not None and tool_name not in tool_names:
             raise ValueError(f"Unknown tool: {tool_name}. Available: {list(tool_names)}")
@@ -158,6 +162,7 @@ class MCPConnection:
         self._task: asyncio.Task[None] | None = None
         self._ready: asyncio.Future[Client] | None = None
         self._shutdown: _ShutdownDeadline | None = None
+        self._incarnation: object | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -173,6 +178,11 @@ class MCPConnection:
     def protocol_version(self) -> str | None:
         """The published revision selected by the SDK's standard negotiation."""
         return self._client.protocol_version if self.is_connected else None
+
+    @property
+    def incarnation(self) -> object | None:
+        """Opaque lifetime of this active session; never a bearer credential."""
+        return self._incarnation if self.is_connected else None
 
     def _owner_finished(self, task: asyncio.Task[None]) -> None:
         # Always observe the task outcome, including a failure after startup.
@@ -234,6 +244,7 @@ class MCPConnection:
     async def connect(self) -> list[types.Tool]:
         if self._task is not None:
             raise RuntimeError("MCP connection already started; close it before reconnecting")
+        self._incarnation = object()
         self._ready = asyncio.get_running_loop().create_future()
         self._task = asyncio.create_task(self._run(), name="mcp-connection")
         self._task.add_done_callback(self._owner_finished)

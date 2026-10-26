@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, AsyncMock
 import pytest
 from mcp.shared.exceptions import MCPError
 
-from kestrel_feature_mcp.connection import MCPConnection, MCPCallOutcomeUnknownError
+from kestrel_feature_mcp.connection import MCPConnection, MCPCallOutcomeUnknownError, bind_tool_caller
 from mcp_types.version import LATEST_PROTOCOL_VERSION
 from kestrel_feature_mcp.manager import DockerMCPGatewayError, MCPGatewayManager, MCPToolManager
 
@@ -64,6 +64,24 @@ async def test_sdk_tool_failure_is_preserved(mcp_http_server):
         result = await connection.call_tool("fail")
         assert result.is_error
         assert result.content[0].text == "Error executing tool fail"
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_reconnecting_same_connection_cannot_revive_its_previous_tool_binding(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        await connection.connect()
+        original = bind_tool_caller(connection, lambda: True, "original", tool_names={"echo"})
+        await original("echo", {"text": "first session"})
+        await connection.close()
+        await connection.connect()
+        with pytest.raises(ValueError, match="changed"):
+            await original("echo", {"text": "stale view"})
+        current = bind_tool_caller(connection, lambda: True, "current", tool_names={"echo"})
+        await current("echo", {"text": "new session"})
+        assert mcp_http_server.witness == ["first session", "new session"]
     finally:
         await connection.close()
 
