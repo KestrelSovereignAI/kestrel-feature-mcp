@@ -128,6 +128,44 @@ async def test_native_resource_read_has_its_own_deadline_without_reissue(mcp_htt
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True}], indirect=True)
+async def test_resource_read_rechecks_session_after_the_native_response(mcp_http_server, monkeypatch):
+    from mcp import Client
+
+    received, release = asyncio.Event(), asyncio.Event()
+    native_read = Client.read_resource
+
+    async def hold_received_response(client, *args, **kwargs):
+        result = await native_read(client, *args, **kwargs)
+        received.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(Client, "read_resource", hold_received_response)
+    connection = MCPConnection(mcp_http_server.url)
+    read = None
+    try:
+        await connection.connect()
+        read = asyncio.create_task(connection.read_resource(
+            "ui://status/view.html", incarnation=connection.incarnation,
+        ))
+        await received.wait()
+        await connection.close()
+        await connection.connect()
+        release.set()
+        with pytest.raises(ValueError, match="changed"):
+            await read
+        assert mcp_http_server.settings["resource_reads"] == ["resources/read"]
+    finally:
+        release.set()
+        if read is not None:
+            if not read.done():
+                read.cancel()
+            await asyncio.gather(read, return_exceptions=True)
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_startup_joins_owner_and_can_retry(mcp_http_server):
     url = mcp_http_server.url
     connection = MCPConnection(url.replace("/mcp", "/missing"), call_timeout=1)
