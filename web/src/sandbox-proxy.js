@@ -33,7 +33,12 @@ export function approveSandboxPolicy(requested = {}, permissions = {}, policy) {
             throw new TypeError('Sandbox domain grants must be arrays of exact origins');
         }
         const allowed = new Set((policy[key] ?? []).map(exactOrigin));
-        csp[key] = (requested[key] ?? []).map(exactOrigin).filter(origin => allowed.has(origin));
+        if (key === 'frameDomains' && allowed.size) {
+            throw new TypeError('Sandbox proxy does not support nested network frame grants');
+        }
+        // The operator list is canonical. Unsupported resource requests are
+        // simply ungranted; normalizing them could create an unintended grant.
+        csp[key] = (requested[key] ?? []).filter(origin => allowed.has(origin));
     }
     const granted = {};
     for (const key of DEVICE_KEYS) {
@@ -112,7 +117,7 @@ export function startSandboxProxy({ hostOrigin, maxMessageBytes, maxHtmlBytes, p
         });
         // CSP is parsed before any untrusted markup, including nested HTML/head tags.
         view.srcdoc = '<!doctype html><html><head>' + meta.outerHTML
-            + '<meta name="referrer" content="no-referrer"></head><body>' + params.html + '</body></html>';
+            + '<meta name="referrer" content="no-referrer">' + params.html + '</html>';
         phase = 'loaded';
         container.append(view);
     };
