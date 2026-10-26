@@ -1,6 +1,7 @@
 """Real HTTP fixtures shared by native MCP lifecycle and deadline tests."""
 
 import asyncio
+import gzip
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -43,6 +44,11 @@ async def mcp_http_server(request, tmp_path):
     settings["bootstrap_body_started"] = asyncio.Event()
     settings["release_bootstrap_body"] = asyncio.Event()
     settings["input_witness_file"] = tmp_path / "input-execution-witness"
+    settings["release_resource_wire"] = asyncio.Event()
+    settings["resource_wire_closed"] = asyncio.Event()
+    if settings.get("resource_wire_mode") == "gzip":
+        # Construct the adversarial fixture before client allocation tracing.
+        settings["compressed_resource_wire"] = gzip.compress(b"x" * (16 * 1024 * 1024))
 
     class TestServer(MCPServer):
         async def _handle_list_tools(self, ctx, params):
@@ -214,6 +220,24 @@ async def mcp_http_server(request, tmp_path):
             return message
 
         async def write(message):
+            wire_mode = settings.get("resource_wire_mode")
+            if wire_mode and b'"resources/read"' in body:
+                if message["type"] == "http.response.start":
+                    return
+                if message["type"] == "http.response.body":
+                    async def adversarial_resource():
+                        try:
+                            if wire_mode == "gzip":
+                                yield settings["compressed_resource_wire"]
+                            else:
+                                for _ in range(288):
+                                    yield b"x" * (32 * 1024)
+                                await settings["release_resource_wire"].wait()
+                        finally:
+                            settings["resource_wire_closed"].set()
+                    headers = {"Content-Encoding": "gzip"} if wire_mode == "gzip" else {}
+                    return await StreamingResponse(adversarial_resource(),
+                        media_type="application/json", headers=headers)(scope, receive, send)
             if message["type"] == "http.response.start":
                 settings.setdefault("responses", []).append(
                     (scope["method"], scope["path"], message["status"]))
