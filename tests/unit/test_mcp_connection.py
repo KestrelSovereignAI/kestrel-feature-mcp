@@ -639,3 +639,40 @@ async def test_managed_http_does_not_send_requests_or_gateway_tokens_to_environm
             server.close()
             await server.wait_closed()
             assert received == [], received
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True}], indirect=True)
+@pytest.mark.parametrize("transport", ["container", "gateway"])
+async def test_discovery_preserves_native_apps_tool_fields(mcp_http_server, transport):
+    peer = mcp_http_server
+    expected = next(tool for tool in await peer.mcp.list_tools() if tool.name == "status_view")
+    expected_wire = expected.model_dump(mode="json", by_alias=True, exclude_none=True)
+    assert expected_wire["_meta"]["ui"] == {
+        "resourceUri": "ui://status/view.html", "visibility": ["model", "app"],
+    }
+    assert expected_wire["title"] and expected_wire["outputSchema"]
+    assert expected_wire["annotations"]["readOnlyHint"] is True
+    assert expected_wire["icons"][0]["mimeType"] == "image/svg+xml"
+    if transport == "container":
+        manager = container_manager(peer.url)
+        try:
+            await manager.connect_to_tool("test")
+            actual = next(tool for tool in manager.get_all_tools() if tool["name"] == "status_view")
+        finally:
+            await manager.aclose()
+        assert actual.pop("container") == "test"
+    else:
+        manager = MCPGatewayManager()
+        manager.gateway = SimpleNamespace(endpoint_url=peer.url, is_running=True)
+        try:
+            await manager._connect("owned-discovery-token")
+            actual = next(tool for tool in manager.get_all_tools() if tool["name"] == "status_view")
+        finally:
+            await manager._disconnect()
+    assert actual.pop("protocol_version") == LATEST_PROTOCOL_VERSION
+    assert actual == expected_wire
+    # Preserving server metadata must not claim an Apps renderer already exists.
+    for _, body in peer.requests:
+        if body:
+            meta = json.loads(body)["params"]["_meta"]
+            assert "io.modelcontextprotocol/ui" not in json.dumps(meta)
