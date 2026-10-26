@@ -106,7 +106,7 @@ class GrantPolicy:
                 try:
                     message = json.loads(await request.aread())
                     envelope = jsonrpc_message_adapter.validate_python(message)
-                except (json.JSONDecodeError, ValidationError):
+                except (UnicodeDecodeError, json.JSONDecodeError, ValidationError):
                     raise GrantRejected("Discovery requests require a valid JSON-RPC envelope") from None
                 if ("method" not in message and isinstance(envelope, (JSONRPCResponse, JSONRPCError))
                         and set(message) <= type(envelope).model_fields.keys()):

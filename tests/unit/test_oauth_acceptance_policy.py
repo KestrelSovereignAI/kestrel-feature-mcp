@@ -200,7 +200,7 @@ async def test_a_response_shape_cannot_hide_an_unapproved_operation(selection, f
 
 
 @pytest.mark.parametrize("body", [
-    b"not-json", b"[]", b'{"jsonrpc":"1.0","id":7,"result":{}}',
+    b"not-json", b"\xff", b"[]", b'{"jsonrpc":"1.0","id":7,"result":{}}',
     b'{"jsonrpc":"2.0","id":{},"result":{}}',
 ])
 async def test_invalid_rpc_envelopes_have_a_safe_policy_error(selection, body):

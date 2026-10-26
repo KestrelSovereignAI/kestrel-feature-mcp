@@ -10,7 +10,7 @@ uv pip install kestrel-feature-mcp
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk[httpx2]>=0.39.2,<1`
+- `kestrel-sovereign-sdk[httpx2]` (version constraints are declared in [pyproject.toml](https://github.com/KestrelSovereignAI/kestrel-feature-mcp/blob/main/pyproject.toml))
 - `docker>=7.1.0`
 - `mcp>=2.3,<3`
 - `requests>=2.34.2`
