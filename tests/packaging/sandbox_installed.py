@@ -39,7 +39,7 @@ def main():
         scenarios = [
             ("absolute", args.node, str(config)),
             ("relative-config", args.node, config.name),
-            ("relative-node", os.path.relpath(Path(args.node).resolve(), root), config.name),
+            ("relative-node", os.path.relpath(Path(args.node).resolve(), root.resolve()), config.name),
             ("relative-path", None, config.name),
         ]
         for scenario, requested, config_argument in scenarios:
