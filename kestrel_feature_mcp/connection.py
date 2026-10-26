@@ -20,13 +20,14 @@ from mcp import Client, types
 from mcp.client.streamable_http import streamable_http_client
 from kestrel_sdk.security.outbound import ValidatedOutboundURL, pinned_httpx2_async_transport
 
-from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSION_CLOSE_TIMEOUT_DEFAULT
+from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSION_CLOSE_TIMEOUT_DEFAULT, RESPONSE_MAX_BYTES_DEFAULT
+from .http_limits import MCPResponseBudget, MCPResponseLimitError
 
 
 logger = logging.getLogger(__name__)
 
 MCP_CONNECTION_ERRORS = (
-    MCPError, InputRequiredRoundsExceededError, httpx2.HTTPError, TimeoutError, OSError, ValidationError,
+    MCPError, InputRequiredRoundsExceededError, MCPResponseLimitError, httpx2.HTTPError, TimeoutError, OSError, ValidationError,
     BrokenResourceError, ClosedResourceError, EndOfStream,
 )
 
@@ -38,8 +39,11 @@ class MCPCallOutcomeUnknownError(RuntimeError):
 def _rejected_before_execution(error: BaseException) -> bool:
     if isinstance(error, BaseExceptionGroup):
         return all(_rejected_before_execution(child) for child in error.exceptions)
+    # The SDK also emits PARSE_ERROR and INVALID_REQUEST locally when a
+    # response is unreadable or invalid. Those codes cannot establish that
+    # the remote tool did not already execute.
     return isinstance(error, MCPError) and error.code in {
-        types.PARSE_ERROR, types.INVALID_REQUEST, types.METHOD_NOT_FOUND, types.INVALID_PARAMS,
+        types.METHOD_NOT_FOUND, types.INVALID_PARAMS,
     }
 
 
@@ -175,13 +179,20 @@ class MCPConnection:
         connect_timeout: float = SESSION_CONNECT_TIMEOUT_DEFAULT,
         call_timeout: float = CALL_TOOL_TIMEOUT,
         close_timeout: float = SESSION_CLOSE_TIMEOUT_DEFAULT,
+        response_max_bytes: int = RESPONSE_MAX_BYTES_DEFAULT,
     ) -> None:
         if not all(math.isfinite(value) and value > 0
                    for value in (connect_timeout, call_timeout, close_timeout)):
             raise ValueError("MCP connection, call and shutdown timeouts must be finite positive numbers")
         self._outbound = url if isinstance(url, ValidatedOutboundURL) else None
         self.url = url.url if self._outbound is not None else url
-        self._headers = dict(headers or {})
+        self._response_budget = MCPResponseBudget(response_max_bytes)
+        request_headers = httpx2.Headers(headers)
+        encoding = request_headers.get("accept-encoding", "identity").strip().lower()
+        if encoding not in {"identity", "identity;q=1, *;q=0"}:
+            raise ValueError("MCP response limits require identity Accept-Encoding")
+        request_headers["Accept-Encoding"] = "identity;q=1, *;q=0"
+        self._headers = dict(request_headers)
         self._auth = auth
         self._connect_timeout = connect_timeout
         self._call_timeout = call_timeout
@@ -244,10 +255,12 @@ class MCPConnection:
                     timeout=httpx2.Timeout(self._connect_timeout, read=None),
                     follow_redirects=False,
                     trust_env=False,
+                    event_hooks={"response": [self._response_budget]},
                     transport=(pinned_httpx2_async_transport(self._outbound)
                                if self._outbound is not None else None),
                 ))
-                transport = streamable_http_client(self.url, http_client=http_client)
+                transport = streamable_http_client(self.url, http_client=http_client,
+                    max_sse_event_size=self._response_budget.max_bytes)
                 client = await resources.enter_async_context(Client(
                     transport,
                     cache=None,

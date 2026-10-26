@@ -26,3 +26,7 @@ CALL_TOOL_TIMEOUT = int(os.environ.get("KESTREL_MCP_CALL_TIMEOUT", "120"))
 MCP_CONTAINER_BIND_HOST = "127.0.0.1"
 MCP_REMOVAL_ATTEMPTS = 10
 MCP_REMOVAL_RETRY_DELAY = 0.5
+
+# Bound finite wire responses and each native SSE event independently. A
+# long-lived SSE channel is not subject to a cumulative stream byte cap.
+RESPONSE_MAX_BYTES_DEFAULT = int(os.environ.get("KESTREL_MCP_RESPONSE_MAX_BYTES", str(8 * 1024 * 1024)))

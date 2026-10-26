@@ -221,7 +221,8 @@ async def mcp_http_server(request, tmp_path):
 
         async def write(message):
             wire_mode = settings.get("resource_wire_mode")
-            if wire_mode and b'"resources/read"' in body:
+            wire_method = settings.get("resource_wire_method", "resources/read")
+            if wire_mode and ('"' + wire_method + '"').encode() in body:
                 if message["type"] == "http.response.start":
                     return
                 if message["type"] == "http.response.body":
@@ -229,6 +230,13 @@ async def mcp_http_server(request, tmp_path):
                         try:
                             if wire_mode == "gzip":
                                 yield settings["compressed_resource_wire"]
+                            elif wire_mode == "sse-many":
+                                for _ in range(10):
+                                    yield b":" + b"x" * 1024 + b"\n\n"
+                                    settings["wire_comments_sent"] = settings.get("wire_comments_sent", 0) + 1
+                                yield b"event: message\ndata: " + message["body"] + b"\n\n"
+                            elif wire_mode == "sse-oversized":
+                                yield b"event: message\ndata: " + b"x" * 8192 + b"\n\n"
                             else:
                                 for _ in range(288):
                                     yield b"x" * (32 * 1024)
@@ -236,8 +244,9 @@ async def mcp_http_server(request, tmp_path):
                         finally:
                             settings["resource_wire_closed"].set()
                     headers = {"Content-Encoding": "gzip"} if wire_mode == "gzip" else {}
+                    content_type = "text/event-stream" if wire_mode.startswith("sse-") else "application/json"
                     return await StreamingResponse(adversarial_resource(),
-                        media_type="application/json", headers=headers)(scope, receive, send)
+                        media_type=content_type, headers=headers)(scope, receive, send)
             if message["type"] == "http.response.start":
                 settings.setdefault("responses", []).append(
                     (scope["method"], scope["path"], message["status"]))
