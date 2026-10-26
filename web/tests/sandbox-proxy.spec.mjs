@@ -1,10 +1,14 @@
 import { test, expect } from '@playwright/test';
 import { createServer } from 'node:http';
 import { build } from 'esbuild';
+import { readFileSync } from 'node:fs';
 
 const servers = [];
 let hostOrigin, sandboxOrigin, hostBundle, proxyBundle, appBundle;
 let networkRequests = [];
+let operatorPolicy;
+// Original geometric glyph authored for these tests; repository Apache-2.0 license.
+const testFont = readFileSync(new URL('./fixtures/view-test-font.ttf', import.meta.url));
 
 async function listen() {
     const server = createServer((request, response) => {
@@ -14,6 +18,12 @@ async function listen() {
         if (path.endsWith('.js')) {
             response.setHeader('Content-Type', 'text/javascript');
             return response.end(path === '/host.js' ? hostBundle : proxyBundle);
+        }
+        if (path === '/view-test-font.ttf') {
+            networkRequests.push(request.url);
+            response.setHeader('Content-Type', 'font/ttf');
+            response.setHeader('Access-Control-Allow-Origin', '*');
+            return response.end(testFont);
         }
         if (path === '/early-navigation') {
             networkRequests.push(request.url);
@@ -46,7 +56,7 @@ async function listen() {
                 }, true);
                 window.disposeProxy = startSandboxProxy({
                     hostOrigin: ${JSON.stringify(hostOrigin)}, maxMessageBytes: 2 * 1024 * 1024,
-                    maxHtmlBytes: 1024 * 1024, policy: { connectDomains: [${JSON.stringify(hostOrigin)}] },
+                    maxHtmlBytes: 1024 * 1024, policy: ${JSON.stringify(operatorPolicy)},
                     onerror: error => proxyErrors.push(error.message),
                 });
                 add('message', event => {
@@ -111,13 +121,15 @@ test.afterAll(async () => {
 });
 
 async function mount(page, { html = '<script type="module">' + appBundle + '</script>', csp,
-    sandbox = 'allow-scripts', permissions } = {}) {
+    sandbox = 'allow-scripts', permissions, policy = { connectDomains: [hostOrigin] }, outerAllow = '' } = {}) {
+    operatorPolicy = policy;
     await page.goto(hostOrigin);
-    await page.evaluate(async ({ origin, html, csp, sandbox, permissions }) => {
+    await page.evaluate(async ({ origin, html, csp, sandbox, permissions, outerAllow }) => {
         const { OriginBoundTransport, AppBridge } = await import('/host.js');
         const proxy = document.createElement('iframe');
         proxy.id = 'proxy';
         proxy.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+        proxy.setAttribute('allow', outerAllow);
         document.body.append(proxy);
         window.messages = [];
         window.hostErrors = [];
@@ -133,7 +145,7 @@ async function mount(page, { html = '<script type="module">' + appBundle + '</sc
             targetWindow: proxy.contentWindow, origin, maxMessageBytes: 2 * 1024 * 1024,
         }));
         proxy.src = origin + '/proxy';
-    }, { origin: sandboxOrigin, html, csp, sandbox, permissions });
+    }, { origin: sandboxOrigin, html, csp, sandbox, permissions, outerAllow });
     await expect.poll(() => page.frames().some(frame => frame.url() === sandboxOrigin + '/proxy')).toBe(true);
     return page.frame({ url: sandboxOrigin + '/proxy' });
 }
@@ -388,4 +400,28 @@ test('operator frame grants fail clearly when the proxy cannot support them', as
         catch (error) { return error.message; }
     }, hostOrigin);
     expect(error).toBe('Sandbox proxy does not support nested network frame grants');
+});
+
+
+test('an approved resource domain can supply an actual View font', async ({ page }) => {
+    const url = hostOrigin + '/view-test-font.ttf';
+    const html = `<script>const face = new FontFace('OwnedTest', ${JSON.stringify('url(' + url + ')')});
+        face.load().then(() => window.fontResult = face.status, () => window.fontResult = 'denied');<\/script>`;
+    const proxy = await mount(page, { html, csp: { resourceDomains: [hostOrigin] },
+        policy: { resourceDomains: [hostOrigin] } });
+    await expect.poll(() => proxy.childFrames().length).toBe(1);
+    const view = proxy.childFrames()[0];
+    await expect.poll(() => view.evaluate(() => window.fontResult)).toBeTruthy();
+    expect(await view.evaluate(() => window.fontResult)).toBe('loaded');
+    expect(networkRequests).toEqual(['/view-test-font.ttf']);
+});
+
+test('an operator-approved device is delegated to the opaque View without granting others', async ({ page }) => {
+    const proxy = await mount(page, { permissions: { camera: {}, microphone: {} },
+        policy: { permissions: ['camera'] }, outerAllow: 'camera ' + sandboxOrigin });
+    await expect.poll(() => page.evaluate(() => window.initialized)).toBe(true);
+    const view = proxy.childFrames()[0];
+    // This exercises browser delegation only; it never opens a physical device.
+    expect(await view.evaluate(() => ['camera', 'microphone', 'geolocation'].map(
+        name => document.featurePolicy.allowsFeature(name)))).toEqual([true, false, false]);
 });
