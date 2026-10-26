@@ -64,7 +64,7 @@ async def mcp_http_server(request, tmp_path):
             resource_uri="ui://status/view.html",
             title="Status view",
             description="Display the server status",
-            visibility=["model", "app"],
+            visibility=settings.get("apps_visibility", ["model", "app"]),
             annotations=types.ToolAnnotations(readOnlyHint=True, openWorldHint=False),
             icons=[types.Icon(src="https://example.com/status.svg", mimeType="image/svg+xml")],
             meta={"example.com/custom": {"nested": ["preserved", {"value": 42}]}},
