@@ -89,12 +89,14 @@ def _is_remote_selector(selector: str) -> bool:
     return "://" in selector or selector.lower().startswith(("http:", "https:"))
 
 
-def _load_failure_message(message: str, persistent: bool, *, gateway_replaced: bool = False) -> str:
+def _load_failure_message(message: str, persistent: bool, *, gateway_replaced: bool = False, gateway_withdrawn: bool = False) -> str:
     """Report confirmed durable intent separately from connection publication."""
     if persistent:
         message += "; enablement remains saved and will restore after restart. Unload the saved connection to disable it."
         if gateway_replaced:
             message += " The saved gateway server set was replaced."
+    if gateway_withdrawn:
+        message += " Gateway tool handles were withdrawn while reconnecting; reload a known-good server set to restore them."
     return message
 
 
@@ -740,13 +742,13 @@ class MCPAgent(Feature):
             )
         except (DockerMCPGatewayError, DockerMCPNotInstalledError) as e:
             logger.error(f"Gateway load failed for {server_name}: {e}")
-            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {str(e)}", persistent))
+            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {str(e)}", persistent, gateway_withdrawn=changed))
         except asyncio.TimeoutError:
             logger.error(f"Timeout loading {server_name} via gateway")
-            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: Connection timeout", persistent))
+            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: Connection timeout", persistent, gateway_withdrawn=changed))
         except Exception as e:
             logger.error(f"Unexpected error loading {server_name} via gateway: {e}", exc_info=True)
-            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {str(e)}", persistent))
+            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {str(e)}", persistent, gateway_withdrawn=changed))
 
         finally:
             if changed and not published:
@@ -1207,13 +1209,13 @@ class MCPAgent(Feature):
 
         except (DockerMCPGatewayError, DockerMCPNotInstalledError) as e:
             logger.error(f"Gateway error: {e}")
-            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {str(e)}", persistent, gateway_replaced=True))
+            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {str(e)}", persistent, gateway_replaced=True, gateway_withdrawn=changed))
         except asyncio.TimeoutError as e:
             logger.error(f"Timeout starting gateway: {e}")
-            return ToolResult.failed(_load_failure_message("Failed to start gateway: Connection timeout", persistent, gateway_replaced=True))
+            return ToolResult.failed(_load_failure_message("Failed to start gateway: Connection timeout", persistent, gateway_replaced=True, gateway_withdrawn=changed))
         except Exception as e:
             logger.error(f"Unexpected error starting gateway: {e}", exc_info=True)
-            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {str(e)}", persistent, gateway_replaced=True))
+            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {str(e)}", persistent, gateway_replaced=True, gateway_withdrawn=changed))
 
         finally:
             if changed and not published:

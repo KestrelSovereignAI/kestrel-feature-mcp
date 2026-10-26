@@ -25,32 +25,12 @@ from mcp import types
 
 from kestrel_sdk.tools.result import ToolResult
 from .connection import MCPCallOutcomeUnknownError, MCP_CONNECTION_ERRORS
+from .tool_contract import validate_tool_contract
 
 logger = logging.getLogger(__name__)
 
 # An MCP call transport: ``await caller(real_tool_name, arguments) -> CallToolResult``.
 MCPCaller = Callable[[str, Dict[str, Any]], Awaitable[Any]]
-
-
-def _app_metadata(tool: types.Tool) -> tuple[frozenset[str], str | None]:
-    """Read the native Apps audience and resource association, without grants."""
-    meta = tool.meta or {}
-    if "ui" not in meta:
-        return frozenset({"model", "app"}), None
-    ui = meta["ui"]
-    if not isinstance(ui, dict):
-        raise ValueError("MCP Apps _meta.ui must be an object")
-    visibility = ui.get("visibility", ["model", "app"])
-    if not isinstance(visibility, list) or any(
-        value not in ("model", "app") for value in visibility
-    ):
-        raise ValueError("MCP Apps visibility must contain only model or app")
-    uri = ui.get("resourceUri")
-    if "resourceUri" in ui and (
-        not isinstance(uri, str) or not uri.startswith("ui://") or len(uri) <= 5
-    ):
-        raise ValueError("MCP Apps resourceUri must be a ui:// resource")
-    return frozenset(visibility), uri
 
 
 def extract_mcp_result(result) -> tuple[str, bool]:
@@ -84,12 +64,8 @@ class _MCPToolSchema:
     def __init__(self, name: str, tool: types.Tool):
         self.name = name
         self.description = tool.description or ""
-        # MCP requires an explicit object root; accepting another shape here
-        # would publish an invalid native contract to both the host and Views.
-        if tool.input_schema.get("type") != "object":
-            raise ValueError("MCP inputSchema must explicitly declare type object")
+        visibility, _ = validate_tool_contract(tool)
         self.parameters = deepcopy(tool.input_schema)
-        visibility, _ = _app_metadata(tool)
         self.model_visible = "model" in visibility
         self.command_prefix = None
         # MCP calls hit external servers/processes; keep them serialized rather
@@ -124,7 +100,7 @@ class MCPToolWrapper:
     ):
         self.name = handle_name
         self._native_tool = tool.model_copy(deep=True)
-        self.visibility, self.resource_uri = _app_metadata(self._native_tool)
+        self.visibility, self.resource_uri = validate_tool_contract(self._native_tool)
         self._caller = caller
         self.schema = _MCPToolSchema(handle_name, self._native_tool)
 
@@ -154,6 +130,8 @@ class MCPToolWrapper:
         try:
             result = await self._caller(self._real_name, kwargs)
         except MCPCallOutcomeUnknownError as error:
+            logger.error("MCP tool %r has an unconfirmed outcome (%s)", self._real_name,
+                type(error.__cause__).__name__)
             return ToolResult.failed(
                 str(error), data={"mcp_tool": self._real_name, "execution_outcome": "unknown"},
             ).to_dict()

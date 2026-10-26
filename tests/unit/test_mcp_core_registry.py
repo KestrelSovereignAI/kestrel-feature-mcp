@@ -73,3 +73,64 @@ def test_hidden_tools_require_the_explicit_host_projection_contract_before_refre
         })], caller)
     assert host._direct_tools == original
     assert host._explored_features[owner] is registration
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_connected", [False, True])
+async def test_bad_native_catalog_never_reaches_gateway_enablement_storage(
+    mcp_http_server, monkeypatch, already_connected,
+):
+    """Only substitute the Docker process; discovery uses the real SDK/HTTP."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+    from kestrel_feature_mcp.manager import MCPGatewayManager
+
+    class OwnedHTTPGateway:
+        endpoint_url = mcp_http_server.url
+        is_running = True
+        requested_servers = set()
+
+        async def start(self, servers):
+            self.requested_servers = set(servers)
+            return "test-token"
+
+        async def add_server(self, server):
+            self.requested_servers.add(server)
+            return "test-token"
+
+        async def stop(self):
+            self.is_running = False
+
+    async def unexpected_persist(*args, **kwargs):
+        raise AssertionError("An invalid native catalog reached durable enablement storage")
+
+    async def approved_catalog_names(requested):
+        return None
+
+    host = CoreRegistryHost()
+    host.persist_feature_enablement = unexpected_persist
+    feature = MCPAgent(host)
+    feature._reject_unknown_servers = approved_catalog_names
+    manager = MCPGatewayManager()
+    manager.gateway = OwnedHTTPGateway()
+    monkeypatch.setattr("kestrel_feature_mcp.feature.check_docker_mcp_available", lambda: True)
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", lambda: manager)
+    if already_connected:
+        await manager.start(["known-good"])
+        feature.gateway_manager = manager
+        assert feature._mount_gateway_tools() == 2
+        assert len(host._direct_tools) == 2
+    mcp_http_server.settings["advertised_contract"] = {
+        "meta": {"ui": {"visibility": ["invalid-audience"]}},
+    }
+    try:
+        result = await feature._load_via_gateway("invalid-app")
+        assert result.status is ToolResultStatus.ERROR
+        assert "echo" in result.error and "visibility" in result.error
+        assert "handles were withdrawn" in result.error
+        assert "remains saved" not in result.error
+        assert not host._direct_tools, "Retired transport handles must not survive a failed discovery"
+        assert manager.connection is None
+        assert not manager.tools
+        assert not mcp_http_server.witness
+    finally:
+        await manager.stop()

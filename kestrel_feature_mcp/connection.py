@@ -22,6 +22,7 @@ from kestrel_sdk.security.outbound import ValidatedOutboundURL, pinned_httpx2_as
 
 from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSION_CLOSE_TIMEOUT_DEFAULT, RESPONSE_MAX_BYTES_DEFAULT
 from .http_limits import MCPResponseBudget, MCPResponseLimitError
+from .tool_contract import MCPToolContractError, validate_tool_contract
 
 
 logger = logging.getLogger(__name__)
@@ -315,14 +316,21 @@ class MCPConnection:
             tools: list[types.Tool] = []
             cursor: str | None = None
             seen: set[str] = set()
+            seen_names: set[str] = set()
             while True:
                 result = await self._require_client().list_tools(cursor=cursor)
+                next_cursor = result.next_cursor
+                if next_cursor is not None and next_cursor in seen:
+                    raise ValueError("MCP server repeated its tools/list cursor")
+                for tool in result.tools:
+                    validate_tool_contract(tool)
+                    if tool.name in seen_names:
+                        raise MCPToolContractError(f"Duplicate MCP tool name {tool.name!r} in catalog")
+                    seen_names.add(tool.name)
                 tools.extend(result.tools)
-                cursor = result.next_cursor
+                cursor = next_cursor
                 if cursor is None:
                     return tools
-                if cursor in seen:
-                    raise ValueError("MCP server repeated its tools/list cursor")
                 seen.add(cursor)
 
         return await asyncio.wait_for(collect(), timeout=self._call_timeout)
@@ -344,13 +352,17 @@ class MCPConnection:
 
     async def call_tool(self, name: str, arguments: dict | None = None) -> types.CallToolResult:
         client = self._require_client()
+        # ClientSession.validate_tool_result documents plain RuntimeError for
+        # output-schema failures after execution. Preserve uncertainty rather
+        # than treating an unreadable result as proof the tool did not run.
+        call_errors = (*MCP_CONNECTION_ERRORS, RuntimeError)
         try:
             return await asyncio.wait_for(
                 client.call_tool(name, arguments or {}), timeout=self._call_timeout,
             )
-        except (ExceptionGroup, *MCP_CONNECTION_ERRORS) as error:
+        except (ExceptionGroup, *call_errors) as error:
             if isinstance(error, ExceptionGroup):
-                _, unexpected = error.split(MCP_CONNECTION_ERRORS)
+                _, unexpected = error.split(call_errors)
                 if unexpected is not None:
                     raise
             if _rejected_before_execution(error):

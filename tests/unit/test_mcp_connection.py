@@ -161,7 +161,7 @@ async def test_resource_read_rechecks_session_after_the_native_response(mcp_http
         if read is not None:
             if not read.done():
                 read.cancel()
-        await asyncio.gather(read, return_exceptions=True)
+            await asyncio.gather(read, return_exceptions=True)
         await connection.close()
 
 
