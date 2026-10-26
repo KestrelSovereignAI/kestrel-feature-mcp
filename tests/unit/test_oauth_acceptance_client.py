@@ -2,6 +2,7 @@
 
 import copy
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -100,3 +101,21 @@ async def test_browser_launcher_ignores_imports_from_the_working_directory(tmp_p
     await open_authorization(url)
     assert receipt.read_text() == url
     assert not (tmp_path / "poison-imported").exists()
+
+
+async def test_browser_failure_does_not_try_a_second_controller(tmp_path, monkeypatch):
+    # Both configured commands belong to this test; even a regression cannot
+    # open the real browser. The selected controller's failure must be final.
+    failed = tmp_path / "failed_browser.py"
+    failed.write_text("import sys\nsys.exit(1)\n")
+    second = tmp_path / "second_browser.py"
+    receipt = tmp_path / "second-controller-used"
+    second.write_text("from pathlib import Path\nimport sys\n"
+                      "Path(sys.argv[1]).write_text(sys.argv[2])\n")
+    monkeypatch.setenv("BROWSER", os.pathsep.join([
+        shlex.join([sys.executable, str(failed), "%s"]),
+        shlex.join([sys.executable, str(second), str(receipt), "%s"]),
+    ]))
+    with pytest.raises(GrantRejected, match="browser launcher"):
+        await open_authorization("https://issuer.example/authorize?state=synthetic")
+    assert not receipt.exists()

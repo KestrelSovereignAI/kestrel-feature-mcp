@@ -175,6 +175,40 @@ async def test_unapproved_requests_fail_before_network_io(selection, url, method
         await policy.request(httpx2.Request(method, url, headers=headers))
 
 
+@pytest.mark.parametrize("reply", [
+    {"result": {}}, {"error": {"code": -32601, "message": "Method not found"}},
+])
+async def test_standard_sdk_replies_are_allowed_without_a_new_operation(selection, reply):
+    policy = GrantPolicy(selection)
+    request = httpx2.Request("POST", selection.server_url,
+                            json={"jsonrpc": "2.0", "id": 7, **reply})
+    before = await request.aread()
+    await policy.request(request)
+    assert await request.aread() == before
+
+
+@pytest.mark.parametrize("fields", [
+    {"method": "tools/call", "result": {}},
+    {"method": "tools/call", "error": {"code": -32601, "message": "Method not found"}},
+    {"result": {}, "error": {"code": -32601, "message": "Ambiguous response"}},
+])
+async def test_a_response_shape_cannot_hide_an_unapproved_operation(selection, fields):
+    policy = GrantPolicy(selection)
+    with pytest.raises(GrantRejected, match="only discovers and lists"):
+        await policy.request(httpx2.Request("POST", selection.server_url,
+                                           json={"jsonrpc": "2.0", "id": 7, **fields}))
+
+
+@pytest.mark.parametrize("body", [
+    b"not-json", b"\xff", b"[]", b'{"jsonrpc":"1.0","id":7,"result":{}}',
+    b'{"jsonrpc":"2.0","id":{},"result":{}}',
+])
+async def test_invalid_rpc_envelopes_have_a_safe_policy_error(selection, body):
+    policy = GrantPolicy(selection)
+    with pytest.raises(GrantRejected, match="valid JSON-RPC envelope"):
+        await policy.request(httpx2.Request("POST", selection.server_url, content=body))
+
+
 @pytest.mark.parametrize("change", ["client_id", "resource", "client_secret", "redirect_uri",
                                     "scope", "client_assertion", "audience"])
 async def test_token_request_cannot_change_the_native_binding(selection, change):

@@ -22,8 +22,10 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, RedirectResponse, StreamingResponse
 from starlette.routing import Route
 from mcp.client.auth import OAuthTokenError
+from mcp.shared.exceptions import MCPError
 
 from kestrel_sdk.security.outbound import assert_safe_url, pinned_httpx2_async_transport
+from kestrel_feature_mcp.connection import MCPConnection
 from tests.http_peers import serve_http
 from tests.oauth_acceptance.client import run
 from tests.oauth_acceptance.policy import GrantRejected, GrantSelection, GuardedAuth
@@ -263,6 +265,26 @@ async def test_native_get_status_does_not_replace_mcp_negotiation(oauth_peers, p
     assert ("initialize" in methods) == (protocol == "2025-11-25")
 
 
+@pytest.mark.parametrize("mcp_http_server", [
+    {"tls": True, "oauth": {}, "bootstrap_event_stream": True},
+], indirect=True)
+async def test_bootstrap_hands_off_without_waiting_for_event_stream_eof(oauth_peers):
+    settings = oauth_peers.resource.settings
+    task = asyncio.create_task(drive(oauth_peers))
+    try:
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert task in done, "Initial OAuth waited for the bootstrap event stream to end"
+        result = await task
+        assert settings["bootstrap_body_started"].is_set()
+        assert not settings["release_bootstrap_body"].is_set()
+        assert result["stage"] == "authorized_and_discovered" and result["tools"] == 2
+        assert oauth_peers.requests.count(("POST", "/token")) == 1
+        assert result["tool_calls"] == 0 and oauth_peers.resource.witness == []
+    finally:
+        settings["release_bootstrap_body"].set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
 @pytest.mark.parametrize("oauth_peers", [{"oversized": "identity"},
                                          {"oversized": "authorization"}], indirect=True)
@@ -319,6 +341,33 @@ async def test_completed_exchange_does_not_hide_resource_authorization_denial(oa
     assert oauth_peers.requests.count(("POST", "/token")) == 1
     assert len(oauth_peers.browser_requests) == 1
     assert all(not body for _, body in oauth_peers.resource.requests)
+    assert oauth_peers.resource.witness == []
+
+
+@pytest.mark.parametrize("mcp_http_server", [
+    {"tls": True, "oauth": {}, "legacy": True, "server_ping": True},
+], indirect=True)
+@pytest.mark.parametrize("with_oauth_guard", [False, True])
+async def test_actual_sdk_server_ping_is_answered_during_discovery(oauth_peers, with_oauth_guard):
+    if with_oauth_guard:
+        result = await drive(oauth_peers)
+        assert result["stage"] == "authorized_and_discovered"
+    else:
+        # First prove the independent SDK server/GET stream/ping fixture with
+        # only its synthetic bearer token, without the application's guard.
+        endpoint = await assert_safe_url(oauth_peers.selection.server_url, allowed_schemes=("https",))
+        connection = MCPConnection(endpoint, headers={
+            "Authorization": "Bearer " + oauth_peers.resource.settings["oauth"]["access_token"]},
+            connect_timeout=5, call_timeout=5, close_timeout=5)
+        try:
+            assert len(await connection.connect()) == 2
+        finally:
+            await connection.close()
+    assert oauth_peers.resource.settings["ping_requested"].is_set()
+    assert oauth_peers.resource.settings["ping_answered"].is_set()
+    messages = [json.loads(body) for _, body in oauth_peers.resource.requests if body]
+    replies = [message for message in messages if "result" in message and "method" not in message]
+    assert len(replies) == 1 and replies[0]["result"] == {}
     assert oauth_peers.resource.witness == []
 
 
@@ -414,3 +463,51 @@ async def test_the_actual_sdk_request_pipeline_applies_policy_before_network(oau
     assert isinstance(error, GrantRejected)
     assert "Credentials cannot leave" in str(error)
     assert oauth_peers.resource.witness == []
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
+@pytest.mark.parametrize("enforce_guard", [False, True])
+async def test_resource_auth_policy_stops_an_unapproved_native_request(
+        oauth_peers, monkeypatch, caplog, enforce_guard):
+    from tests.oauth_acceptance import client as client_module
+    corrupted = []
+
+    async def poison_resource_output(_auth, outgoing):
+        # Corrupt the public pass-through auth output, before the outer guard.
+        # Native OAuth, MCP discovery, and the independent server remain real.
+        if outgoing.method == "POST":
+            body = json.loads(await outgoing.aread())
+            if body.get("method") == "tools/list":
+                # Keep the complete native envelope and routing headers. Change
+                # only the HTTP verb, which this discovery role must refuse.
+                outgoing = httpx2.Request("PATCH", outgoing.url, headers=outgoing.headers,
+                                         content=await outgoing.aread())
+                corrupted.append(True)
+        yield outgoing
+
+    monkeypatch.setattr(httpx2.Auth, "async_auth_flow", poison_resource_output)
+    if not enforce_guard:
+        guarded_auth = client_module.GuardedAuth
+
+        def remove_resource_guard(provider, policy):
+            return provider if type(provider) is httpx2.Auth else guarded_auth(provider, policy)
+
+        monkeypatch.setattr(client_module, "GuardedAuth", remove_resource_guard)
+    error = None
+    try:
+        await drive(oauth_peers)
+    except (ValueError, ExceptionGroup, MCPError, ConnectionError, httpx2.HTTPError) as caught:
+        error = caught
+    assert corrupted == [True]
+    assert oauth_peers.requests.count(("POST", "/token")) == 1
+    sent = [json.loads(body) for scope, body in oauth_peers.resource.requests
+            if scope["method"] == "PATCH" and body]
+    assert error is not None
+    assert oauth_peers.resource.witness == []
+    if enforce_guard:
+        assert sent == []
+        assert "only discovers and lists MCP tools" in caplog.text or isinstance(error, GrantRejected)
+    else:
+        # Positive control: removing only this wiring sends the refused verb
+        # to the independent server. Its 405 response is not a policy refusal.
+        assert len(sent) == 1 and sent[0]["method"] == "tools/list"
