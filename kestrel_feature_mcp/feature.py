@@ -101,7 +101,7 @@ def _load_failure_message(message: str, persistent: bool, *, gateway_replaced: b
         if gateway_replaced:
             message += " The saved gateway server set was replaced."
     if gateway_unavailable:
-        message += " Gateway tool handles are unavailable after reconnecting; reload a known-good server set to restore them."
+        message += " Gateway tool handles are unavailable; reload a known-good server set to publish fresh handles."
     return message
 
 

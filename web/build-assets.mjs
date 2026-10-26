@@ -4,6 +4,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { build, version as esbuildVersion } from 'esbuild';
 import { sha256 as digest, SANDBOX_GENERATED_FILES } from './src/sandbox-assets.js';
+import { collectEmbeddedNotices } from './build-notices.mjs';
 
 const webRoot = path.dirname(fileURLToPath(import.meta.url));
 const generatedNames = new Set(SANDBOX_GENERATED_FILES);
@@ -72,20 +73,32 @@ export async function buildSandboxAssets(outputDirectory) {
     const dependencies = new Map();
     for (const input of [...inputs.keys()].filter(name => name.startsWith('node_modules/')).sort()) {
         const item = await licenseFor(input);
-        dependencies.set(item.name, item);
+        dependencies.set(item.name + '@' + item.version, item);
+    }
+    const embedded = await collectEmbeddedNotices(webRoot, [...inputs.keys()]);
+    for (const item of embedded.dependencies) {
+        const key = item.name + '@' + item.version;
+        const installed = dependencies.get(key);
+        if (installed) {
+            installed.embeddedIn = item.embeddedIn;
+            installed.licenses.push(...item.licenses);
+        } else dependencies.set(key, item);
     }
     const ordered = [...dependencies.values()].sort((a, b) => a.name.localeCompare(b.name, 'en'));
     outputs.set('THIRD_PARTY_NOTICES.txt', Buffer.from(ordered.map(item =>
         `${item.name} ${item.version} (${item.license})\n` + item.licenses.map(license =>
             `--- ${license.name} ---\n${license.text.trim()}\n`).join('\n')).join('\n')));
-    const sourceFiles = ['build.mjs', 'build-assets.mjs', 'package.json', 'package-lock.json',
+    const sourceFiles = ['build.mjs', 'build-assets.mjs', 'build-notices.mjs', 'package.json', 'package-lock.json',
+        ...embedded.sourceFiles,
         ...(await fs.readdir(path.join(webRoot, 'src'))).filter(name => name.endsWith('.js')).map(name => 'src/' + name)];
     const sourceHashes = {};
     for (const filename of sourceFiles.sort()) sourceHashes[filename] = digest(await fs.readFile(path.join(webRoot, filename)));
     const manifest = { format: 1, compiler: { name: 'esbuild', version: esbuildVersion },
         sources: sourceHashes, bundledInputs: Object.fromEntries([...inputs].sort(([a], [b]) => a.localeCompare(b, 'en'))),
+        embeddedSourceMaps: embedded.sourceMaps,
         dependencies: ordered.map(item => ({ name: item.name, version: item.version, license: item.license,
-            licenseFiles: Object.fromEntries(item.licenses.map(license => [license.name, digest(license.text)])) })),
+            licenseFiles: Object.fromEntries(item.licenses.map(license => [license.name, digest(license.text)])),
+            ...(item.embeddedIn ? { embeddedIn: item.embeddedIn } : {}) })),
         assets: Object.fromEntries([...outputs].sort(([a], [b]) => a.localeCompare(b, 'en'))
             .map(([name, bytes]) => [name, digest(bytes)])) };
     outputs.set('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2) + '\n'));

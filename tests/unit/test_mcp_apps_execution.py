@@ -178,8 +178,9 @@ async def test_original_view_authority_is_rechecked_after_approval(app_boundary,
         peer.host.unregister_dynamic_tools("mcp:original")
     await peer.approvals.submit_decision(request.id, True, scope="once")
     if withdraw == "view":
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(ResourceConflict, match="before native execution"):
             await call
+        assert not call.cancelled()
     else:
         with pytest.raises((ResourceConflict, ResourceOutcomeUnknown)):
             await call
@@ -233,8 +234,9 @@ async def test_view_close_joins_required_sql_finalization_through_repeated_cance
         with pytest.raises(asyncio.CancelledError):
             await closing
         assert closing.cancelled()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(ResourceOutcomeUnknown):
             await call
+        assert not call.cancelled()
         row = await peer.backend.fetch_one("SELECT result_status, error_class FROM a2a_tool_dispatches")
         assert tuple(row) == ("error", "ResourceOutcomeUnknown")
         assert mcp_http_server.witness == ["before-close"]
@@ -323,11 +325,28 @@ async def test_pending_app_calls_are_bounded_before_more_approval_or_execution_w
             await peer.view.close()
             await asyncio.gather(excess, extra_approval, return_exceptions=True)
         await peer.view.close()
-        assert all(call.done() and call.cancelled() for call in calls)
+        assert all(call.done() and not call.cancelled() and isinstance(call.exception(), ResourceConflict)
+                   for call in calls)
     finally:
         peer.approvals.cancel_all()
         await peer.view.close()
         await asyncio.gather(*calls, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("revoke_view", [False, True])
+async def test_actual_app_caller_cancellation_remains_cancellation(app_boundary, mcp_http_server, revoke_view):
+    peer = app_boundary
+    await allow(peer, "app_mutate", PermissionLevel.ASK)
+    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "cancelled"}))
+    await asyncio.wait_for(peer.approval_requests.get(), 5)
+    if revoke_view:
+        peer.view.revoke()
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert call.cancelled() and not mcp_http_server.witness
+    await peer.view.close()
 
 
 @pytest.mark.asyncio

@@ -85,7 +85,8 @@ class AppView:
 
         return await self._run_owned(read, name="mcp-app-native-resource")
 
-    async def _run_owned(self, operation, *, name: str):
+    async def _run_owned(self, operation, *, name: str,
+                         revoked_outcome: Callable[[], BaseException] | None = None):
         self.require_current()
         if len(self._calls) >= self.executor._max_pending_calls:
             raise ResourceConflict("MCP App View reached its pending-call limit")
@@ -93,6 +94,16 @@ class AppView:
         self._calls.add(call)
         try:
             return await call
+        except asyncio.CancelledError as error:
+            owner = asyncio.current_task()
+            if self._closed and owner is not None and owner.cancelling() == 0:
+                # Withdrawal cancels our child, not the awaiting caller's task.
+                # Preserve actual caller cancellation; otherwise report whether
+                # this View had already admitted a native tool invocation.
+                if revoked_outcome is not None:
+                    raise revoked_outcome() from error
+                raise ResourceConflict("MCP App View closed before resource delivery") from error
+            raise
         finally:
             self._calls.discard(call)
 
@@ -199,9 +210,16 @@ class AppExecutor:
         if not isinstance(arguments, dict):
             raise TypeError("MCP App tool arguments must be an object")
         arguments = deepcopy(arguments)
+        invocation = _Invocation(view, registered)
+
+        def revoked_outcome():
+            if not invocation.started:
+                return ResourceConflict("MCP App View closed before native execution")
+            return ResourceOutcomeUnknown(
+                "MCP App View closed after tool admission; reconcile before retrying. Do not replay",
+            )
 
         async def operation():
-            invocation = _Invocation(view, registered)
             token = self._invocation.set(invocation)
             try:
                 # This is the sole execution lane. Core owns permission hooks,
@@ -243,4 +261,4 @@ class AppExecutor:
                 invocation.finished = True
                 self._invocation.reset(token)
 
-        return await view._run_owned(operation, name="mcp-app-governed-call")
+        return await view._run_owned(operation, name="mcp-app-governed-call", revoked_outcome=revoked_outcome)

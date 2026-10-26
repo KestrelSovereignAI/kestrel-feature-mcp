@@ -365,18 +365,26 @@ class MCPConnection:
                 client.session.call_tool(name, arguments or {}), timeout=self._call_timeout,
             )
         except (ExceptionGroup, *call_errors) as error:
+            self._retire_changed_contract(error)
             if isinstance(error, ExceptionGroup):
                 _, unexpected = error.split(call_errors)
                 if unexpected is not None:
                     raise
             if _rejected_before_execution(error):
-                if isinstance(error, MCPError) and error.code == types.HEADER_MISMATCH:
-                    self._incarnation = None
                 raise
             raise MCPCallOutcomeUnknownError(
                 f"MCP tool {name!r} returned no confirmed result; its execution outcome is unknown. "
                 "Do not replay it without policy approval and an explicit idempotency or safe-repeat guarantee."
             ) from error
+
+    def _retire_changed_contract(self, error: BaseException) -> None:
+        """Withdraw an admitted catalog when the peer rejects its contract."""
+        def mismatch(candidate: BaseException) -> bool:
+            return isinstance(candidate, MCPError) and candidate.code == types.HEADER_MISMATCH
+
+        if mismatch(error) or (isinstance(error, BaseExceptionGroup)
+                and error.subgroup(mismatch) is not None):
+            self._incarnation = None
 
     async def close(self) -> None:
         task = self._task

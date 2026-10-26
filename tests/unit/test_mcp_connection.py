@@ -61,6 +61,31 @@ def test_invalid_deadlines_fail_before_any_connection(value, field):
         MCPConnection("http://127.0.0.1:1/mcp", **{field: value})
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["bare", "group", "nested", "mixed"])
+async def test_catalog_retirement_recognizes_native_header_errors_in_aggregate_outcomes(mcp_http_server, shape):
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        native = await connection.connect()
+        original = bind_tool_caller(connection, lambda: True, "aggregate-header-policy",
+            tool_names=[tool.name for tool in native])
+        # This tests retirement policy, not a fabricated wire reply. The
+        # separate changed-contract test obtains the rejection from the real
+        # native SDK server and verifies the production call wiring.
+        error = MCPError(types.HEADER_MISMATCH, "Native tool contract changed")
+        if shape == "group":
+            error = ExceptionGroup("native outcome", [error])
+        elif shape == "nested":
+            error = ExceptionGroup("outer", [ExceptionGroup("native outcome", [error])])
+        elif shape == "mixed":
+            error = ExceptionGroup("native outcome", [error, TimeoutError("unconfirmed sibling")])
+        connection._retire_changed_contract(error)
+        assert not connection.is_connected and not original.is_current
+        assert not mcp_http_server.witness
+    finally:
+        await connection.close()
+
+
 
 
 @pytest.mark.asyncio

@@ -52,6 +52,16 @@ test('bundles are deterministic and include original dependency licenses and inp
         const notices = await fs.readFile(path.join(first, 'THIRD_PARTY_NOTICES.txt'), 'utf8');
         assert.match(notices, /Apache License/);
         assert.match(notices, /MIT License/);
+        const embedded = JSON.parse(await fs.readFile(new URL('../vendor-notices.json', import.meta.url), 'utf8'));
+        assert.equal(embedded.packages.length, 7);
+        for (const item of embedded.packages) {
+            assert.ok(manifest.dependencies.some(dependency => dependency.name === item.name
+                && dependency.version === item.version), `Missing embedded dependency ${item.name}`);
+            for (const filename of Object.keys(item.licenseFiles)) {
+                const original = await fs.readFile(new URL('../' + filename, import.meta.url), 'utf8');
+                assert.ok(notices.includes(original.trim()), `Missing original embedded notice ${item.name}`);
+            }
+        }
         await fs.writeFile(path.join(other, 'operator-owned.txt'), 'preserve');
         await assert.rejects(buildSandboxAssets(other), /not owned/);
         assert.equal(await fs.readFile(path.join(other, 'operator-owned.txt'), 'utf8'), 'preserve');
