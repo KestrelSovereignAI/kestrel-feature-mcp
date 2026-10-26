@@ -120,3 +120,32 @@ def test_mcp_input_schema_requires_the_standard_object_root(schema):
     record["inputSchema"] = schema
     with pytest.raises(ValueError, match="inputSchema.*object"):
         build_wrappers("dashboard", [record], _metadata_caller())
+
+
+@pytest.mark.parametrize("is_error", [False, True])
+@pytest.mark.parametrize("kind", ["empty", "image", "resource"])
+async def test_model_result_projection_keeps_structured_data_and_omits_native_private_metadata(kind, is_error):
+    private = {"private-sentinel": {"value": 7}}
+    blocks = []
+    if kind == "image":
+        blocks = [types.ImageContent(type="image", data="AA==", mimeType="image/png", _meta=private)]
+    elif kind == "resource":
+        blocks = [types.EmbeddedResource(type="resource", _meta=private,
+            resource=types.TextResourceContents(uri="note://owned/result", text="Public resource text",
+                mimeType="text/plain", _meta=private))]
+    native = types.CallToolResult(content=blocks, isError=is_error, _meta=private,
+        structuredContent={"message": "public data", "_meta": {"business-field": "preserved"}})
+
+    async def caller(_name, _arguments):
+        return native
+
+    (wrapper,) = build_wrappers("dashboard", [_record()], caller)
+    projected = await wrapper.execute()
+    assert "private-sentinel" not in json.dumps(projected)
+    assert projected["data"]["structuredContent"] == native.structured_content
+    assert projected["data"]["structuredContent"]["_meta"] == {"business-field": "preserved"}
+    projected["data"]["structuredContent"]["message"] = "mutated projection"
+    assert native.structured_content["message"] == "public data"
+    assert native.meta == private
+    if kind == "resource":
+        assert "Public resource text" in json.dumps(projected)
