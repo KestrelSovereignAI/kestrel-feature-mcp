@@ -18,7 +18,7 @@ def _metadata_caller():
 def _record(ui=None):
     record = {
         "name": "refresh_dashboard", "title": "Refresh dashboard",
-        "description": "Read dashboard state", "inputSchema": {},
+        "description": "Read dashboard state", "inputSchema": {"type": "object"},
         "outputSchema": {"type": "object"},
         "annotations": {"readOnlyHint": True},
         "_meta": {"private-server-data": {"value": 3}},
@@ -44,7 +44,7 @@ def test_native_tool_visibility_controls_only_model_projection(visibility, visib
     assert wrapper.native_tool.model_dump(mode="json", by_alias=True, exclude_none=True) == (
         types.Tool.model_validate(record).model_dump(mode="json", by_alias=True, exclude_none=True)
     )
-    assert wrapper.schema.to_openai_format()["function"]["parameters"] == {}
+    assert wrapper.schema.to_openai_format()["function"]["parameters"] == {"type": "object"}
     assert "model_visible" not in wrapper.schema.to_openai_format()["function"]["parameters"]
 
 
@@ -106,3 +106,17 @@ def test_deprecated_flat_ui_metadata_does_not_create_a_view_binding():
     (wrapper,) = build_wrappers("dashboard", [record], _metadata_caller())
     assert wrapper.resource_uri is None
     assert wrapper.schema.model_visible is True
+
+
+def test_model_parameters_cannot_mutate_the_native_tool_contract():
+    (wrapper,) = build_wrappers("dashboard", [_record()], _metadata_caller())
+    wrapper.schema.parameters["properties"] = {"unexpected": {"type": "string"}}
+    assert wrapper.native_tool.input_schema == {"type": "object"}
+
+
+@pytest.mark.parametrize("schema", [{}, {"type": "array"}, {"type": ["object", "null"]}])
+def test_mcp_input_schema_requires_the_standard_object_root(schema):
+    record = _record()
+    record["inputSchema"] = schema
+    with pytest.raises(ValueError, match="inputSchema.*object"):
+        build_wrappers("dashboard", [record], _metadata_caller())
