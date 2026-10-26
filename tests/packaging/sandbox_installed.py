@@ -37,12 +37,13 @@ def main():
         (root / "bin").mkdir()
         (root / "bin" / "node").symlink_to(Path(args.node).resolve())
         scenarios = [
-            ("absolute", args.node, str(config)),
-            ("relative-config", args.node, config.name),
-            ("relative-node", os.path.relpath(Path(args.node).resolve(), root.resolve()), config.name),
-            ("relative-path", None, config.name),
+            ("absolute", args.node, ["--config", str(config)]),
+            ("relative-config", args.node, ["--config", config.name]),
+            ("relative-config-equals", args.node, ["--config=" + config.name]),
+            ("relative-node", os.path.relpath(Path(args.node).resolve(), root.resolve()), ["--config", config.name]),
+            ("relative-path", None, ["--config", config.name]),
         ]
-        for scenario, requested, config_argument in scenarios:
+        for scenario, requested, config_arguments in scenarios:
             environment = {key: value for key, value in os.environ.items()
                            if key in {"SystemRoot", "WINDIR", "LANG", "LC_ALL", "LC_CTYPE"}}
             environment.update(HOME=str(root),
@@ -51,7 +52,7 @@ def main():
                 environment["KESTREL_MCP_APPS_NODE"] = requested
             else:
                 environment["PATH"] = "bin"
-            process = subprocess.Popen([str(launcher), "--config", config_argument], cwd=root,
+            process = subprocess.Popen([str(launcher), *config_arguments], cwd=root,
                 env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True)
             try:

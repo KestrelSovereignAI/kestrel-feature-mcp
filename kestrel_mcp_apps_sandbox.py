@@ -17,6 +17,8 @@ def main() -> None:
     # before entering the identity-free service's packaged working directory.
     if len(arguments) == 2 and arguments[0] == "--config" and arguments[1]:
         arguments[1] = str(Path(arguments[1]).absolute())
+    elif len(arguments) == 1 and arguments[0].startswith("--config=") and arguments[0][9:]:
+        arguments[0] = "--config=" + str(Path(arguments[0][9:]).absolute())
     assets = Path(__file__).resolve().parent / "kestrel_feature_mcp" / "apps_sandbox"
     entry = assets / "sandbox-service.mjs"
     if not entry.is_file():
