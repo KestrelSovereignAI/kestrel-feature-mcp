@@ -300,6 +300,11 @@ advertise Apps support: authenticated view routes, initial result associations
 and the chat renderer still need to be composed and accepted together.
 MCP tool loading requires the governed registration API provided by Core 0.55.0
 or newer. An unsupported host is refused before connecting or saving enablement.
+When a server rejects a call with `HeaderMismatch`, Kestrel retires the original
+catalog. Reload the connection to discover and admit the new contract before
+calling again. The [transport specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#client-behavior)
+recommends refreshing and retrying; Kestrel requires that recovery to pass through
+fresh host admission instead of resending under the previous approval.
 
 The package includes a standalone public sandbox service. Run it on a separate
 origin that receives no host identity cookies, behind your normal HTTPS ingress:

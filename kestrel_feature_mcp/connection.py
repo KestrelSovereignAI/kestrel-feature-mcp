@@ -44,7 +44,7 @@ def _rejected_before_execution(error: BaseException) -> bool:
     # response is unreadable or invalid. Those codes cannot establish that
     # the remote tool did not already execute.
     return isinstance(error, MCPError) and error.code in {
-        types.METHOD_NOT_FOUND, types.INVALID_PARAMS,
+        types.METHOD_NOT_FOUND, types.INVALID_PARAMS, types.HEADER_MISMATCH,
     }
 
 
@@ -207,7 +207,8 @@ class MCPConnection:
     @property
     def is_connected(self) -> bool:
         return (
-            self._client is not None
+            self._incarnation is not None
+            and self._client is not None
             and self._task is not None
             and not self._task.done()
             and not self._task.cancelling()
@@ -358,7 +359,10 @@ class MCPConnection:
         call_errors = (*MCP_CONNECTION_ERRORS, RuntimeError)
         try:
             return await asyncio.wait_for(
-                client.call_tool(name, arguments or {}), timeout=self._call_timeout,
+                # The public one-round API preserves native headers and output
+                # validation without Client.call_tool's schema-refresh resend.
+                # A new contract needs a new catalog and governed admission.
+                client.session.call_tool(name, arguments or {}), timeout=self._call_timeout,
             )
         except (ExceptionGroup, *call_errors) as error:
             if isinstance(error, ExceptionGroup):
@@ -366,6 +370,8 @@ class MCPConnection:
                 if unexpected is not None:
                     raise
             if _rejected_before_execution(error):
+                if isinstance(error, MCPError) and error.code == types.HEADER_MISMATCH:
+                    self._incarnation = None
                 raise
             raise MCPCallOutcomeUnknownError(
                 f"MCP tool {name!r} returned no confirmed result; its execution outcome is unknown. "

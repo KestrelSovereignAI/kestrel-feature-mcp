@@ -8,10 +8,50 @@ from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 from mcp.shared.exceptions import MCPError
+from mcp import types
+from pydantic import Field
+from typing import Annotated
 
 from kestrel_feature_mcp.connection import MCPConnection, MCPCallOutcomeUnknownError, bind_tool_caller
 from mcp_types.version import LATEST_PROTOCOL_VERSION
 from kestrel_feature_mcp.manager import DockerMCPGatewayError, MCPGatewayManager, MCPToolManager
+
+
+@pytest.mark.asyncio
+async def test_changed_native_header_contract_is_not_refreshed_and_resent_without_readmission(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        tools = await connection.connect()
+        original = bind_tool_caller(connection, lambda: True, "header-contract",
+            tool_names=[tool.name for tool in tools])
+
+        async def replacement(text: Annotated[str, Field(json_schema_extra={"x-mcp-header": "Text"})]) -> str:
+            mcp_http_server.witness.append(text)
+            return text
+
+        # Change the real server's advertised and enforced contract after the
+        # original catalog was admitted. No fabricated wire error or SDK patch.
+        mcp_http_server.mcp.remove_tool("echo")
+        mcp_http_server.mcp.add_tool(replacement, name="echo")
+        error = None
+        try:
+            await connection.call_tool("echo", {"text": "requires-fresh-admission"})
+        except MCPError as rejected:
+            error = rejected
+        messages = [json.loads(body) for _, body in mcp_http_server.requests if body]
+        assert error is not None, {"effects": mcp_http_server.witness,
+            "methods": [message.get("method") for message in messages]}
+        assert error.code == types.HEADER_MISMATCH
+        assert mcp_http_server.witness == []
+        assert not connection.is_connected and not original.is_current
+        with pytest.raises(ConnectionError):
+            bind_tool_caller(connection, lambda: True, "cannot-rebind-an-unadmitted-catalog")
+        with pytest.raises(ValueError, match="rediscover"):
+            await original("echo", {"text": "must-not-resend"})
+        assert sum(message.get("method") == "tools/list" for message in messages) == 1
+        assert sum(message.get("method") == "tools/call" for message in messages) == 1
+    finally:
+        await connection.close()
 
 
 @pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
