@@ -161,6 +161,64 @@ async def test_resource_read_rechecks_session_after_the_native_response(mcp_http
         if read is not None:
             if not read.done():
                 read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_bound_connection_captures_advertised_names_and_reports_retirement(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        await connection.connect()
+        names = ["echo"]
+        caller = bind_tool_caller(connection, lambda: True, "view-server", tool_names=names)
+        names.append("fail")
+        with pytest.raises(ValueError, match="Unknown tool"):
+            await caller("fail")
+        assert caller.is_current
+        await caller("echo", {"text": "bound session"})
+        await connection.close()
+        assert caller.is_current is False
+        assert mcp_http_server.witness == ["bound session"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True}], indirect=True)
+async def test_bound_resource_reader_rejects_owner_retirement_after_the_response(mcp_http_server, monkeypatch):
+    from mcp import Client
+
+    received, release = asyncio.Event(), asyncio.Event()
+    native_read = Client.read_resource
+
+    async def hold_received_response(client, *args, **kwargs):
+        result = await native_read(client, *args, **kwargs)
+        received.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(Client, "read_resource", hold_received_response)
+    connection = MCPConnection(mcp_http_server.url)
+    owner = {"current": True}
+    read = None
+    try:
+        await connection.connect()
+        caller = bind_tool_caller(connection, lambda: owner["current"], "retiring-view")
+        read = asyncio.create_task(caller.read_resource("ui://status/view.html"))
+        await received.wait()
+        owner["current"] = False
+        release.set()
+        with pytest.raises(ValueError, match="changed"):
+            await read
+        assert connection.is_connected
+        assert not caller.is_current
+        assert mcp_http_server.settings["resource_reads"] == ["resources/read"]
+    finally:
+        release.set()
+        if read is not None:
+            if not read.done():
+                read.cancel()
             await asyncio.gather(read, return_exceptions=True)
         await connection.close()
 

@@ -78,20 +78,47 @@ async def connection_lifecycle(gates: dict, name: str):
             del gates[name]
 
 
+@dataclass(frozen=True)
+class BoundMCPCaller:
+    """One advertised connection lifetime, never a grant to execute tools."""
+
+    connection: MCPConnection
+    name: str
+    incarnation: object
+    _owner_is_current: Callable[[], bool] = field(repr=False)
+    tool_names: frozenset[str] | None = None
+
+    @property
+    def is_current(self) -> bool:
+        return self._owner_is_current() and self.connection.incarnation is self.incarnation
+
+    def require_current(self) -> None:
+        if not self.is_current:
+            raise ValueError(f"MCP connection {self.name} changed; rediscover its tools before calling")
+
+    async def __call__(self, tool_name: str, arguments: dict | None = None):
+        self.require_current()
+        if self.tool_names is not None and tool_name not in self.tool_names:
+            raise ValueError(f"Unknown tool: {tool_name}. Available: {sorted(self.tool_names)}")
+        return await self.connection.call_tool(tool_name, arguments or {})
+
+    async def read_resource(self, uri: str) -> types.ReadResourceResult:
+        self.require_current()
+        result = await self.connection.read_resource(uri, incarnation=self.incarnation)
+        self.require_current()
+        return result
+
+
 def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, tool_names=None):
     """Bind the advertised connection, never a later replacement's transport."""
     incarnation = connection.incarnation
     if incarnation is None:
         raise ConnectionError("MCP connection is not connected")
-
-    async def call(tool_name: str, arguments: dict | None = None):
-        if not is_current():
-            raise ValueError(f"MCP connection {name} changed; rediscover its tools before calling")
-        connection.require_incarnation(incarnation)
-        if tool_names is not None and tool_name not in tool_names:
-            raise ValueError(f"Unknown tool: {tool_name}. Available: {list(tool_names)}")
-        return await connection.call_tool(tool_name, arguments or {})
-    return call
+    return BoundMCPCaller(
+        connection=connection, name=name, incarnation=incarnation,
+        _owner_is_current=is_current,
+        tool_names=frozenset(tool_names) if tool_names is not None else None,
+    )
 
 
 def describe_tools(client, tools, **labels) -> list[dict]:
