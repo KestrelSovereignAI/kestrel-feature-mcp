@@ -91,12 +91,7 @@ def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, t
 
 def describe_tools(client, tools, **labels) -> list[dict]:
     """Retain the SDK's standard Tool record alongside host connection labels."""
-    # Include every SDK-declared field, including _meta, annotations and output
-    # schema. Undeclared server root extensions must not impersonate our host
-    # connection labels; arbitrary vendor metadata remains intact inside _meta.
-    wire_fields = set(types.Tool.model_fields)
-    return [{**tool.model_dump(mode="json", by_alias=True, exclude_none=True,
-                              include=wire_fields),
+    return [{**tool.model_dump(mode="json", by_alias=True, exclude_none=True),
              **labels, "protocol_version": client.protocol_version}
             for tool in tools]
 
