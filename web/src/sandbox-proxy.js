@@ -54,7 +54,8 @@ export function sandboxCsp(csp) {
     return [
         "default-src 'none'", `script-src 'unsafe-inline' ${resources}`,
         `style-src 'unsafe-inline' ${resources}`, `img-src data: ${resources}`,
-        `media-src data: ${resources}`, `connect-src ${domains('connectDomains')}`,
+        `media-src data: ${resources}`, `font-src ${domains('resourceDomains')}`,
+        `connect-src ${domains('connectDomains')}`,
         `frame-src ${domains('frameDomains')}`, `base-uri ${domains('baseUriDomains')}`,
         "object-src 'none'", "form-action 'none'", "worker-src 'none'",
     ].join('; ');

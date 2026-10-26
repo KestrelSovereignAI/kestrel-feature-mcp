@@ -425,3 +425,15 @@ test('an operator-approved device is delegated to the opaque View without granti
     expect(await view.evaluate(() => ['camera', 'microphone', 'geolocation'].map(
         name => document.featurePolicy.allowsFeature(name)))).toEqual([true, false, false]);
 });
+
+
+test('View tool requests before initialization never reach the host', async ({ page }) => {
+    const html = `<script>parent.postMessage({ jsonrpc:'2.0', id: 'early-call',
+        method: 'tools/call', params: { name: 'forbidden', arguments: {} } }, '*');<\/script>`;
+    const proxy = await mount(page, { html });
+    await expect.poll(() => proxy.evaluate(() => window.proxyErrors)).toEqual([
+        'Sandbox View used the bridge before initialization',
+    ]);
+    expect(await page.evaluate(() => messages.some(message => message.id === 'early-call'))).toBe(false);
+    expect(await proxy.locator('iframe').count()).toBe(0);
+});
