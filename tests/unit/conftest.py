@@ -9,7 +9,8 @@ import uvicorn
 from mcp import types
 from mcp_types.version import LATEST_PROTOCOL_VERSION
 from mcp.server import MCPServer
-from mcp.server.apps import Apps
+from mcp.server.apps import APP_MIME_TYPE, Apps
+from mcp.server.mcpserver.resources import BinaryResource
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.shared.exceptions import MCPError
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -72,7 +73,14 @@ async def mcp_http_server(request, tmp_path):
         async def status_view() -> dict[str, str]:
             return {"status": "ready"}
 
-        apps.add_html_resource("ui://status/view.html", "<!doctype html><p>Status</p>")
+        html = settings.get("apps_html", "<!doctype html><p>Status</p>")
+        if settings.get("apps_blob"):
+            apps.add_resource(BinaryResource(
+                uri="ui://status/view.html", name="Status", mime_type=APP_MIME_TYPE,
+                data=html.encode("utf-8"), meta=settings.get("apps_resource_meta"),
+            ))
+        else:
+            apps.add_html_resource("ui://status/view.html", html)
         extensions.append(apps)
     mcp = TestServer("native-connection-test", extensions=extensions)
     witness = []

@@ -186,7 +186,8 @@ async def test_bound_connection_captures_advertised_names_and_reports_retirement
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True}], indirect=True)
-async def test_bound_resource_reader_rejects_owner_retirement_after_the_response(mcp_http_server, monkeypatch):
+@pytest.mark.parametrize("reader", ["bound", "app"])
+async def test_bound_resource_reader_rejects_owner_retirement_after_the_response(mcp_http_server, monkeypatch, reader):
     from mcp import Client
 
     received, release = asyncio.Event(), asyncio.Event()
@@ -205,7 +206,12 @@ async def test_bound_resource_reader_rejects_owner_retirement_after_the_response
     try:
         await connection.connect()
         caller = bind_tool_caller(connection, lambda: owner["current"], "retiring-view")
-        read = asyncio.create_task(caller.read_resource("ui://status/view.html"))
+        if reader == "app":
+            from kestrel_feature_mcp.apps_resources import read_app_resource
+            operation = read_app_resource(caller, uri="ui://status/view.html", max_html_bytes=4096)
+        else:
+            operation = caller.read_resource("ui://status/view.html")
+        read = asyncio.create_task(operation)
         await received.wait()
         owner["current"] = False
         release.set()
