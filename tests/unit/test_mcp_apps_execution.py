@@ -468,6 +468,7 @@ async def test_native_app_result_waits_for_post_policy_then_required_sql(app_bou
     peer = app_boundary
     await allow(peer, "app_mutate")
     policy_started, release_policy = asyncio.Event(), asyncio.Event()
+    policy_results = []
     peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
 
     class CompletePostPolicy(Hook):
@@ -475,10 +476,7 @@ async def test_native_app_result_waits_for_post_policy_then_required_sql(app_bou
             super().__init__("complete-native-app-policy", [HookEvent.POST_TOOL_USE])
 
         async def execute(self, value):
-            assert isinstance(value.tool_response, DeferredToolResult)
-            serialized = json.dumps(value.tool_response)
-            assert "policy-first" in serialized
-            assert "private-result" not in serialized and "private-block" not in serialized
+            policy_results.append(value.tool_response)
             policy_started.set()
             await release_policy.wait()
             return HookOutput.allow()
@@ -487,6 +485,10 @@ async def test_native_app_result_waits_for_post_policy_then_required_sql(app_bou
     call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "policy-first"}))
     try:
         await asyncio.wait_for(policy_started.wait(), 5)
+        assert len(policy_results) == 1 and isinstance(policy_results[0], DeferredToolResult)
+        serialized = json.dumps(policy_results[0])
+        assert "policy-first" in serialized
+        assert "private-result" not in serialized and "private-block" not in serialized
         assert not call.done() and not peer.store.dispatch_started.is_set()
         assert mcp_http_server.witness == ["policy-first"]
         release_policy.set()
