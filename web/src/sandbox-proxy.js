@@ -69,6 +69,13 @@ export function startSandboxProxy({ hostOrigin, maxMessageBytes, maxHtmlBytes, p
     // Snapshot policy before accepting untrusted messages.
     const grants = structuredClone(policy);
     approveSandboxPolicy({}, {}, grants);
+    // The View's WindowProxy survives navigation, including a navigation
+    // before its first load event. Restrict the parent document before
+    // creating the View so no foreign document can inherit its bridge.
+    const navigationPolicy = eventWindow.document.createElement('meta');
+    navigationPolicy.httpEquiv = 'Content-Security-Policy';
+    navigationPolicy.content = "frame-src 'none'";
+    eventWindow.document.head.append(navigationPolicy);
     const host = eventWindow.parent;
     let view, closed = false, initializeId, phase = 'empty';
     const postHost = message => host.postMessage(message, hostOrigin);

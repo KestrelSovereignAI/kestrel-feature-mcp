@@ -343,6 +343,15 @@ for (const method of ['script', 'meta']) {
         const proxy = await mount(page, { html });
         await expect.poll(() => proxy.evaluate(() => window.viewLoads)).toBeGreaterThanOrEqual(1);
         expect(networkRequests).toEqual([]);
-        expect(await proxy.childFrames()[0].evaluate(() => self.origin)).toBe('null');
+        const [view] = proxy.childFrames();
+        if (view) {
+            expect(view.url()).not.toMatch(/^https?:/);
+            // Chromium may replace a refused navigation with its inert error page.
+            expect(await view.evaluate(() => self.origin)).toBe('null');
+        } else {
+            expect(await proxy.evaluate(() => window.proxyErrors)).toEqual([
+                'Sandbox View navigated away from its original resource',
+            ]);
+        }
     });
 }
