@@ -45,6 +45,8 @@ async def mcp_http_server(request, tmp_path):
     settings["release_bootstrap_body"] = asyncio.Event()
     settings["input_witness_file"] = tmp_path / "input-execution-witness"
     settings["release_resource_wire"] = asyncio.Event()
+    settings["resource_read_started"] = asyncio.Event()
+    settings["app_reply_recorded"] = asyncio.Event()
     settings["resource_wire_closed"] = asyncio.Event()
     if settings.get("resource_wire_mode") == "gzip":
         # Construct the adversarial fixture before client allocation tracing.
@@ -56,6 +58,10 @@ async def mcp_http_server(request, tmp_path):
             listed = [] if settings.get("empty_tools") else await self.list_tools()
             if settings.get("advertised_contract") is not None and listed:
                 listed[0] = listed[0].model_copy(update=settings["advertised_contract"], deep=True)
+            for index, tool in enumerate(listed):
+                update = settings.get("advertised_tool_contracts", {}).get(tool.name)
+                if update is not None:
+                    listed[index] = tool.model_copy(update=update, deep=True)
             if settings.get("duplicate_tools") and listed:
                 listed.append(listed[0].model_copy(deep=True))
             if settings.get("repeat_cursor"):
@@ -83,6 +89,18 @@ async def mcp_http_server(request, tmp_path):
         async def status_view() -> dict[str, str]:
             return {"status": "ready"}
 
+        if settings.get("apps_execution_tools"):
+            @apps.tool(resource_uri="ui://status/view.html", visibility=["app"], description="Record one View action")
+            async def app_mutate(text: str) -> types.CallToolResult:
+                witness.append(text)
+                await asyncio.sleep(settings.get("app_tool_delay", 0))
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=text,
+                        _meta={"private-block": "view-only"})],
+                    structured_content={"text": text},
+                    _meta={"private-result": {"view": "only"}},
+                )
+
         html = settings.get("apps_html", "<!doctype html><p>Status</p>")
         if settings.get("apps_blob"):
             apps.add_resource(BinaryResource(
@@ -108,6 +126,7 @@ async def mcp_http_server(request, tmp_path):
     async def discover_behavior(ctx, call_next):
         if ctx.method == "resources/read":
             settings.setdefault("resource_reads", []).append(ctx.method)
+            settings["resource_read_started"].set()
             await asyncio.sleep(settings.get("resource_delay", 0))
         if ctx.method == "tools/call" and settings.get("input_required"):
             with settings["input_witness_file"].open("a") as stream:
@@ -287,6 +306,8 @@ async def mcp_http_server(request, tmp_path):
                 await app(scope, read, write)
         finally:
             requests.append((scope, bytes(body)))
+            if b'"tools/call"' in body and b'"app_mutate"' in body:
+                settings["app_reply_recorded"].set()
 
     tls = settings.get("tls", False)
     certificate_host = settings.get("certificate_host", "remote.example") if tls else None

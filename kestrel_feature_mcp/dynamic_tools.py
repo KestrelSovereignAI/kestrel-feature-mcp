@@ -19,13 +19,16 @@ from __future__ import annotations
 import logging
 import json
 from copy import deepcopy
-from typing import Any, Awaitable, Callable, Dict, List
+from typing import Any, Awaitable, Callable, Dict, List, TYPE_CHECKING
 
 from mcp import types
 
 from kestrel_sdk.tools.result import ToolResult
 from .connection import MCPCallOutcomeUnknownError, MCP_CONNECTION_ERRORS
 from .tool_contract import validate_tool_contract
+
+if TYPE_CHECKING:
+    from .apps_execution import AppExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +100,18 @@ class MCPToolWrapper:
         handle_name: str,
         tool: types.Tool,
         caller: MCPCaller,
+        app_executor: AppExecutor | None = None,
     ):
         self.name = handle_name
         self._native_tool = tool.model_copy(deep=True)
         self.visibility, self.resource_uri = validate_tool_contract(self._native_tool)
         self._caller = caller
+        self.app_executor = app_executor
         self.schema = _MCPToolSchema(handle_name, self._native_tool)
+
+    @property
+    def bound_caller(self) -> MCPCaller:
+        return self._caller
 
     @property
     def native_tool(self) -> types.Tool:
@@ -123,7 +132,8 @@ class MCPToolWrapper:
         the ``ToolResult.failed`` *classmethod* (always truthy) and record every
         call as an error. (Caught by the #1979 DB-grounded dogfood.)
         """
-        if not self.schema.model_visible:
+        invocation = self.app_executor.admit(self) if self.app_executor is not None else None
+        if invocation is None and not self.schema.model_visible:
             return ToolResult.failed(
                 "MCP app-only tool requires a live authorized view",
             ).to_dict()
@@ -152,14 +162,16 @@ class MCPToolWrapper:
             # defines. It is distinct from the native result/block _meta.
             data["structuredContent"] = deepcopy(result.structured_content)
         if is_error:
-            return ToolResult.failed(
+            projected = ToolResult.failed(
                 f"MCP tool '{self._real_name}' reported an error:\n{text}",
                 data=data,
             ).to_dict()
-        # A complete native result may contain structured data alone (or
-        # legitimately no content). Acknowledge that explicit success without
-        # serializing its private metadata into the required confirmation.
-        return ToolResult.ok(text or "MCP tool completed", data=data).to_dict()
+        else:
+            # A complete native result may legitimately have no text content.
+            projected = ToolResult.ok(text or "MCP tool completed", data=data).to_dict()
+        if invocation is not None:
+            self.app_executor.capture(invocation, result, projected)
+        return projected
 
 
 def build_wrappers(
