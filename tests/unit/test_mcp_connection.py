@@ -676,3 +676,22 @@ async def test_discovery_preserves_native_apps_tool_fields(mcp_http_server, tran
         if body:
             meta = json.loads(body)["params"]["_meta"]
             assert "io.modelcontextprotocol/ui" not in json.dumps(meta)
+
+
+def test_server_extensions_cannot_supply_host_connection_labels():
+    from mcp import types
+    from kestrel_feature_mcp.connection import describe_tools
+
+    tool = types.Tool.model_validate({
+        "name": "status", "inputSchema": {"type": "object"},
+        "container": "forged-container", "connection": "forged-connection",
+        "url": "https://forged.example", "via": "remote",
+        "protocol_version": "forged-version",
+        "_meta": {"example.com/custom": {"connection": "ordinary server data"}},
+    })
+    record = describe_tools(SimpleNamespace(protocol_version=LATEST_PROTOCOL_VERSION),
+                            [tool], container="owned-container")[0]
+    assert record["container"] == "owned-container"
+    assert record["protocol_version"] == LATEST_PROTOCOL_VERSION
+    assert not {"connection", "url", "via"}.intersection(record)
+    assert record["_meta"] == tool.meta
