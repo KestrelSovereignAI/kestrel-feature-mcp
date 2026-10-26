@@ -93,7 +93,16 @@ class AppView:
         call = asyncio.create_task(operation(), name=name)
         self._calls.add(call)
         try:
-            return await call
+            result = await call
+            # The child may finish before a queued lifecycle callback runs,
+            # while this awaiting API task resumes after that callback.
+            try:
+                self.require_current()
+            except ResourceConflict as error:
+                if revoked_outcome is not None:
+                    raise revoked_outcome() from error
+                raise
+            return result
         except asyncio.CancelledError as error:
             owner = asyncio.current_task()
             if self._closed and owner is not None and owner.cancelling() == 0:
@@ -214,9 +223,13 @@ class AppExecutor:
 
         def revoked_outcome():
             if not invocation.started:
-                return ResourceConflict("MCP App View closed before native execution")
+                return ResourceConflict("MCP App authority expired before native execution")
+            if invocation.native is not None:
+                return MCPAppResultWithheld(
+                    "Native MCP result received; delivery was withheld after authority expired. Do not replay",
+                )
             return ResourceOutcomeUnknown(
-                "MCP App View closed after tool admission; reconcile before retrying. Do not replay",
+                "MCP App authority expired after tool admission; reconcile before retrying. Do not replay",
             )
 
         async def operation():

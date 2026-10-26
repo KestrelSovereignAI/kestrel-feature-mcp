@@ -350,6 +350,39 @@ async def test_actual_app_caller_cancellation_remains_cancellation(app_boundary,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["tool", "resource"])
+async def test_view_withdrawal_at_the_owned_result_handoff_withholds_delivery(app_boundary, mcp_http_server, operation):
+    peer = app_boundary
+    await allow(peer, "app_mutate")
+    holder, scheduled = [], []
+
+    def current_owner():
+        completed = bool(mcp_http_server.witness or mcp_http_server.settings.get("resource_reads"))
+        if completed and not scheduled:
+            scheduled.append(True)
+            # A real lifecycle callback runs after native completion but before
+            # the awaiting API task receives its owned child's result.
+            asyncio.get_running_loop().call_soon(holder[0].revoke)
+        return True
+
+    view = peer.executor.open_view(peer.view.source, peer.registered,
+        session_id="mcp-app:owned-handoff", owner_is_current=current_owner)
+    holder.append(view)
+    try:
+        if operation == "tool":
+            with pytest.raises(ResourceOutcomeUnknown):
+                await peer.executor.invoke(view, "app_mutate", {"text": "handoff-once"})
+            assert mcp_http_server.witness == ["handoff-once"]
+        else:
+            with pytest.raises(ResourceConflict):
+                await view.read_resource("ui://status/view.html", max_html_bytes=4096)
+            assert not mcp_http_server.witness
+        assert scheduled and not view._calls
+    finally:
+        await view.close()
+
+
+@pytest.mark.asyncio
 async def test_inherited_context_cannot_reuse_an_admitted_app_invocation(app_boundary, mcp_http_server):
     peer = app_boundary
     tool = await allow(peer, "app_mutate")
