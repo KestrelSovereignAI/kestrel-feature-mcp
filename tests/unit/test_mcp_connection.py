@@ -660,7 +660,10 @@ async def test_discovery_preserves_native_apps_tool_fields(mcp_http_server, tran
             connection = manager.owned_containers["test"]["connection"]
             actual = next(tool for tool in manager.get_all_tools() if tool["name"] == "status_view")
         finally:
-            await manager.aclose()
+            try:
+                await manager._drop_connection("test")
+            finally:
+                await manager.aclose()
         assert not connection.is_connected
         assert connection._task is None
         assert actual.pop("container") == "test"

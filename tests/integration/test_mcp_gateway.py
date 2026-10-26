@@ -9,6 +9,7 @@ Run with: uv run pytest tests/integration/test_mcp_gateway.py -v -x
 
 import pytest
 import pytest_asyncio
+from mcp import types
 
 # Mark all tests in this module as requiring Docker MCP
 pytestmark = pytest.mark.docker_mcp
@@ -278,9 +279,8 @@ class TestMCPGatewayManager:
         assert len(tools) > 0
 
         for tool in tools:
-            assert "name" in tool
-            assert "description" in tool
-            assert "inputSchema" in tool
+            # Description is optional in the native Tool contract.
+            types.Tool.model_validate(tool)
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(GATEWAY_TIMEOUT)
