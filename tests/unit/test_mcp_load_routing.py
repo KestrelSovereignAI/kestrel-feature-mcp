@@ -121,8 +121,8 @@ async def test_load_stdio_server_delegates_to_gateway(monkeypatch):
 
         def get_all_tools(self):
             return [
-                {"name": "get_current_time", "description": "d", "inputSchema": {}},
-                {"name": "convert_time", "description": "d", "inputSchema": {}},
+                {"name": "get_current_time", "description": "d", "inputSchema": {"type": "object"}},
+                {"name": "convert_time", "description": "d", "inputSchema": {"type": "object"}},
             ]
 
         def tool_caller(self):

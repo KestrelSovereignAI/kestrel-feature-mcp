@@ -77,8 +77,11 @@ class _MCPToolSchema:
     def __init__(self, name: str, tool: types.Tool):
         self.name = name
         self.description = tool.description or ""
-        # inputSchema is required by MCP and stays exactly as advertised.
-        self.parameters = tool.input_schema
+        # MCP requires an explicit object root; accepting another shape here
+        # would publish an invalid native contract to both the host and Views.
+        if tool.input_schema.get("type") != "object":
+            raise ValueError("MCP inputSchema must explicitly declare type object")
+        self.parameters = deepcopy(tool.input_schema)
         visibility, _ = _app_metadata(tool)
         self.model_visible = "model" in visibility
         self.command_prefix = None

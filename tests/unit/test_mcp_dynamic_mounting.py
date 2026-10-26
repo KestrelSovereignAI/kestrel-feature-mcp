@@ -271,7 +271,7 @@ class TestWrapper:
         # dict's "status" key. (Regression: a raw ToolResult records as error
         # because infer_tool_result_status reads the .failed classmethod.)
         caller = AsyncMock(return_value=_result("hello"))
-        w = MCPToolWrapper(handle_name="mcp__fetch__fetch", tool=types.Tool(name="fetch", description="d", inputSchema={}), caller=caller)
+        w = MCPToolWrapper(handle_name="mcp__fetch__fetch", tool=types.Tool(name="fetch", description="d", inputSchema={"type": "object"}), caller=caller)
         res = await w.execute(url="x")
         assert isinstance(res, dict) and res["status"] == "ok"
         assert "hello" in res["confirmation"]
@@ -280,14 +280,14 @@ class TestWrapper:
     @pytest.mark.asyncio
     async def test_execute_iserror_is_failed(self):
         caller = AsyncMock(return_value=_result("boom", is_error=True))
-        w = MCPToolWrapper(handle_name="h", tool=types.Tool(name="fetch", description="", inputSchema={}), caller=caller)
+        w = MCPToolWrapper(handle_name="h", tool=types.Tool(name="fetch", description="", inputSchema={"type": "object"}), caller=caller)
         res = await w.execute()
         assert isinstance(res, dict) and res["status"] == "error" and "boom" in res["error"]
 
     @pytest.mark.asyncio
     async def test_execute_exception_is_failed(self):
         caller = AsyncMock(side_effect=ConnectionError("transport down"))
-        w = MCPToolWrapper(handle_name="h", tool=types.Tool(name="fetch", description="", inputSchema={}), caller=caller)
+        w = MCPToolWrapper(handle_name="h", tool=types.Tool(name="fetch", description="", inputSchema={"type": "object"}), caller=caller)
         res = await w.execute()
         assert isinstance(res, dict) and res["status"] == "error" and "transport down" in res["error"]
 
@@ -295,7 +295,7 @@ class TestWrapper:
     async def test_programming_errors_are_not_transport_failures(self):
         async def broken_caller(name, arguments):
             raise RuntimeError("broken caller invariant")
-        wrapper = MCPToolWrapper(handle_name="h", tool=types.Tool(name="echo", description="", inputSchema={}), caller=broken_caller)
+        wrapper = MCPToolWrapper(handle_name="h", tool=types.Tool(name="echo", description="", inputSchema={"type": "object"}), caller=broken_caller)
         with pytest.raises(RuntimeError, match="broken caller invariant"):
             await wrapper.execute()
 
@@ -303,7 +303,7 @@ class TestWrapper:
     async def test_disconnected_native_connection_is_a_known_failure(self):
         from kestrel_feature_mcp.connection import MCPConnection
         connection = MCPConnection("http://127.0.0.1:1/mcp")
-        wrapper = MCPToolWrapper(handle_name="h", tool=types.Tool(name="echo", description="", inputSchema={}), caller=connection.call_tool)
+        wrapper = MCPToolWrapper(handle_name="h", tool=types.Tool(name="echo", description="", inputSchema={"type": "object"}), caller=connection.call_tool)
         result = await wrapper.execute()
         assert result["status"] == "error"
         assert "not connected" in result["error"]
@@ -318,16 +318,16 @@ class TestWrapper:
         assert fmt["function"]["parameters"] == schema
         assert s.is_concurrency_safe is False
 
-    def test_schema_keeps_empty_native_schema(self):
-        s = _MCPToolSchema("h", types.Tool(name="native", description="", inputSchema={}))
-        assert s.to_openai_format()["function"]["parameters"] == {}
+    def test_schema_refuses_empty_native_schema(self):
+        with pytest.raises(ValueError, match="inputSchema.*object"):
+            _MCPToolSchema("h", types.Tool(name="native", description="", inputSchema={}))
 
     def test_extract_multi_block(self):
         text, err = extract_mcp_result(_result(blocks=[SimpleNamespace(text="a"), SimpleNamespace(text="b")]))
         assert text == "a\nb" and err is False
 
     def test_build_wrappers_maps_handles_and_real_names(self):
-        ws = build_wrappers("fetch", [{"name": "fetch", "description": "d", "inputSchema": {}}], AsyncMock())
+        ws = build_wrappers("fetch", [{"name": "fetch", "description": "d", "inputSchema": {"type": "object"}}], AsyncMock())
         assert ws[0].name == "mcp__fetch__fetch"
         assert ws[0]._real_name == "fetch"
 
@@ -387,7 +387,7 @@ class TestMounting:
         host = _FakeHost()
         feat = _feature(host)
         n = feat._mount_tools("mcp:srv", "srv",
-                              [{"name": "a", "inputSchema": {}}, {"name": "b", "inputSchema": {}}],
+                              [{"name": "a", "inputSchema": {"type": "object"}}, {"name": "b", "inputSchema": {"type": "object"}}],
                               AsyncMock())
         assert n == 2
         assert {w._real_name for w in host.registered["mcp:srv"]} == {"a", "b"}
@@ -397,7 +397,7 @@ class TestMounting:
         host = _FakeHost()
         gw = MagicMock()
         gw.is_connected = True
-        gw.get_all_tools.return_value = [{"name": "fetch", "description": "d", "inputSchema": {}}]
+        gw.get_all_tools.return_value = [{"name": "fetch", "description": "d", "inputSchema": {"type": "object"}}]
         gw.call_tool = AsyncMock(return_value=_result("page"))
         gw.tool_caller.return_value = gw.call_tool
         feat = _feature(host, gateway=gw)
@@ -493,7 +493,7 @@ class TestMounting:
             SimpleNamespace(name="fetch"), SimpleNamespace(name="sqlite_query"),
         ])
         gw.get_all_tools = MagicMock(return_value=[
-            {"name": "fetch", "inputSchema": {}}, {"name": "sqlite_query", "inputSchema": {}},
+            {"name": "fetch", "inputSchema": {"type": "object"}}, {"name": "sqlite_query", "inputSchema": {"type": "object"}},
         ])
         feat = _feature(gateway=gw)
 
@@ -528,7 +528,7 @@ class TestMounting:
 
     def test_generated_handles_are_provider_valid(self):
         # The host sanitises, but the proposed handles should already be tame.
-        ws = build_wrappers("fetch", [{"name": "do_thing", "inputSchema": {}}], AsyncMock())
+        ws = build_wrappers("fetch", [{"name": "do_thing", "inputSchema": {"type": "object"}}], AsyncMock())
         assert re.fullmatch(r"[a-zA-Z0-9_-]+", ws[0].name)
 
 

@@ -217,13 +217,13 @@ class MCPAgent(Feature):
         """Mount a set of MCP tools into the host registry under ``owner``.
 
         Idempotent refresh: any previously-mounted tools for ``owner`` are
-        dropped first, then the current set is registered. Returns the number
+        replaced only after the complete advertised batch validates. Returns the number
         of tools mounted. A host without a dynamic registry is unsupported.
         """
         if not self._host_supports_dynamic_tools():
             raise RuntimeError("MCP execution requires the host's governed dynamic tool registry")
-        self.agent.unregister_dynamic_tools(owner)
         wrappers = build_wrappers(handle_prefix, tool_dicts, caller)
+        self.agent.unregister_dynamic_tools(owner)
         return self.agent.register_dynamic_tools(owner, wrappers)
 
     def _unmount_tools(self, owner: str) -> int:
