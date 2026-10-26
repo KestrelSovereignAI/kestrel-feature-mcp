@@ -90,8 +90,9 @@ def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, t
 
 
 def describe_tools(client, tools, **labels) -> list[dict]:
-    return [{**labels, "name": tool.name, "description": tool.description,
-             "inputSchema": tool.input_schema, "protocol_version": client.protocol_version}
+    """Retain the SDK's standard Tool record alongside host connection labels."""
+    return [{**tool.model_dump(mode="json", by_alias=True, exclude_none=True),
+             **labels, "protocol_version": client.protocol_version}
             for tool in tools]
 
 

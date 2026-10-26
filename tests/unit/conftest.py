@@ -9,6 +9,7 @@ import uvicorn
 from mcp import types
 from mcp_types.version import LATEST_PROTOCOL_VERSION
 from mcp.server import MCPServer
+from mcp.server.apps import Apps
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.shared.exceptions import MCPError
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -55,7 +56,25 @@ async def mcp_http_server(request, tmp_path):
                 )
             return types.ListToolsResult(tools=listed)
 
-    mcp = TestServer("native-connection-test")
+    extensions = []
+    if settings.get("apps_tools"):
+        apps = Apps()
+
+        @apps.tool(
+            resource_uri="ui://status/view.html",
+            title="Status view",
+            description="Display the server status",
+            visibility=["model", "app"],
+            annotations=types.ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+            icons=[types.Icon(src="https://example.com/status.svg", mimeType="image/svg+xml")],
+            meta={"example.com/custom": {"nested": ["preserved", {"value": 42}]}},
+        )
+        async def status_view() -> dict[str, str]:
+            return {"status": "ready"}
+
+        apps.add_html_resource("ui://status/view.html", "<!doctype html><p>Status</p>")
+        extensions.append(apps)
+    mcp = TestServer("native-connection-test", extensions=extensions)
     witness = []
 
     @mcp.tool()

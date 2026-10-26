@@ -101,6 +101,13 @@ handle determine permissions, approvals and audit records. The generic
 removed: allowing a generic dispatcher could otherwise bypass a DENY on its
 target. A host without the dynamic registry cannot mount MCP tools.
 
+Tool listings retain the official SDK's standard Tool fields, including
+`_meta.ui`, annotations, icons and output schemas, across remote, gateway and
+container discovery. Server metadata is untrusted data and does not grant
+permissions. Retaining Apps metadata does not advertise an Apps renderer;
+sandboxed rendering and governed app calls remain in
+[Kestrel #3679](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3679).
+
 Each handle is bound to the connection that advertised its schema. Reloading or
 withdrawing that connection invalidates its old handles, including a call still
 waiting for approval. A fresh handle and approval are required after reload.

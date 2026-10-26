@@ -858,3 +858,28 @@ async def test_unsupported_remote_host_is_refused_before_dns_or_persistence(remo
         assert not remote_peer.resolutions and not remote_peer.dials
         assert host.saved == saved
         assert not host.registered and not feature._remote_connections
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "apps_tools": True}], indirect=True)
+async def test_remote_discovery_preserves_the_standard_tool_record(remote_peer):
+    feature = MCPAgent(RegistryHost())
+    await feature.initialize()
+    try:
+        result = await feature.load_tool(remote_peer.url)
+        assert result.status is ToolResultStatus.OK, result.to_dict()
+        assert "status_view" in result.data["tools"]
+        listed = await feature.list_tools()
+        actual = next(tool for tool in listed.data["tools"] if tool["name"] == "status_view")
+        expected = next(tool for tool in await remote_peer.peer.mcp.list_tools()
+                        if tool.name == "status_view")
+        expected_wire = expected.model_dump(mode="json", by_alias=True, exclude_none=True)
+        assert actual.pop("connection") == result.data["connection"]
+        assert actual.pop("via") == "remote"
+        assert actual.pop("url") == remote_peer.url
+        assert actual.pop("protocol_version") == "2026-07-28"
+        assert actual == expected_wire
+        listed = await feature.list_tools()
+        relisted = next(tool for tool in listed.data["tools"] if tool["name"] == "status_view")
+        assert relisted["_meta"] == expected_wire["_meta"]
+    finally:
+        await feature.shutdown()

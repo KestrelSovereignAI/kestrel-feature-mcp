@@ -639,3 +639,66 @@ async def test_managed_http_does_not_send_requests_or_gateway_tokens_to_environm
             server.close()
             await server.wait_closed()
             assert received == [], received
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True}], indirect=True)
+@pytest.mark.parametrize("transport", ["container", "gateway"])
+async def test_discovery_preserves_native_apps_tool_fields(mcp_http_server, transport):
+    peer = mcp_http_server
+    expected = next(tool for tool in await peer.mcp.list_tools() if tool.name == "status_view")
+    expected_wire = expected.model_dump(mode="json", by_alias=True, exclude_none=True)
+    assert expected_wire["_meta"]["ui"] == {
+        "resourceUri": "ui://status/view.html", "visibility": ["model", "app"],
+    }
+    assert expected_wire["title"] and expected_wire["outputSchema"]
+    assert expected_wire["annotations"]["readOnlyHint"] is True
+    assert expected_wire["icons"][0]["mimeType"] == "image/svg+xml"
+    if transport == "container":
+        manager = container_manager(peer.url)
+        try:
+            await manager.connect_to_tool("test")
+            connection = manager.owned_containers["test"]["connection"]
+            actual = next(tool for tool in manager.get_all_tools() if tool["name"] == "status_view")
+        finally:
+            try:
+                await manager._drop_connection("test")
+            finally:
+                await manager.aclose()
+        assert not connection.is_connected
+        assert connection._task is None
+        assert actual.pop("container") == "test"
+    else:
+        manager = MCPGatewayManager()
+        manager.gateway = SimpleNamespace(endpoint_url=peer.url, is_running=True)
+        try:
+            await manager._connect("owned-discovery-token")
+            actual = next(tool for tool in manager.get_all_tools() if tool["name"] == "status_view")
+        finally:
+            await manager._disconnect()
+    assert actual.pop("protocol_version") == LATEST_PROTOCOL_VERSION
+    assert actual == expected_wire
+    # Preserving server metadata must not claim an Apps renderer already exists.
+    for _, body in peer.requests:
+        if body:
+            meta = json.loads(body)["params"]["_meta"]
+            assert "io.modelcontextprotocol/ui" not in json.dumps(meta)
+
+
+def test_server_extensions_cannot_supply_host_connection_labels():
+    from mcp import types
+    from kestrel_feature_mcp.connection import describe_tools
+
+    tool = types.Tool.model_validate({
+        "name": "status", "inputSchema": {"type": "object"},
+        "container": "forged-container", "connection": "forged-connection",
+        "url": "https://forged.example", "via": "remote",
+        "protocol_version": "forged-version",
+        "_meta": {"example.com/custom": {"connection": "ordinary server data"}},
+    })
+    record = describe_tools(SimpleNamespace(protocol_version=LATEST_PROTOCOL_VERSION),
+                            [tool], container="owned-container")[0]
+    assert record["container"] == "owned-container"
+    assert record["protocol_version"] == LATEST_PROTOCOL_VERSION
+    assert not {"connection", "url", "via"}.intersection(record)
+    assert record["_meta"] == tool.meta
+    assert "description" not in record, "an absent optional description stays omitted"
