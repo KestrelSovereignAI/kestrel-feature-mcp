@@ -1,6 +1,7 @@
 """Real HTTP fixtures shared by native MCP lifecycle and deadline tests."""
 
 import asyncio
+import gzip
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -9,7 +10,8 @@ import uvicorn
 from mcp import types
 from mcp_types.version import LATEST_PROTOCOL_VERSION
 from mcp.server import MCPServer
-from mcp.server.apps import Apps
+from mcp.server.apps import APP_MIME_TYPE, Apps
+from mcp.server.mcpserver.resources import BinaryResource
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.shared.exceptions import MCPError
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -42,11 +44,26 @@ async def mcp_http_server(request, tmp_path):
     settings["bootstrap_body_started"] = asyncio.Event()
     settings["release_bootstrap_body"] = asyncio.Event()
     settings["input_witness_file"] = tmp_path / "input-execution-witness"
+    settings["release_resource_wire"] = asyncio.Event()
+    settings["resource_read_started"] = asyncio.Event()
+    settings["app_reply_recorded"] = asyncio.Event()
+    settings["resource_wire_closed"] = asyncio.Event()
+    if settings.get("resource_wire_mode") == "gzip":
+        # Construct the adversarial fixture before client allocation tracing.
+        settings["compressed_resource_wire"] = gzip.compress(b"x" * (16 * 1024 * 1024))
 
     class TestServer(MCPServer):
         async def _handle_list_tools(self, ctx, params):
             await asyncio.sleep(settings.get("list_delay", 0))
             listed = [] if settings.get("empty_tools") else await self.list_tools()
+            if settings.get("advertised_contract") is not None and listed:
+                listed[0] = listed[0].model_copy(update=settings["advertised_contract"], deep=True)
+            for index, tool in enumerate(listed):
+                update = settings.get("advertised_tool_contracts", {}).get(tool.name)
+                if update is not None:
+                    listed[index] = tool.model_copy(update=update, deep=True)
+            if settings.get("duplicate_tools") and listed:
+                listed.append(listed[0].model_copy(deep=True))
             if settings.get("repeat_cursor"):
                 return types.ListToolsResult(tools=listed, next_cursor="repeated")
             if settings.get("paginate"):
@@ -64,7 +81,7 @@ async def mcp_http_server(request, tmp_path):
             resource_uri="ui://status/view.html",
             title="Status view",
             description="Display the server status",
-            visibility=["model", "app"],
+            visibility=settings.get("apps_visibility", ["model", "app"]),
             annotations=types.ToolAnnotations(readOnlyHint=True, openWorldHint=False),
             icons=[types.Icon(src="https://example.com/status.svg", mimeType="image/svg+xml")],
             meta={"example.com/custom": {"nested": ["preserved", {"value": 42}]}},
@@ -72,7 +89,26 @@ async def mcp_http_server(request, tmp_path):
         async def status_view() -> dict[str, str]:
             return {"status": "ready"}
 
-        apps.add_html_resource("ui://status/view.html", "<!doctype html><p>Status</p>")
+        if settings.get("apps_execution_tools"):
+            @apps.tool(resource_uri="ui://status/view.html", visibility=["app"], description="Record one View action")
+            async def app_mutate(text: str) -> types.CallToolResult:
+                witness.append(text)
+                await asyncio.sleep(settings.get("app_tool_delay", 0))
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=text,
+                        _meta={"private-block": "view-only"})],
+                    structured_content={"text": text},
+                    _meta={"private-result": {"view": "only"}},
+                )
+
+        html = settings.get("apps_html", "<!doctype html><p>Status</p>")
+        if settings.get("apps_blob"):
+            apps.add_resource(BinaryResource(
+                uri="ui://status/view.html", name="Status", mime_type=APP_MIME_TYPE,
+                data=html.encode("utf-8"), meta=settings.get("apps_resource_meta"),
+            ))
+        else:
+            apps.add_html_resource("ui://status/view.html", html)
         extensions.append(apps)
     mcp = TestServer("native-connection-test", extensions=extensions)
     witness = []
@@ -88,6 +124,10 @@ async def mcp_http_server(request, tmp_path):
         raise ValueError("test tool failure")
 
     async def discover_behavior(ctx, call_next):
+        if ctx.method == "resources/read":
+            settings.setdefault("resource_reads", []).append(ctx.method)
+            settings["resource_read_started"].set()
+            await asyncio.sleep(settings.get("resource_delay", 0))
         if ctx.method == "tools/call" and settings.get("input_required"):
             with settings["input_witness_file"].open("a") as stream:
                 stream.write("executed-before-input\n")
@@ -203,6 +243,33 @@ async def mcp_http_server(request, tmp_path):
             return message
 
         async def write(message):
+            wire_mode = settings.get("resource_wire_mode")
+            wire_method = settings.get("resource_wire_method", "resources/read")
+            if wire_mode and ('"' + wire_method + '"').encode() in body:
+                if message["type"] == "http.response.start":
+                    return
+                if message["type"] == "http.response.body":
+                    async def adversarial_resource():
+                        try:
+                            if wire_mode == "gzip":
+                                yield settings["compressed_resource_wire"]
+                            elif wire_mode == "sse-many":
+                                for _ in range(10):
+                                    yield b":" + b"x" * 1024 + b"\n\n"
+                                    settings["wire_comments_sent"] = settings.get("wire_comments_sent", 0) + 1
+                                yield b"event: message\ndata: " + message["body"] + b"\n\n"
+                            elif wire_mode == "sse-oversized":
+                                yield b"event: message\ndata: " + b"x" * 8192 + b"\n\n"
+                            else:
+                                for _ in range(288):
+                                    yield b"x" * (32 * 1024)
+                                await settings["release_resource_wire"].wait()
+                        finally:
+                            settings["resource_wire_closed"].set()
+                    headers = {"Content-Encoding": "gzip"} if wire_mode == "gzip" else {}
+                    content_type = "text/event-stream" if wire_mode.startswith("sse-") else "application/json"
+                    return await StreamingResponse(adversarial_resource(),
+                        media_type=content_type, headers=headers)(scope, receive, send)
             if message["type"] == "http.response.start":
                 settings.setdefault("responses", []).append(
                     (scope["method"], scope["path"], message["status"]))
@@ -239,6 +306,8 @@ async def mcp_http_server(request, tmp_path):
                 await app(scope, read, write)
         finally:
             requests.append((scope, bytes(body)))
+            if b'"tools/call"' in body and b'"app_mutate"' in body:
+                settings["app_reply_recorded"].set()
 
     tls = settings.get("tls", False)
     certificate_host = settings.get("certificate_host", "remote.example") if tls else None

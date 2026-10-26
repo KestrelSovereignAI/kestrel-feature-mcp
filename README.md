@@ -292,3 +292,88 @@ done
 
 Update the pinned harness and lock together, rerun both scenarios, and review
 new required scenarios as the remaining host capabilities land.
+
+## MCP Apps components (0.8.0)
+
+The MCP Apps host is under development in #3679. Version 0.8.0 ships the native
+tool contracts, bounded resources, governed App execution and standalone sandbox
+service described below. These components do not yet
+advertise Apps support: authenticated view routes, initial result associations
+and the chat renderer still need to be composed and accepted together.
+MCP tool loading requires the governed registration API provided by Core 0.55.0
+or newer. An unsupported host is refused before connecting or saving enablement.
+When a server rejects a call with `HeaderMismatch`, Kestrel retires the original
+catalog. Reload the connection to discover and admit the new contract before
+calling again. The [transport specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#client-behavior)
+recommends refreshing and retrying; Kestrel requires that recovery to pass through
+fresh host admission instead of resending under the previous approval.
+The App execution component conservatively treats a call admitted without a
+complete governed native result as unconfirmed, including native pre-execution
+errors. Consumers must not turn that uncertainty into an automatic retry.
+Withdrawing a View before native admission raises `ResourceConflict`; withdrawal
+after admission raises `ResourceOutcomeUnknown`. An awaiting caller's own
+cancellation remains cancellation. Closing a View joins its owned calls and
+required audit finalization; it cannot undo effects already accepted remotely.
+
+The package includes a standalone public sandbox service. Run it on a separate
+origin that receives no host identity cookies, behind your normal HTTPS ingress:
+
+```bash
+kestrel-mcp-apps-sandbox --config /absolute/path/to/sandbox.json
+```
+
+This command requires Node.js 22 or newer. Set `KESTREL_MCP_APPS_NODE` to an
+explicit executable when Node is not on `PATH`. Relative configuration and
+executable paths resolve from the caller's working directory. The launcher
+starts the built service without importing the agent feature or passing host credentials,
+`HOME`, cloud configuration or `NODE_OPTIONS` into that process. It verifies
+the packaged asset hashes before listening and refuses credentials on its
+public HTTP routes.
+
+Supply the deployment configuration explicitly. For example, for local
+development with the host console on port 8000:
+
+```json
+{
+  "listen": {"host": "127.0.0.1", "port": 8090},
+  "sandbox": {
+    "hostOrigin": "http://127.0.0.1:8000",
+    "maxMessageBytes": 8388608,
+    "maxHtmlBytes": 1048576,
+    "policy": {}
+  }
+}
+```
+
+The operator's `policy` bounds resource-requested `connectDomains`,
+`resourceDomains`, `baseUriDomains` and device `permissions`. Empty grants deny
+those capabilities. Nested network-frame grants are unsupported and refused.
+Only exact configured origins can be granted. HTTP limits are configurable
+through the deployment's `httpLimits` object: `maxHeaderBytes`,
+`requestTimeoutMs`, `headersTimeoutMs` and `keepAliveTimeoutMs`.
+
+The source of the bundled assets is `web/`, its npm lock and the unchanged
+official SDK packages. Regenerate the checked-in bundles and original license
+notices together.
+
+The build also identifies dependencies embedded inside the official SDK's
+distribution through its source maps. It requires their original notices from
+the hashed [notice inventory](web/licenses/README.md), and refuses unknown
+embedded versions or altered notice files. These attribution records do not
+constrain the runtime dependency resolver.
+
+CI checks a clean rebuild byte for byte:
+
+```bash
+npm ci --prefix web --no-audit --no-fund
+npm run build --prefix web
+npm run build --prefix web -- --check
+npm run test:node --prefix web
+npm exec --prefix web -- playwright install --with-deps chromium
+npm test --prefix web
+```
+
+The browser checks use the actual built standalone service, the official App
+and AppBridge, and an opaque View inside the separate-origin proxy. They cover
+native initialization, teardown, source/origin checks and effective browser
+policies. They do not establish complete host acceptance or vendor OAuth consent.

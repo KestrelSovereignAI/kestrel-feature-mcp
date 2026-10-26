@@ -20,13 +20,15 @@ from mcp import Client, types
 from mcp.client.streamable_http import streamable_http_client
 from kestrel_sdk.security.outbound import ValidatedOutboundURL, pinned_httpx2_async_transport
 
-from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSION_CLOSE_TIMEOUT_DEFAULT
+from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSION_CLOSE_TIMEOUT_DEFAULT, RESPONSE_MAX_BYTES_DEFAULT
+from .http_limits import MCPResponseBudget, MCPResponseLimitError
+from .tool_contract import MCPToolContractError, validate_tool_contract
 
 
 logger = logging.getLogger(__name__)
 
 MCP_CONNECTION_ERRORS = (
-    MCPError, InputRequiredRoundsExceededError, httpx2.HTTPError, TimeoutError, OSError, ValidationError,
+    MCPError, InputRequiredRoundsExceededError, MCPResponseLimitError, httpx2.HTTPError, TimeoutError, OSError, ValidationError,
     BrokenResourceError, ClosedResourceError, EndOfStream,
 )
 
@@ -38,8 +40,11 @@ class MCPCallOutcomeUnknownError(RuntimeError):
 def _rejected_before_execution(error: BaseException) -> bool:
     if isinstance(error, BaseExceptionGroup):
         return all(_rejected_before_execution(child) for child in error.exceptions)
+    # The SDK also emits PARSE_ERROR and INVALID_REQUEST locally when a
+    # response is unreadable or invalid. Those codes cannot establish that
+    # the remote tool did not already execute.
     return isinstance(error, MCPError) and error.code in {
-        types.PARSE_ERROR, types.INVALID_REQUEST, types.METHOD_NOT_FOUND, types.INVALID_PARAMS,
+        types.METHOD_NOT_FOUND, types.INVALID_PARAMS, types.HEADER_MISMATCH,
     }
 
 
@@ -78,15 +83,47 @@ async def connection_lifecycle(gates: dict, name: str):
             del gates[name]
 
 
+@dataclass(frozen=True)
+class BoundMCPCaller:
+    """One advertised connection lifetime, never a grant to execute tools."""
+
+    connection: MCPConnection
+    name: str
+    incarnation: object
+    _owner_is_current: Callable[[], bool] = field(repr=False)
+    tool_names: frozenset[str] | None = None
+
+    @property
+    def is_current(self) -> bool:
+        return self._owner_is_current() and self.connection.incarnation is self.incarnation
+
+    def require_current(self) -> None:
+        if not self.is_current:
+            raise ValueError(f"MCP connection {self.name} changed; rediscover its tools before calling")
+
+    async def __call__(self, tool_name: str, arguments: dict | None = None):
+        self.require_current()
+        if self.tool_names is not None and tool_name not in self.tool_names:
+            raise ValueError(f"Unknown tool: {tool_name}. Available: {sorted(self.tool_names)}")
+        return await self.connection.call_tool(tool_name, arguments or {})
+
+    async def read_resource(self, uri: str) -> types.ReadResourceResult:
+        self.require_current()
+        result = await self.connection.read_resource(uri, incarnation=self.incarnation)
+        self.require_current()
+        return result
+
+
 def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, tool_names=None):
     """Bind the advertised connection, never a later replacement's transport."""
-    async def call(tool_name: str, arguments: dict | None = None):
-        if not is_current():
-            raise ValueError(f"MCP connection {name} changed; rediscover its tools before calling")
-        if tool_names is not None and tool_name not in tool_names:
-            raise ValueError(f"Unknown tool: {tool_name}. Available: {list(tool_names)}")
-        return await connection.call_tool(tool_name, arguments or {})
-    return call
+    incarnation = connection.incarnation
+    if incarnation is None:
+        raise ConnectionError("MCP connection is not connected")
+    return BoundMCPCaller(
+        connection=connection, name=name, incarnation=incarnation,
+        _owner_is_current=is_current,
+        tool_names=frozenset(tool_names) if tool_names is not None else None,
+    )
 
 
 def describe_tools(client, tools, **labels) -> list[dict]:
@@ -143,13 +180,20 @@ class MCPConnection:
         connect_timeout: float = SESSION_CONNECT_TIMEOUT_DEFAULT,
         call_timeout: float = CALL_TOOL_TIMEOUT,
         close_timeout: float = SESSION_CLOSE_TIMEOUT_DEFAULT,
+        response_max_bytes: int = RESPONSE_MAX_BYTES_DEFAULT,
     ) -> None:
         if not all(math.isfinite(value) and value > 0
                    for value in (connect_timeout, call_timeout, close_timeout)):
             raise ValueError("MCP connection, call and shutdown timeouts must be finite positive numbers")
         self._outbound = url if isinstance(url, ValidatedOutboundURL) else None
         self.url = url.url if self._outbound is not None else url
-        self._headers = dict(headers or {})
+        self._response_budget = MCPResponseBudget(response_max_bytes)
+        request_headers = httpx2.Headers(headers)
+        encoding = request_headers.get("accept-encoding", "identity").strip().lower()
+        if encoding not in {"identity", "identity;q=1, *;q=0"}:
+            raise ValueError("MCP response limits require identity Accept-Encoding")
+        request_headers["Accept-Encoding"] = "identity;q=1, *;q=0"
+        self._headers = dict(request_headers)
         self._auth = auth
         self._connect_timeout = connect_timeout
         self._call_timeout = call_timeout
@@ -158,11 +202,13 @@ class MCPConnection:
         self._task: asyncio.Task[None] | None = None
         self._ready: asyncio.Future[Client] | None = None
         self._shutdown: _ShutdownDeadline | None = None
+        self._incarnation: object | None = None
 
     @property
     def is_connected(self) -> bool:
         return (
-            self._client is not None
+            self._incarnation is not None
+            and self._client is not None
             and self._task is not None
             and not self._task.done()
             and not self._task.cancelling()
@@ -173,6 +219,16 @@ class MCPConnection:
     def protocol_version(self) -> str | None:
         """The published revision selected by the SDK's standard negotiation."""
         return self._client.protocol_version if self.is_connected else None
+
+    @property
+    def incarnation(self) -> object | None:
+        """Opaque lifetime of this active session; never a bearer credential."""
+        return self._incarnation if self.is_connected else None
+
+    def require_incarnation(self, incarnation: object) -> None:
+        """Refuse closed or replaced sessions without selecting a new client."""
+        if incarnation is None or self.incarnation is not incarnation:
+            raise ValueError("MCP connection changed; rediscover its tools and reopen its views")
 
     def _owner_finished(self, task: asyncio.Task[None]) -> None:
         # Always observe the task outcome, including a failure after startup.
@@ -201,10 +257,12 @@ class MCPConnection:
                     timeout=httpx2.Timeout(self._connect_timeout, read=None),
                     follow_redirects=False,
                     trust_env=False,
+                    event_hooks={"response": [self._response_budget]},
                     transport=(pinned_httpx2_async_transport(self._outbound)
                                if self._outbound is not None else None),
                 ))
-                transport = streamable_http_client(self.url, http_client=http_client)
+                transport = streamable_http_client(self.url, http_client=http_client,
+                    max_sse_event_size=self._response_budget.max_bytes)
                 client = await resources.enter_async_context(Client(
                     transport,
                     cache=None,
@@ -234,6 +292,7 @@ class MCPConnection:
     async def connect(self) -> list[types.Tool]:
         if self._task is not None:
             raise RuntimeError("MCP connection already started; close it before reconnecting")
+        self._incarnation = object()
         self._ready = asyncio.get_running_loop().create_future()
         self._task = asyncio.create_task(self._run(), name="mcp-connection")
         self._task.add_done_callback(self._owner_finished)
@@ -258,27 +317,57 @@ class MCPConnection:
             tools: list[types.Tool] = []
             cursor: str | None = None
             seen: set[str] = set()
+            seen_names: set[str] = set()
             while True:
                 result = await self._require_client().list_tools(cursor=cursor)
+                next_cursor = result.next_cursor
+                if next_cursor is not None and next_cursor in seen:
+                    raise ValueError("MCP server repeated its tools/list cursor")
+                for tool in result.tools:
+                    validate_tool_contract(tool)
+                    if tool.name in seen_names:
+                        raise MCPToolContractError(f"Duplicate MCP tool name {tool.name!r} in catalog")
+                    seen_names.add(tool.name)
                 tools.extend(result.tools)
-                cursor = result.next_cursor
+                cursor = next_cursor
                 if cursor is None:
                     return tools
-                if cursor in seen:
-                    raise ValueError("MCP server repeated its tools/list cursor")
                 seen.add(cursor)
 
         return await asyncio.wait_for(collect(), timeout=self._call_timeout)
 
+    async def read_resource(self, uri: str, *, incarnation: object) -> types.ReadResourceResult:
+        """Read through the originating native client, with a whole deadline.
+
+        View ownership and the exact advertised resource association belong to
+        the Apps host. This method preserves the authenticated transport and
+        its session lifetime; it never fetches a resource URI over HTTP.
+        """
+        self.require_incarnation(incarnation)
+        client = self._require_client()
+        result = await asyncio.wait_for(
+            client.read_resource(uri, cache_mode="bypass"), timeout=self._call_timeout,
+        )
+        self.require_incarnation(incarnation)
+        return result
+
     async def call_tool(self, name: str, arguments: dict | None = None) -> types.CallToolResult:
         client = self._require_client()
+        # ClientSession.validate_tool_result documents plain RuntimeError for
+        # output-schema failures after execution. Preserve uncertainty rather
+        # than treating an unreadable result as proof the tool did not run.
+        call_errors = (*MCP_CONNECTION_ERRORS, RuntimeError)
         try:
             return await asyncio.wait_for(
-                client.call_tool(name, arguments or {}), timeout=self._call_timeout,
+                # The public one-round API preserves native headers and output
+                # validation without Client.call_tool's schema-refresh resend.
+                # A new contract needs a new catalog and governed admission.
+                client.session.call_tool(name, arguments or {}), timeout=self._call_timeout,
             )
-        except (ExceptionGroup, *MCP_CONNECTION_ERRORS) as error:
+        except (ExceptionGroup, *call_errors) as error:
+            self._retire_changed_contract(error)
             if isinstance(error, ExceptionGroup):
-                _, unexpected = error.split(MCP_CONNECTION_ERRORS)
+                _, unexpected = error.split(call_errors)
                 if unexpected is not None:
                     raise
             if _rejected_before_execution(error):
@@ -287,6 +376,15 @@ class MCPConnection:
                 f"MCP tool {name!r} returned no confirmed result; its execution outcome is unknown. "
                 "Do not replay it without policy approval and an explicit idempotency or safe-repeat guarantee."
             ) from error
+
+    def _retire_changed_contract(self, error: BaseException) -> None:
+        """Withdraw an admitted catalog when the peer rejects its contract."""
+        def mismatch(candidate: BaseException) -> bool:
+            return isinstance(candidate, MCPError) and candidate.code == types.HEADER_MISMATCH
+
+        if mismatch(error) or (isinstance(error, BaseExceptionGroup)
+                and error.subgroup(mismatch) is not None):
+            self._incarnation = None
 
     async def close(self) -> None:
         task = self._task

@@ -17,10 +17,18 @@ the gateway/container via the bound ``caller`` and returns a ToolResult.
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+import json
+from copy import deepcopy
+from typing import Any, Awaitable, Callable, Dict, List, TYPE_CHECKING
+
+from mcp import types
 
 from kestrel_sdk.tools.result import ToolResult
 from .connection import MCPCallOutcomeUnknownError, MCP_CONNECTION_ERRORS
+from .tool_contract import validate_tool_contract
+
+if TYPE_CHECKING:
+    from .apps_execution import AppExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -38,24 +46,30 @@ def extract_mcp_result(result) -> tuple[str, bool]:
     """
     if hasattr(result, "content") and result.content:
         parts = [
-            block.text if hasattr(block, "text") else str(block)
+            block.text if hasattr(block, "text") else json.dumps(
+                block.model_dump(mode="json", by_alias=True, exclude_none=True,
+                    exclude={"meta": True, "resource": {"meta": True}}),
+                ensure_ascii=False,
+            )
             for block in result.content
         ]
         text = "\n".join(parts)
     else:
-        text = str(result)
+        # A native result may carry only structuredContent. Its repr also
+        # contains private _meta and must never become model-visible text.
+        text = ""
     return text, bool(getattr(result, "is_error", False))
 
 
 class _MCPToolSchema:
     """Minimal AgentTool-schema duck type the host tool registry consumes."""
 
-    def __init__(self, name: str, description: str, input_schema: Optional[dict]):
+    def __init__(self, name: str, tool: types.Tool):
         self.name = name
-        self.description = description or ""
-        # MCP inputSchema IS JSON Schema → use it verbatim as the function
-        # parameters. Default to an open object when a server omits it.
-        self.parameters = input_schema or {"type": "object", "properties": {}}
+        self.description = tool.description or ""
+        visibility, _ = validate_tool_contract(tool)
+        self.parameters = deepcopy(tool.input_schema)
+        self.model_visible = "model" in visibility
         self.command_prefix = None
         # MCP calls hit external servers/processes; keep them serialized rather
         # than letting the orchestrator batch them as concurrency-safe.
@@ -67,7 +81,7 @@ class _MCPToolSchema:
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.parameters,
+                "parameters": deepcopy(self.parameters),
             },
         }
 
@@ -75,25 +89,37 @@ class _MCPToolSchema:
 class MCPToolWrapper:
     """One downstream MCP tool, presented to the host as an AgentTool.
 
-    ``handle_name`` is the readable, namespaced name we propose to the registry
-    (which sanitises/bounds/uniquifies it for the provider). ``real_name`` is
-    the actual MCP tool name used against the server — the host never sees it,
-    so the registry is free to rename the handle.
+    ``handle_name`` is the readable, namespaced name proposed to the registry.
+    The native SDK Tool is the canonical snapshot of the advertised contract;
+    registry normalization never changes its downstream name or input schema.
     """
 
     def __init__(
         self,
         *,
         handle_name: str,
-        real_name: str,
-        description: str,
-        input_schema: Optional[dict],
+        tool: types.Tool,
         caller: MCPCaller,
+        app_executor: AppExecutor | None = None,
     ):
         self.name = handle_name
-        self._real_name = real_name
+        self._native_tool = tool.model_copy(deep=True)
+        self.visibility, self.resource_uri = validate_tool_contract(self._native_tool)
         self._caller = caller
-        self.schema = _MCPToolSchema(handle_name, description, input_schema)
+        self.app_executor = app_executor
+        self.schema = _MCPToolSchema(handle_name, self._native_tool)
+
+    @property
+    def bound_caller(self) -> MCPCaller:
+        return self._caller
+
+    @property
+    def native_tool(self) -> types.Tool:
+        return self._native_tool.model_copy(deep=True)
+
+    @property
+    def _real_name(self) -> str:
+        return self._native_tool.name
 
     async def execute(self, **kwargs) -> Dict[str, Any]:
         """Run the MCP tool and return the ToolResult **dict envelope**.
@@ -106,9 +132,16 @@ class MCPToolWrapper:
         the ``ToolResult.failed`` *classmethod* (always truthy) and record every
         call as an error. (Caught by the #1979 DB-grounded dogfood.)
         """
+        invocation = self.app_executor.admit(self) if self.app_executor is not None else None
+        if invocation is None and not self.schema.model_visible:
+            return ToolResult.failed(
+                "MCP app-only tool requires a live authorized view",
+            ).to_dict()
         try:
             result = await self._caller(self._real_name, kwargs)
         except MCPCallOutcomeUnknownError as error:
+            logger.error("MCP tool %r has an unconfirmed outcome (%s)", self._real_name,
+                type(error.__cause__).__name__)
             return ToolResult.failed(
                 str(error), data={"mcp_tool": self._real_name, "execution_outcome": "unknown"},
             ).to_dict()
@@ -123,12 +156,22 @@ class MCPToolWrapper:
             return ToolResult.failed(f"MCP tool '{self._real_name}' failed: {e}").to_dict()
 
         text, is_error = extract_mcp_result(result)
+        data = {"mcp_tool": self._real_name}
+        if getattr(result, "structured_content", None) is not None:
+            # This is business output, including any keys its own schema
+            # defines. It is distinct from the native result/block _meta.
+            data["structuredContent"] = deepcopy(result.structured_content)
         if is_error:
-            return ToolResult.failed(
+            projected = ToolResult.failed(
                 f"MCP tool '{self._real_name}' reported an error:\n{text}",
-                data={"mcp_tool": self._real_name},
+                data=data,
             ).to_dict()
-        return ToolResult.ok(text, data={"mcp_tool": self._real_name}).to_dict()
+        else:
+            # A complete native result may legitimately have no text content.
+            projected = ToolResult.ok(text or "MCP tool completed", data=data).to_dict()
+        if invocation is not None:
+            self.app_executor.capture(invocation, result, projected)
+        return projected
 
 
 def build_wrappers(
@@ -136,7 +179,7 @@ def build_wrappers(
     tool_dicts: List[Dict[str, Any]],
     caller: MCPCaller,
 ) -> List[MCPToolWrapper]:
-    """Build wrappers from a list of ``{name, description, inputSchema}`` dicts.
+    """Build wrappers from native SDK Tool records with host connection labels.
 
     ``handle_prefix`` namespaces the proposed handle name (e.g. ``"fetch"`` →
     ``mcp__fetch__<tool>``) for readability; the registry guarantees final
@@ -144,13 +187,11 @@ def build_wrappers(
     """
     wrappers: List[MCPToolWrapper] = []
     for td in tool_dicts:
-        real = td["name"]
+        native = types.Tool.model_validate(td)
         wrappers.append(
             MCPToolWrapper(
-                handle_name=f"mcp__{handle_prefix}__{real}",
-                real_name=real,
-                description=td.get("description", ""),
-                input_schema=td.get("inputSchema"),
+                handle_name=f"mcp__{handle_prefix}__{native.name}",
+                tool=native,
                 caller=caller,
             )
         )

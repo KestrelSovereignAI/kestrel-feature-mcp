@@ -8,10 +8,50 @@ from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 from mcp.shared.exceptions import MCPError
+from mcp import types
+from pydantic import Field
+from typing import Annotated
 
-from kestrel_feature_mcp.connection import MCPConnection, MCPCallOutcomeUnknownError
+from kestrel_feature_mcp.connection import MCPConnection, MCPCallOutcomeUnknownError, bind_tool_caller
 from mcp_types.version import LATEST_PROTOCOL_VERSION
 from kestrel_feature_mcp.manager import DockerMCPGatewayError, MCPGatewayManager, MCPToolManager
+
+
+@pytest.mark.asyncio
+async def test_changed_native_header_contract_is_not_refreshed_and_resent_without_readmission(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        tools = await connection.connect()
+        original = bind_tool_caller(connection, lambda: True, "header-contract",
+            tool_names=[tool.name for tool in tools])
+
+        async def replacement(text: Annotated[str, Field(json_schema_extra={"x-mcp-header": "Text"})]) -> str:
+            mcp_http_server.witness.append(text)
+            return text
+
+        # Change the real server's advertised and enforced contract after the
+        # original catalog was admitted. No fabricated wire error or SDK patch.
+        mcp_http_server.mcp.remove_tool("echo")
+        mcp_http_server.mcp.add_tool(replacement, name="echo")
+        error = None
+        try:
+            await connection.call_tool("echo", {"text": "requires-fresh-admission"})
+        except MCPError as rejected:
+            error = rejected
+        messages = [json.loads(body) for _, body in mcp_http_server.requests if body]
+        assert error is not None, {"effects": mcp_http_server.witness,
+            "methods": [message.get("method") for message in messages]}
+        assert error.code == types.HEADER_MISMATCH
+        assert mcp_http_server.witness == []
+        assert not connection.is_connected and not original.is_current
+        with pytest.raises(ConnectionError):
+            bind_tool_caller(connection, lambda: True, "cannot-rebind-an-unadmitted-catalog")
+        with pytest.raises(ValueError, match="rediscover"):
+            await original("echo", {"text": "must-not-resend"})
+        assert sum(message.get("method") == "tools/list" for message in messages) == 1
+        assert sum(message.get("method") == "tools/call" for message in messages) == 1
+    finally:
+        await connection.close()
 
 
 @pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
@@ -19,6 +59,31 @@ from kestrel_feature_mcp.manager import DockerMCPGatewayError, MCPGatewayManager
 def test_invalid_deadlines_fail_before_any_connection(value, field):
     with pytest.raises(ValueError, match="finite positive"):
         MCPConnection("http://127.0.0.1:1/mcp", **{field: value})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["bare", "group", "nested", "mixed"])
+async def test_catalog_retirement_recognizes_native_header_errors_in_aggregate_outcomes(mcp_http_server, shape):
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        native = await connection.connect()
+        original = bind_tool_caller(connection, lambda: True, "aggregate-header-policy",
+            tool_names=[tool.name for tool in native])
+        # This tests retirement policy, not a fabricated wire reply. The
+        # separate changed-contract test obtains the rejection from the real
+        # native SDK server and verifies the production call wiring.
+        error = MCPError(types.HEADER_MISMATCH, "Native tool contract changed")
+        if shape == "group":
+            error = ExceptionGroup("native outcome", [error])
+        elif shape == "nested":
+            error = ExceptionGroup("outer", [ExceptionGroup("native outcome", [error])])
+        elif shape == "mixed":
+            error = ExceptionGroup("native outcome", [error, TimeoutError("unconfirmed sibling")])
+        connection._retire_changed_contract(error)
+        assert not connection.is_connected and not original.is_current
+        assert not mcp_http_server.witness
+    finally:
+        await connection.close()
 
 
 
@@ -65,6 +130,167 @@ async def test_sdk_tool_failure_is_preserved(mcp_http_server):
         assert result.is_error
         assert result.content[0].text == "Error executing tool fail"
     finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_reconnecting_same_connection_cannot_revive_its_previous_tool_binding(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        await connection.connect()
+        original = bind_tool_caller(connection, lambda: True, "original", tool_names={"echo"})
+        await original("echo", {"text": "first session"})
+        await connection.close()
+        await connection.connect()
+        with pytest.raises(ValueError, match="changed"):
+            await original("echo", {"text": "stale view"})
+        current = bind_tool_caller(connection, lambda: True, "current", tool_names={"echo"})
+        await current("echo", {"text": "new session"})
+        assert mcp_http_server.witness == ["first session", "new session"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True}], indirect=True)
+async def test_ui_resource_read_stays_on_the_original_native_session(mcp_http_server):
+    from mcp import types
+    from mcp.server.apps import APP_MIME_TYPE
+
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        await connection.connect()
+        original = connection.incarnation
+        result = await connection.read_resource("ui://status/view.html", incarnation=original)
+        assert isinstance(result, types.ReadResourceResult)
+        assert len(result.contents) == 1
+        assert result.contents[0].mime_type == APP_MIME_TYPE
+        assert result.contents[0].text == "<!doctype html><p>Status</p>"
+        await connection.close()
+        await connection.connect()
+        with pytest.raises(ValueError, match="changed"):
+            await connection.read_resource("ui://status/view.html", incarnation=original)
+        await connection.read_resource("ui://status/view.html", incarnation=connection.incarnation)
+    finally:
+        await connection.close()
+    reads = [json.loads(body) for _, body in mcp_http_server.requests if body
+             and json.loads(body).get("method") == "resources/read"]
+    assert len(reads) == 2
+    assert [read["params"]["uri"] for read in reads] == ["ui://status/view.html"] * 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True, "resource_delay": 0.6}], indirect=True)
+async def test_native_resource_read_has_its_own_deadline_without_reissue(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url, call_timeout=0.2)
+    try:
+        await connection.connect()
+        with pytest.raises(TimeoutError):
+            await connection.read_resource("ui://status/view.html", incarnation=connection.incarnation)
+    finally:
+        await connection.close()
+    assert mcp_http_server.settings["resource_reads"] == ["resources/read"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True}], indirect=True)
+async def test_resource_read_rechecks_session_after_the_native_response(mcp_http_server, monkeypatch):
+    from mcp import Client
+
+    received, release = asyncio.Event(), asyncio.Event()
+    native_read = Client.read_resource
+
+    async def hold_received_response(client, *args, **kwargs):
+        result = await native_read(client, *args, **kwargs)
+        received.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(Client, "read_resource", hold_received_response)
+    connection = MCPConnection(mcp_http_server.url)
+    read = None
+    try:
+        await connection.connect()
+        read = asyncio.create_task(connection.read_resource(
+            "ui://status/view.html", incarnation=connection.incarnation,
+        ))
+        await received.wait()
+        await connection.close()
+        await connection.connect()
+        release.set()
+        with pytest.raises(ValueError, match="changed"):
+            await read
+        assert mcp_http_server.settings["resource_reads"] == ["resources/read"]
+    finally:
+        release.set()
+        if read is not None:
+            if not read.done():
+                read.cancel()
+            await asyncio.gather(read, return_exceptions=True)
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_bound_connection_captures_advertised_names_and_reports_retirement(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        await connection.connect()
+        names = ["echo"]
+        caller = bind_tool_caller(connection, lambda: True, "view-server", tool_names=names)
+        names.append("fail")
+        with pytest.raises(ValueError, match="Unknown tool"):
+            await caller("fail")
+        assert caller.is_current
+        await caller("echo", {"text": "bound session"})
+        await connection.close()
+        assert caller.is_current is False
+        assert mcp_http_server.witness == ["bound session"]
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True}], indirect=True)
+@pytest.mark.parametrize("reader", ["bound", "app"])
+async def test_bound_resource_reader_rejects_owner_retirement_after_the_response(mcp_http_server, monkeypatch, reader):
+    from mcp import Client
+
+    received, release = asyncio.Event(), asyncio.Event()
+    native_read = Client.read_resource
+
+    async def hold_received_response(client, *args, **kwargs):
+        result = await native_read(client, *args, **kwargs)
+        received.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(Client, "read_resource", hold_received_response)
+    connection = MCPConnection(mcp_http_server.url)
+    owner = {"current": True}
+    read = None
+    try:
+        await connection.connect()
+        caller = bind_tool_caller(connection, lambda: owner["current"], "retiring-view")
+        if reader == "app":
+            from kestrel_feature_mcp.apps_resources import read_app_resource
+            operation = read_app_resource(caller, uri="ui://status/view.html", max_html_bytes=4096)
+        else:
+            operation = caller.read_resource("ui://status/view.html")
+        read = asyncio.create_task(operation)
+        await received.wait()
+        owner["current"] = False
+        release.set()
+        with pytest.raises(ValueError, match="changed"):
+            await read
+        assert connection.is_connected
+        assert not caller.is_current
+        assert mcp_http_server.settings["resource_reads"] == ["resources/read"]
+    finally:
+        release.set()
+        if read is not None:
+            if not read.done():
+                read.cancel()
+            await asyncio.gather(read, return_exceptions=True)
         await connection.close()
 
 
@@ -702,3 +928,45 @@ def test_server_extensions_cannot_supply_host_connection_labels():
     assert not {"connection", "url", "via"}.intersection(record)
     assert record["_meta"] == tool.meta
     assert "description" not in record, "an absent optional description stays omitted"
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"advertised_contract": {"input_schema": schema}}
+    for schema in [{}, {"type": "array"}]], indirect=True)
+async def test_native_sdk_refuses_malformed_root_schemas_before_publication(mcp_http_server):
+    # The native SDK's wire serializer already rejects these records. Do not
+    # bypass it to manufacture a private tools/list result for this test.
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        with pytest.raises(MCPError, match="invalid result"):
+            await connection.connect()
+        assert not connection.is_connected
+        assert not mcp_http_server.witness
+    finally:
+        await connection.close()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"advertised_contract": {
+    "meta": {"ui": {"visibility": ["unrecognized"]}},
+}}], indirect=True)
+async def test_invalid_apps_tool_contract_fails_discovery_before_publication(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        with pytest.raises(ValueError, match="MCP tool 'echo'"):
+            await connection.connect()
+        assert not connection.is_connected
+        assert not mcp_http_server.witness
+    finally:
+        await connection.close()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"duplicate_tools": True, "paginate": paginated}
+    for paginated in [False, True]], indirect=True)
+async def test_duplicate_native_tool_names_fail_the_whole_discovery(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        with pytest.raises(ValueError, match="(?i)duplicate.*echo"):
+            await connection.connect()
+        assert not connection.is_connected
+        assert not mcp_http_server.witness
+    finally:
+        await connection.close()

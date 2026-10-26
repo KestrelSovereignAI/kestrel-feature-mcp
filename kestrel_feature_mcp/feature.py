@@ -9,6 +9,7 @@ mount through the host's governed dynamic-tool registry.
 import asyncio
 from contextlib import AsyncExitStack
 from functools import wraps
+from inspect import signature
 import logging
 import json
 from urllib.parse import urlsplit
@@ -50,6 +51,10 @@ class MCPFeatureClosingError(RuntimeError):
     """A connection start belongs to a feature generation that is closing."""
 
 
+class MCPHostCapabilityError(RemoteMCPError):
+    """The host cannot provide the required governed registration contract."""
+
+
 _REMOTE_LOAD_ERRORS = MCP_CONNECTION_ERRORS + (
     SSRFError, ValueError, RemoteMCPError, MCPFeatureClosingError,
 )
@@ -64,11 +69,12 @@ def _serialize_docker_operation(*, starts: bool):
             try:
                 if starts:
                     self._require_open(generation)
+                    self._require_governed_host()
                 async with self._docker_operations:
                     if starts:
                         self._require_open(generation)
                     return await method(self, *args, **kwargs)
-            except MCPFeatureClosingError as error:
+            except (MCPFeatureClosingError, MCPHostCapabilityError) as error:
                 return ToolResult.failed(str(error))
         return operation
     return decorate
@@ -88,12 +94,14 @@ def _is_remote_selector(selector: str) -> bool:
     return "://" in selector or selector.lower().startswith(("http:", "https:"))
 
 
-def _load_failure_message(message: str, persistent: bool, *, gateway_replaced: bool = False) -> str:
+def _load_failure_message(message: str, persistent: bool, *, gateway_replaced: bool = False, gateway_unavailable: bool = False) -> str:
     """Report confirmed durable intent separately from connection publication."""
     if persistent:
         message += "; enablement remains saved and will restore after restart. Unload the saved connection to disable it."
         if gateway_replaced:
             message += " The saved gateway server set was replaced."
+    if gateway_unavailable:
+        message += " Gateway tool handles are unavailable; reload a known-good server set to publish fresh handles."
     return message
 
 
@@ -213,17 +221,24 @@ class MCPAgent(Feature):
             and callable(getattr(agent, "unregister_dynamic_tools", None))
         )
 
+    def _require_governed_host(self) -> None:
+        if not self._host_supports_dynamic_tools():
+            raise MCPHostCapabilityError("MCP execution requires the host's governed dynamic tool registry")
+        if "on_registered" not in signature(self.agent.register_dynamic_tools).parameters:
+            raise MCPHostCapabilityError(
+                "MCP execution requires the governed registration API from Core 0.55.0 or newer",
+            )
+
     def _mount_tools(self, owner: str, handle_prefix: str, tool_dicts, caller) -> int:
         """Mount a set of MCP tools into the host registry under ``owner``.
 
         Idempotent refresh: any previously-mounted tools for ``owner`` are
-        dropped first, then the current set is registered. Returns the number
+        replaced only after the complete advertised batch validates. Returns the number
         of tools mounted. A host without a dynamic registry is unsupported.
         """
-        if not self._host_supports_dynamic_tools():
-            raise RuntimeError("MCP execution requires the host's governed dynamic tool registry")
-        self.agent.unregister_dynamic_tools(owner)
+        self._require_governed_host()
         wrappers = build_wrappers(handle_prefix, tool_dicts, caller)
+        self.agent.unregister_dynamic_tools(owner)
         return self.agent.register_dynamic_tools(owner, wrappers)
 
     def _unmount_tools(self, owner: str) -> int:
@@ -471,8 +486,7 @@ class MCPAgent(Feature):
         invalid = _selector_failure(url)
         if invalid is not None:
             raise RemoteMCPError(invalid.error)
-        if not self._host_supports_dynamic_tools():
-            raise RemoteMCPError("MCP execution requires the host's governed dynamic tool registry")
+        self._require_governed_host()
         if urlsplit(url).fragment:
             raise RemoteMCPError("Remote MCP endpoints must not contain URL fragments")
         owner_did = self._connection_owner_did()
@@ -730,13 +744,13 @@ class MCPAgent(Feature):
             )
         except (DockerMCPGatewayError, DockerMCPNotInstalledError) as e:
             logger.error(f"Gateway load failed for {server_name}: {e}")
-            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {str(e)}", persistent))
+            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {str(e)}", persistent, gateway_unavailable=changed))
         except asyncio.TimeoutError:
             logger.error(f"Timeout loading {server_name} via gateway")
-            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: Connection timeout", persistent))
+            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: Connection timeout", persistent, gateway_unavailable=changed))
         except Exception as e:
             logger.error(f"Unexpected error loading {server_name} via gateway: {e}", exc_info=True)
-            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {str(e)}", persistent))
+            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {str(e)}", persistent, gateway_unavailable=changed))
 
         finally:
             if changed and not published:
@@ -1197,13 +1211,13 @@ class MCPAgent(Feature):
 
         except (DockerMCPGatewayError, DockerMCPNotInstalledError) as e:
             logger.error(f"Gateway error: {e}")
-            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {str(e)}", persistent, gateway_replaced=True))
+            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {str(e)}", persistent, gateway_replaced=True, gateway_unavailable=changed))
         except asyncio.TimeoutError as e:
             logger.error(f"Timeout starting gateway: {e}")
-            return ToolResult.failed(_load_failure_message("Failed to start gateway: Connection timeout", persistent, gateway_replaced=True))
+            return ToolResult.failed(_load_failure_message("Failed to start gateway: Connection timeout", persistent, gateway_replaced=True, gateway_unavailable=changed))
         except Exception as e:
             logger.error(f"Unexpected error starting gateway: {e}", exc_info=True)
-            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {str(e)}", persistent, gateway_replaced=True))
+            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {str(e)}", persistent, gateway_replaced=True, gateway_unavailable=changed))
 
         finally:
             if changed and not published:

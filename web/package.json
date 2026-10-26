@@ -1,0 +1,23 @@
+{
+  "name": "@kestrel/mcp-apps-host-web",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^2.0.3",
+    "@modelcontextprotocol/client": "^2.4.0",
+    "@modelcontextprotocol/core": "^2.4.0",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1",
+    "esbuild": "^0.28.2"
+  },
+  "scripts": {
+    "test": "playwright test --reporter=line",
+    "test:node": "node --test node-tests/*.test.mjs",
+    "build": "node build.mjs"
+  }
+}

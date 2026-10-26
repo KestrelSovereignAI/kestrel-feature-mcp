@@ -318,12 +318,12 @@ async def test_shutdown_rechecks_each_docker_producer_await_and_discloses_saved_
     manager = SimpleNamespace(
         owner_did=host.agent_id, owned_containers={}, aclose=AsyncMock(),
         start_tool_container=start_container, connect_to_tool=discover, stop_tool=stop_container,
-        get_all_tools=lambda: [{"container": name, "name": "echo", "description": "", "inputSchema": {}}],
+        get_all_tools=lambda: [{"container": name, "name": "echo", "description": "", "inputSchema": {"type": "object"}}],
         tool_caller=lambda container: AsyncMock(),
     )
     monkeypatch.setattr(MCPToolManager, "create", AsyncMock(return_value=manager))
     gateway = SimpleNamespace(tools={}, is_connected=producer == "gateway-add", stop=AsyncMock(),
-                              get_all_tools=lambda: [{"name": "echo", "description": "", "inputSchema": {}}],
+                              get_all_tools=lambda: [{"name": "echo", "description": "", "inputSchema": {"type": "object"}}],
                               tool_caller=lambda: AsyncMock())
 
     async def start_gateway(*args):
@@ -347,9 +347,9 @@ async def test_shutdown_rechecks_each_docker_producer_await_and_discloses_saved_
     monkeypatch.setattr(feature, "_persist_server", persist)
     original_mount = host.register_dynamic_tools
 
-    def mount(*args, **kwargs):
+    def mount(*args, on_registered=None, **kwargs):
         mounted.append(args[0])
-        return original_mount(*args, **kwargs)
+        return original_mount(*args, on_registered=on_registered, **kwargs)
 
     monkeypatch.setattr(host, "register_dynamic_tools", mount)
     if producer == "container":

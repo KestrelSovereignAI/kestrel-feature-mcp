@@ -1,7 +1,7 @@
 """MCP server enablement persistence (#1979 PR4): enable/disable persist
 mcp_server deltas via the host foundation, and post_all_features_loaded
 auto-restores them on restart. No Docker required — the host API + gateway are
-mocked; what's verified is the persist/forget/restore wiring."""
+recorded; the registry uses Core and the tests verify persist/forget/restore wiring."""
 
 from __future__ import annotations
 
@@ -12,18 +12,16 @@ import pytest
 
 import kestrel_feature_mcp.feature as feat_mod
 from kestrel_feature_mcp.feature import MCPAgent
+from tests.unit.test_mcp_core_registry import CoreRegistryHost
 
 
 def _host(*, with_persistence=True):
-    host = MagicMock()
-    host.agent_id = "did:test:manager"
+    host = CoreRegistryHost()
+    host.did = host.agent_id = "did:test:manager"
     if with_persistence:
         host.persist_feature_enablement = AsyncMock()
         host.clear_feature_enablement = AsyncMock()
         host.get_enablement_deltas = AsyncMock(return_value=[])
-    else:
-        # A host lacking the foundation: remove the attrs so hasattr is False.
-        del host.persist_feature_enablement
     return host
 
 
