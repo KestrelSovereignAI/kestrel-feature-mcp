@@ -87,6 +87,47 @@ async def test_reconnecting_same_connection_cannot_revive_its_previous_tool_bind
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True}], indirect=True)
+async def test_ui_resource_read_stays_on_the_original_native_session(mcp_http_server):
+    from mcp import types
+    from mcp.server.apps import APP_MIME_TYPE
+
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        await connection.connect()
+        original = connection.incarnation
+        result = await connection.read_resource("ui://status/view.html", incarnation=original)
+        assert isinstance(result, types.ReadResourceResult)
+        assert len(result.contents) == 1
+        assert result.contents[0].mime_type == APP_MIME_TYPE
+        assert result.contents[0].text == "<!doctype html><p>Status</p>"
+        await connection.close()
+        await connection.connect()
+        with pytest.raises(ValueError, match="changed"):
+            await connection.read_resource("ui://status/view.html", incarnation=original)
+        await connection.read_resource("ui://status/view.html", incarnation=connection.incarnation)
+    finally:
+        await connection.close()
+    reads = [json.loads(body) for _, body in mcp_http_server.requests if body
+             and json.loads(body).get("method") == "resources/read"]
+    assert len(reads) == 2
+    assert [read["params"]["uri"] for read in reads] == ["ui://status/view.html"] * 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True, "resource_delay": 0.6}], indirect=True)
+async def test_native_resource_read_has_its_own_deadline_without_reissue(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url, call_timeout=0.2)
+    try:
+        await connection.connect()
+        with pytest.raises(TimeoutError):
+            await connection.read_resource("ui://status/view.html", incarnation=connection.incarnation)
+    finally:
+        await connection.close()
+    assert mcp_http_server.settings["resource_reads"] == ["resources/read"]
+
+
+@pytest.mark.asyncio
 async def test_failed_startup_joins_owner_and_can_retry(mcp_http_server):
     url = mcp_http_server.url
     connection = MCPConnection(url.replace("/mcp", "/missing"), call_timeout=1)

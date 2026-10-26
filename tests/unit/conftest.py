@@ -88,6 +88,9 @@ async def mcp_http_server(request, tmp_path):
         raise ValueError("test tool failure")
 
     async def discover_behavior(ctx, call_next):
+        if ctx.method == "resources/read":
+            settings.setdefault("resource_reads", []).append(ctx.method)
+            await asyncio.sleep(settings.get("resource_delay", 0))
         if ctx.method == "tools/call" and settings.get("input_required"):
             with settings["input_witness_file"].open("a") as stream:
                 stream.write("executed-before-input\n")

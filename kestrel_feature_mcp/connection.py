@@ -85,8 +85,9 @@ def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, t
         raise ConnectionError("MCP connection is not connected")
 
     async def call(tool_name: str, arguments: dict | None = None):
-        if not is_current() or connection.incarnation is not incarnation:
+        if not is_current():
             raise ValueError(f"MCP connection {name} changed; rediscover its tools before calling")
+        connection.require_incarnation(incarnation)
         if tool_names is not None and tool_name not in tool_names:
             raise ValueError(f"Unknown tool: {tool_name}. Available: {list(tool_names)}")
         return await connection.call_tool(tool_name, arguments or {})
@@ -184,6 +185,11 @@ class MCPConnection:
         """Opaque lifetime of this active session; never a bearer credential."""
         return self._incarnation if self.is_connected else None
 
+    def require_incarnation(self, incarnation: object) -> None:
+        """Refuse closed or replaced sessions without selecting a new client."""
+        if incarnation is None or self.incarnation is not incarnation:
+            raise ValueError("MCP connection changed; rediscover its tools and reopen its views")
+
     def _owner_finished(self, task: asyncio.Task[None]) -> None:
         # Always observe the task outcome, including a failure after startup.
         # Deliver startup failures to connect immediately instead of waiting
@@ -280,6 +286,21 @@ class MCPConnection:
                 seen.add(cursor)
 
         return await asyncio.wait_for(collect(), timeout=self._call_timeout)
+
+    async def read_resource(self, uri: str, *, incarnation: object) -> types.ReadResourceResult:
+        """Read through the originating native client, with a whole deadline.
+
+        View ownership and the exact advertised resource association belong to
+        the Apps host. This method preserves the authenticated transport and
+        its session lifetime; it never fetches a resource URI over HTTP.
+        """
+        self.require_incarnation(incarnation)
+        client = self._require_client()
+        result = await asyncio.wait_for(
+            client.read_resource(uri, cache_mode="bypass"), timeout=self._call_timeout,
+        )
+        self.require_incarnation(incarnation)
+        return result
 
     async def call_tool(self, name: str, arguments: dict | None = None) -> types.CallToolResult:
         client = self._require_client()
