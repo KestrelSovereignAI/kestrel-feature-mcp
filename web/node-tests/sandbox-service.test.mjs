@@ -8,7 +8,7 @@ const config = () => ({ hostOrigin: 'https://host.example', maxMessageBytes: 8 *
 
 async function withService(operation) {
     const initial = config();
-    const server = createSandboxService({ config: initial, entryJavascript: 'export const owned = true;' });
+    const server = createSandboxService({ config: initial, entryJavascript: 'export const owned = true;', thirdPartyNotices: 'Owned test assets' });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     try { await operation('http://127.0.0.1:' + server.address().port, initial); }
     finally {
@@ -34,7 +34,7 @@ test('public sandbox config is snapshotted and allows only the configured host',
 
 test('sandbox documents restrict framing and never set identity state', async () => {
     await withService(async origin => {
-        for (const path of ['/proxy', '/sandbox-entry.js', '/config', '/health']) {
+        for (const path of ['/proxy', '/sandbox-entry.js', '/config', '/health', '/THIRD_PARTY_NOTICES.txt']) {
             const response = await fetch(origin + path);
             assert.equal(response.status, 200);
             assert.equal(response.headers.get('Set-Cookie'), null);
@@ -44,6 +44,7 @@ test('sandbox documents restrict framing and never set identity state', async ()
             assert.equal(response.headers.get('Origin-Agent-Cluster'), '?1');
             assert.match(response.headers.get('Content-Security-Policy'), /frame-ancestors https:\/\/host.example/);
             assert.match(response.headers.get('Content-Security-Policy'), /frame-src 'none'/);
+            assert.doesNotMatch(response.headers.get('Content-Security-Policy'), /(?:default|script|connect)-src|base-uri/);
             assert.equal(response.headers.get('Permissions-Policy'), 'camera=(), microphone=(), geolocation=(), clipboard-write=()');
         }
         const response = await fetch(origin + '/proxy');
@@ -56,7 +57,7 @@ test('sandbox documents restrict framing and never set identity state', async ()
 
 test('credentials are refused on every route rather than creating a sandbox auth lane', async () => {
     await withService(async origin => {
-        for (const path of ['/proxy', '/sandbox-entry.js', '/config', '/health']) {
+        for (const path of ['/proxy', '/sandbox-entry.js', '/config', '/health', '/THIRD_PARTY_NOTICES.txt']) {
             for (const headers of [{ Cookie: 'operator=secret' }, { Authorization: 'Bearer secret' }, { 'X-API-Key': 'secret' }]) {
                 const response = await fetch(origin + path, { headers });
                 assert.equal(response.status, 400);
@@ -91,13 +92,13 @@ for (const changes of [
 
 
 test('HTTP limits are configurable and malformed limits fail before listening', () => {
-    const server = createSandboxService({ config: config(), entryJavascript: 'export {};',
+    const server = createSandboxService({ config: config(), entryJavascript: 'export {};', thirdPartyNotices: 'Owned test assets',
         httpLimits: { requestTimeoutMs: 1234, headersTimeoutMs: 2345, keepAliveTimeoutMs: 3456 } });
     assert.equal(server.requestTimeout, 1234);
     assert.equal(server.headersTimeout, 2345);
     assert.equal(server.keepAliveTimeout, 3456);
     for (const httpLimits of [null, [], { requestTimeoutMs: 0 }, { unexpected: 10 }]) {
-        assert.throws(() => createSandboxService({ config: config(), entryJavascript: 'export {};', httpLimits }), TypeError);
+        assert.throws(() => createSandboxService({ config: config(), entryJavascript: 'export {};', thirdPartyNotices: 'Owned test assets', httpLimits }), TypeError);
     }
     assert.throws(() => createSandboxService({ config: config(), entryJavascript: '' }), TypeError);
 });

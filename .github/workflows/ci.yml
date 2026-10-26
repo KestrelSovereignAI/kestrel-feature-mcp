@@ -103,6 +103,11 @@ jobs:
               'kestrel_feature_mcp/registry_contract_LICENSE.txt',
               'kestrel_feature_mcp/catalog.toml',
               'kestrel_feature_mcp/component.yaml',
+              'kestrel_mcp_apps_sandbox.py',
+              'kestrel_feature_mcp/apps_sandbox/sandbox-entry.js',
+              'kestrel_feature_mcp/apps_sandbox/sandbox-service.mjs',
+              'kestrel_feature_mcp/apps_sandbox/THIRD_PARTY_NOTICES.txt',
+              'kestrel_feature_mcp/apps_sandbox/manifest.json',
           ]
           missing = [m for m in required if m not in names]
           if missing:
@@ -110,6 +115,44 @@ jobs:
               sys.exit(1)
           print(f'Wheel OK ({len(names)} entries)')
           "
+
+  apps-web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build-check
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Set up maintained Node LTS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 'lts/*'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install locked browser dependencies
+        run: npm ci --prefix web --no-audit --no-fund
+        timeout-minutes: 5
+      - name: Verify packaged assets against a clean build
+        run: npm run build --prefix web -- --check
+      - name: Verify standalone service and build failures
+        run: npm run test:node --prefix web
+      - name: Install Chromium and browser system dependencies
+        run: npm exec --prefix web -- playwright install --with-deps chromium
+        timeout-minutes: 20
+      - name: Verify actual browser isolation and native Apps protocol
+        run: npm test --prefix web
+        timeout-minutes: 5
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - name: Build and normally install the feature wheel
+        run: |
+          uv build --wheel
+          uv venv --python 3.14 "$RUNNER_TEMP/mcp-apps-install"
+          uv pip install --python "$RUNNER_TEMP/mcp-apps-install/bin/python" dist/*.whl
+      - name: Verify the installed public sandbox and credential boundary
+        run: |
+          "$RUNNER_TEMP/mcp-apps-install/bin/python" -I tests/packaging/sandbox_installed.py --node "$(command -v node)"
 
   install-check:
     runs-on: ubuntu-latest

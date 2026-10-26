@@ -17,6 +17,7 @@
   },
   "scripts": {
     "test": "playwright test --reporter=line",
-    "test:node": "node --test node-tests/*.test.mjs"
+    "test:node": "node --test node-tests/*.test.mjs",
+    "build": "node build.mjs"
   }
 }

@@ -292,3 +292,65 @@ done
 
 Update the pinned harness and lock together, rerun both scenarios, and review
 new required scenarios as the remaining host capabilities land.
+
+## Apps sandbox development
+
+The MCP Apps host is under development in #3679. These components do not yet
+advertise Apps support: authenticated view routes, initial result associations
+and the chat renderer still need to be composed and accepted together.
+MCP tool loading requires the governed registration API provided by Core 0.55.0
+or newer. An unsupported host is refused before connecting or saving enablement.
+
+The package includes a standalone public sandbox service. Run it on a separate
+origin that receives no host identity cookies, behind your normal HTTPS ingress:
+
+```bash
+kestrel-mcp-apps-sandbox --config /absolute/path/to/sandbox.json
+```
+
+This command requires Node.js 22 or newer. Set `KESTREL_MCP_APPS_NODE` to an
+explicit executable when Node is not on `PATH`. The launcher starts the built
+service without importing the agent feature or passing host credentials,
+`HOME`, cloud configuration or `NODE_OPTIONS` into that process. It verifies
+the packaged asset hashes before listening and refuses credentials on its
+public HTTP routes.
+
+Supply the deployment configuration explicitly. For example, for local
+development with the host console on port 8000:
+
+```json
+{
+  "listen": {"host": "127.0.0.1", "port": 8090},
+  "sandbox": {
+    "hostOrigin": "http://127.0.0.1:8000",
+    "maxMessageBytes": 8388608,
+    "maxHtmlBytes": 1048576,
+    "policy": {}
+  }
+}
+```
+
+The operator's `policy` bounds resource-requested `connectDomains`,
+`resourceDomains`, `baseUriDomains` and device `permissions`. Empty grants deny
+those capabilities. Nested network-frame grants are unsupported and refused.
+Only exact configured origins can be granted. HTTP limits are configurable
+through the deployment's `httpLimits` object: `maxHeaderBytes`,
+`requestTimeoutMs`, `headersTimeoutMs` and `keepAliveTimeoutMs`.
+
+The source of the bundled assets is `web/`, its npm lock and the unchanged
+official SDK packages. Regenerate the checked-in bundles and original license
+notices together; CI checks a clean rebuild byte for byte:
+
+```bash
+npm ci --prefix web --no-audit --no-fund
+npm run build --prefix web
+npm run build --prefix web -- --check
+npm run test:node --prefix web
+npm exec --prefix web -- playwright install --with-deps chromium
+npm test --prefix web
+```
+
+The browser checks use the actual built standalone service, the official App
+and AppBridge, and an opaque View inside the separate-origin proxy. They cover
+native initialization, teardown, source/origin checks and effective browser
+policies. They do not establish complete host acceptance or vendor OAuth consent.

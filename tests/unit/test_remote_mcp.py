@@ -21,7 +21,7 @@ class RegistryHost:
         self.registered = {}
         self.saved = {}
 
-    def register_dynamic_tools(self, owner, tools):
+    def register_dynamic_tools(self, owner, tools, *, on_registered=None):
         self.registered[owner] = list(tools)
         return len(tools)
 
@@ -36,6 +36,26 @@ class RegistryHost:
 
     async def get_enablement_deltas(self, kind):
         return list(self.saved.values())
+
+
+@pytest.mark.parametrize("mcp_http_server", [
+    {"tls": True, "apps_tools": True, "apps_visibility": ["app"]},
+], indirect=True)
+async def test_missing_governed_registration_api_fails_before_discovery_or_saving(remote_peer):
+    class MissingGovernedAPI(RegistryHost):
+        def register_dynamic_tools(self, owner, tools):
+            return super().register_dynamic_tools(owner, tools)
+
+    host = MissingGovernedAPI()
+    feature = MCPAgent(host)
+    try:
+        result = await feature.load_tool(remote_peer.url)
+        assert result.status is ToolResultStatus.ERROR
+        assert "Core 0.55.0" in result.error
+        assert not host.saved and not host.registered and not feature._remote_connections
+        assert not remote_peer.peer.requests and not remote_peer.dials and not remote_peer.resolutions
+    finally:
+        await feature.shutdown()
 
 
 @pytest.fixture
@@ -735,7 +755,7 @@ async def test_restore_does_not_suppress_programming_errors_or_cancellation(remo
 async def test_post_ack_mount_rejection_discloses_saved_enablement(remote_peer):
     host = RegistryHost()
     register = host.register_dynamic_tools
-    def reject(owner, tools):
+    def reject(owner, tools, *, on_registered=None):
         raise ValueError("Host rejected the advertised catalog")
     host.register_dynamic_tools = reject
     feature = MCPAgent(host)

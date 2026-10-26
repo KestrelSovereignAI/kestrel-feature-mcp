@@ -6,7 +6,7 @@ const DEFAULT_HTTP_LIMITS = Object.freeze({ maxHeaderBytes: 16 * 1024,
     requestTimeoutMs: 5_000, headersTimeoutMs: 5_000, keepAliveTimeoutMs: 5_000 });
 
 /** Serve only the public sandbox, without an authentication or identity lane. */
-export function createSandboxService({ config, entryJavascript, httpLimits = {} }) {
+export function createSandboxService({ config, entryJavascript, thirdPartyNotices, httpLimits = {} }) {
     if (!httpLimits || typeof httpLimits !== 'object' || Array.isArray(httpLimits)
         || Object.keys(httpLimits).some(key => !Object.hasOwn(DEFAULT_HTTP_LIMITS, key))) {
         throw new TypeError('Sandbox HTTP limits contain unsupported fields');
@@ -17,9 +17,12 @@ export function createSandboxService({ config, entryJavascript, httpLimits = {} 
     if (typeof entryJavascript !== 'string' || !entryJavascript.trim()) {
         throw new TypeError('A built sandbox entry module is required');
     }
+    if (typeof thirdPartyNotices !== 'string' || !thirdPartyNotices.trim()) {
+        throw new TypeError('The sandbox requires its bundled third-party license notices');
+    }
     // Serialize the snapshot once. Later caller mutations cannot widen a live
     // service's policy. Escaping '<' also keeps the JSON script element inert.
-    const configJson = JSON.stringify(approved).replaceAll('<', '\u003c');
+    const configJson = JSON.stringify(approved).replaceAll('<', '\\u003c');
     const html = '<!doctype html><html><head><meta charset="utf-8">'
         + '<meta name="referrer" content="no-referrer"></head><body>'
         + '<script type="application/json" id="sandbox-config">' + configJson + '</script>'
@@ -32,9 +35,10 @@ export function createSandboxService({ config, entryJavascript, httpLimits = {} 
         response.setHeader('Origin-Agent-Cluster', '?1');
         response.setHeader('Content-Security-Policy',
             `frame-ancestors ${approved.hostOrigin}; frame-src 'none'; object-src 'none'; `
-            + "base-uri 'none'; form-action 'none'; worker-src 'none'");
+            + "form-action 'none'; worker-src 'none'");
         // Network/script directives belong to the View's own CSP. Imposing
-        // them here would be inherited by srcdoc and revoke approved grants.
+        // them (including base-uri) here would be inherited by srcdoc and
+        // revoke approved grants. The View's own policy denies ungranted URLs.
         // Device delegation remains constrained by both iframe allow lists.
         response.setHeader('Permissions-Policy', permissionPolicy);
         const end = (status, text) => {
@@ -74,6 +78,10 @@ export function createSandboxService({ config, entryJavascript, httpLimits = {} 
         if (target.pathname === '/sandbox-entry.js') {
             response.setHeader('Content-Type', 'text/javascript; charset=utf-8');
             return end(200, entryJavascript);
+        }
+        if (target.pathname === '/THIRD_PARTY_NOTICES.txt') {
+            response.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            return end(200, thirdPartyNotices);
         }
         if (target.pathname === '/proxy') {
             response.setHeader('Content-Type', 'text/html; charset=utf-8');

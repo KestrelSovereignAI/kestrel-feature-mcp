@@ -2,12 +2,12 @@ import { test, expect } from '@playwright/test';
 import { createServer } from 'node:http';
 import { build } from 'esbuild';
 import { readFileSync } from 'node:fs';
-import { createSandboxService } from '../src/sandbox-service.js';
+import { startBuiltSandbox } from '../test-support/sandbox-process.mjs';
 
 const servers = [];
 let hostOrigin, sandboxOrigin, productionSandboxOrigin, hostBundle, proxyBundle, appBundle;
 let networkRequests = [];
-let operatorPolicy;
+let operatorPolicy, sandboxProcess;
 // Original geometric glyph authored for these tests; repository Apache-2.0 license.
 const testFont = readFileSync(new URL('./fixtures/view-test-font.ttf', import.meta.url));
 
@@ -93,15 +93,12 @@ test.beforeAll(async () => {
     expect(Buffer.byteLength(appBundle)).toBeLessThan(1024 * 1024);
     hostOrigin = await listen();
     sandboxOrigin = await listen();
-    const serviceEntry = (await build({ entryPoints: ['src/sandbox-entry.js'], bundle: true,
-        platform: 'browser', format: 'esm', minify: true, write: false })).outputFiles[0].text;
-    const service = createSandboxService({ entryJavascript: serviceEntry, config: {
+    sandboxProcess = await startBuiltSandbox({ listen: { host: '127.0.0.1', port: 0 }, sandbox: {
         hostOrigin, maxMessageBytes: 8 * 1024 * 1024, maxHtmlBytes: 1024 * 1024,
-        policy: { connectDomains: [hostOrigin], resourceDomains: [hostOrigin], permissions: ['camera'] },
+        policy: { connectDomains: [hostOrigin], resourceDomains: [hostOrigin],
+            baseUriDomains: [hostOrigin], permissions: ['camera'] },
     } });
-    await new Promise(resolve => service.listen(0, '127.0.0.1', resolve));
-    servers.push(service);
-    productionSandboxOrigin = 'http://127.0.0.1:' + service.address().port;
+    productionSandboxOrigin = sandboxProcess.origin;
 });
 
 test.beforeEach(async ({ page }) => {
@@ -127,6 +124,7 @@ test.afterEach(async ({ page }, info) => {
     }
 });
 test.afterAll(async () => {
+    await sandboxProcess?.close();
     for (const server of servers) {
         server.closeAllConnections();
         await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
@@ -490,3 +488,20 @@ test('real service headers preserve approved View resource grants without wideni
     expect(networkRequests).toEqual(['/view-test-font.ttf']);
     expect(await view.evaluate(() => document.featurePolicy.allowsFeature('camera'))).toBe(false);
 });
+
+for (const requested of [false, true]) {
+    test(`built service permits a resource base URI only when requested and approved: ${requested}`, async ({ page }) => {
+        const html = `<base href=${JSON.stringify(hostOrigin + '/')}><script>
+            fetch('network-probe?approved-base').then(response => response.text()).then(
+                text => window.baseResult = text, () => window.baseResult = 'denied');<\/script>`;
+        const proxy = await mount(page, { proxyOrigin: productionSandboxOrigin, html,
+            csp: { connectDomains: [hostOrigin], ...(requested ? { baseUriDomains: [hostOrigin] } : {}) } });
+        await expect.poll(() => proxy.childFrames().length).toBe(1);
+        const view = proxy.childFrames()[0];
+        await expect.poll(() => view.evaluate(() => window.baseResult)).toBeTruthy();
+        expect(await view.evaluate(() => window.baseResult)).toBe(requested ? 'owned network probe' : 'denied');
+        expect(await view.evaluate(() => self.origin)).toBe('null');
+        if (requested) expect(await view.evaluate(() => document.baseURI)).toBe(hostOrigin + '/');
+        expect(networkRequests).toEqual(requested ? ['/network-probe?approved-base'] : []);
+    });
+}

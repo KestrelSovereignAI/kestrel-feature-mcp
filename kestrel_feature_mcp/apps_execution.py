@@ -24,6 +24,10 @@ if TYPE_CHECKING:
     from .dynamic_tools import MCPToolWrapper
 
 
+class MCPAppResultWithheld(ResourceOutcomeUnknown):
+    """The call completed, but native delivery was refused; never replay it."""
+
+
 @dataclass(frozen=True)
 class RegisteredAppTool:
     tool: MCPToolWrapper
@@ -57,8 +61,12 @@ class AppView:
         if self._closed or not self._owner_is_current():
             raise ResourceConflict("MCP App View expired; reopen it without replaying prior calls")
         for registered in self._tools.values():
-            registered.binding.require_current()
-        self.caller.require_current()
+            if not registered.binding.is_current:
+                raise ResourceConflict("MCP App tool registration expired; reopen the originating View")
+        try:
+            self.caller.require_current()
+        except ValueError as error:
+            raise ResourceConflict("MCP App connection expired; reopen the originating View") from error
 
     def list_tools(self) -> list[types.Tool]:
         self.require_current()
@@ -113,6 +121,8 @@ class AppView:
         failures = [call.exception() for call in calls if not call.cancelled()
                     and call.exception() is not None]
         if cancellation is not None:
+            if not failures:
+                raise cancellation
             failures.insert(0, cancellation)
         if failures:
             raise BaseExceptionGroup("MCP App View cleanup did not complete normally", failures)
@@ -166,7 +176,6 @@ class AppExecutor:
         if invocation.registered.tool is not tool or tool.app_executor is not self:
             raise ResourceConflict("MCP App invocation cannot change its admitted tool")
         invocation.view.require_current()
-        invocation.registered.binding.require_current()
         if "app" not in tool.visibility:
             raise ResourceConflict("MCP tool is not available to Apps")
         invocation.started = True
@@ -174,7 +183,7 @@ class AppExecutor:
 
     def capture(self, invocation: _Invocation, native: types.CallToolResult, projection: dict) -> None:
         if self._invocation.get() is not invocation or invocation.finished or not invocation.started:
-            raise ResourceConflict("MCP App invocation context changed")
+            raise ResourceOutcomeUnknown("MCP App invocation context changed after execution; do not replay")
         if not isinstance(native, types.CallToolResult) or native.result_type != "complete":
             raise ResourceOutcomeUnknown("MCP App tool returned no complete native result; do not replay")
         invocation.native = native.model_copy(deep=True)
@@ -187,7 +196,6 @@ class AppExecutor:
         registered = view._tools.get(name)
         if registered is None or "app" not in registered.tool.visibility:
             raise ResourceConflict("MCP tool is not available to this App")
-        registered.binding.require_current()
         if not isinstance(arguments, dict):
             raise TypeError("MCP App tool arguments must be an object")
         arguments = deepcopy(arguments)
@@ -198,18 +206,36 @@ class AppExecutor:
             try:
                 # This is the sole execution lane. Core owns permission hooks,
                 # one-shot approvals, registry identity, cancellation and SQL audit.
-                projected = await registered.binding.invoke(
-                    arguments, session_id=view.session_id, source="mcp-app",
-                )
-                view.require_current()
+                try:
+                    projected = await registered.binding.invoke(
+                        arguments, session_id=view.session_id, source="mcp-app",
+                    )
+                except ResourceConflict as error:
+                    if invocation.started:
+                        raise ResourceOutcomeUnknown(
+                            "MCP App call may have executed; reconcile before retrying",
+                        ) from error
+                    raise
                 if invocation.native is None:
-                    if isinstance(projected, dict) and (projected.get("data") or {}).get("execution_outcome") == "unknown":
+                    # Hooks can redact the serialized result. Admission and the
+                    # native capture are private execution facts, so missing
+                    # output after admission stays unknown regardless of hooks.
+                    if invocation.started:
                         raise ResourceOutcomeUnknown("MCP App tool outcome is unknown; do not replay without reconciliation")
+                    view.require_current()
                     return types.CallToolResult(is_error=True, content=[types.TextContent(
                         type="text", text="The host refused this MCP App invocation before a native result was confirmed",
                     )])
+                try:
+                    view.require_current()
+                except ResourceConflict as error:
+                    raise MCPAppResultWithheld(
+                        "MCP App call completed; result delivery was withheld. Do not replay",
+                    ) from error
                 if projected != invocation.projection:
-                    raise ResourceConflict("The governed result changed; native MCP output was withheld")
+                    raise MCPAppResultWithheld(
+                        "The governed result changed after execution; native MCP output was withheld. Do not replay",
+                    )
                 # Never forward the private native result before invoke returns:
                 # at this point Core has confirmed its required structured audit.
                 return invocation.native.model_copy(deep=True)

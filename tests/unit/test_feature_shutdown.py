@@ -347,9 +347,9 @@ async def test_shutdown_rechecks_each_docker_producer_await_and_discloses_saved_
     monkeypatch.setattr(feature, "_persist_server", persist)
     original_mount = host.register_dynamic_tools
 
-    def mount(*args, **kwargs):
+    def mount(*args, on_registered=None, **kwargs):
         mounted.append(args[0])
-        return original_mount(*args, **kwargs)
+        return original_mount(*args, on_registered=on_registered, **kwargs)
 
     monkeypatch.setattr(host, "register_dynamic_tools", mount)
     if producer == "container":

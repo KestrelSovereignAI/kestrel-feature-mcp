@@ -230,9 +230,9 @@ async def test_view_close_joins_required_sql_finalization_through_repeated_cance
             await asyncio.sleep(0)
             assert not closing.done(), "View released an admitted call before its SQL audit finished"
         peer.store.release_dispatch.set()
-        with pytest.raises(BaseExceptionGroup) as error:
+        with pytest.raises(asyncio.CancelledError):
             await closing
-        assert all(isinstance(item, asyncio.CancelledError) for item in error.value.exceptions)
+        assert closing.cancelled()
         with pytest.raises(asyncio.CancelledError):
             await call
         row = await peer.backend.fetch_one("SELECT result_status, error_class FROM a2a_tool_dispatches")
@@ -249,9 +249,20 @@ async def test_view_close_joins_required_sql_finalization_through_repeated_cance
 
 
 @pytest.mark.asyncio
-async def test_timed_out_native_call_after_effects_is_unknown_and_not_replayed(app_boundary, mcp_http_server):
+@pytest.mark.parametrize("rewrite_projection", [False, True])
+async def test_timed_out_native_call_after_effects_is_unknown_and_not_replayed(app_boundary, mcp_http_server, rewrite_projection):
     peer = app_boundary
     await allow(peer, "app_mutate")
+    if rewrite_projection:
+        class RedactOutcomeData(Hook):
+            def __init__(self):
+                super().__init__("redact-model-outcome-data", [HookEvent.POST_TOOL_USE])
+
+            async def execute(self, value):
+                value.tool_response["data"] = {}
+                return HookOutput.allow()
+
+        peer.host.hooks_manager.register(RedactOutcomeData())
     peer.connection._call_timeout = 0.05
     mcp_http_server.settings["app_tool_delay"] = 0.2
     with pytest.raises(ResourceOutcomeUnknown, match="unknown"):
@@ -356,9 +367,79 @@ async def test_changed_governed_projection_cannot_reveal_the_unmodified_private_
             return HookOutput.allow()
 
     peer.host.hooks_manager.register(RedactBusinessData())
-    with pytest.raises(ResourceConflict, match="governed result changed"):
+    with pytest.raises(ResourceOutcomeUnknown, match="governed result changed"):
         await peer.executor.invoke(peer.view, "app_mutate", {"text": "original-private-data"})
     assert mcp_http_server.witness == ["original-private-data"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("withdraw", ["owner", "connection", "registration"])
+@pytest.mark.parametrize("uncertain", [False, True])
+async def test_currency_loss_after_native_effect_is_never_reported_as_nothing_ran(app_boundary, mcp_http_server, withdraw, uncertain):
+    peer = app_boundary
+    await allow(peer, "app_mutate")
+    if uncertain:
+        peer.connection._call_timeout = 0.05
+        mcp_http_server.settings["app_tool_delay"] = 0.2
+    peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
+    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "confirmed-effect"}))
+    try:
+        await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
+        assert mcp_http_server.witness == ["confirmed-effect"]
+        if withdraw == "owner":
+            peer.owner_current[0] = False
+        elif withdraw == "connection":
+            await peer.connection.close()
+            await peer.connection.connect()
+        else:
+            peer.host.unregister_dynamic_tools("mcp:original")
+        peer.store.release_dispatch.set()
+        with pytest.raises(ResourceOutcomeUnknown, match="replay|retry"):
+            await call
+        assert mcp_http_server.witness == ["confirmed-effect"]
+        row = await peer.backend.fetch_one("SELECT result_status FROM a2a_tool_dispatches")
+        assert row[0] == ("error" if uncertain else "success")
+    finally:
+        peer.store.release_dispatch.set()
+        if not call.done():
+            call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_actual_core_binding_is_usable_through_only_its_public_sdk_contract(app_boundary, mcp_http_server):
+    peer = app_boundary
+    await allow(peer, "app_mutate")
+
+    class PublicBinding:
+        """Expose the SDK's three members; execution remains actual Core/SQL."""
+
+        def __init__(self, binding):
+            self._binding = binding
+
+        @property
+        def name(self):
+            return self._binding.name
+
+        @property
+        def is_current(self):
+            return self._binding.is_current
+
+        async def invoke(self, arguments, *, session_id, source="external"):
+            return await self._binding.invoke(arguments, session_id=session_id, source=source)
+
+    registered = [RegisteredAppTool(item.tool, PublicBinding(item.binding)) for item in peer.registered]
+    source = next(item for item in registered if item.tool is peer.view.source.tool)
+    view = peer.executor.open_view(source, registered, session_id="mcp-app:public-sdk-only",
+        owner_is_current=lambda: peer.owner_current[0])
+    try:
+        result = await peer.executor.invoke(view, "app_mutate", {"text": "public-contract"})
+        assert result.structured_content == {"text": "public-contract"}
+        assert mcp_http_server.witness == ["public-contract"]
+        row = await peer.backend.fetch_one("SELECT session_id, result_status FROM a2a_tool_dispatches")
+        assert tuple(row) == ("mcp-app:public-sdk-only", "success")
+    finally:
+        await view.close()
 
 
 @pytest.mark.asyncio

@@ -34,7 +34,7 @@ class _FakeHost:
     def __init__(self):
         self.registered: dict = {}
 
-    def register_dynamic_tools(self, owner, tools, *, pin=False):
+    def register_dynamic_tools(self, owner, tools, *, pin=False, on_registered=None):
         self.registered[owner] = list(tools)
         return len(self.registered[owner])
 
@@ -337,7 +337,7 @@ class TestWrapper:
 async def test_container_load_reports_tools_evicted_by_host_capacity(mcp_http_server, retained):
     feature, manager, name = _native_container_feature(mcp_http_server, "acme/native:latest")
 
-    def limited_register(owner, tools):
+    def limited_register(owner, tools, *, on_registered=None):
         feature.agent.registered[owner] = list(tools)[:retained]
         return len(feature.agent.registered[owner])
 

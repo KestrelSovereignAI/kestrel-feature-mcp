@@ -55,18 +55,20 @@ def test_app_visibility_is_honored_in_actual_core_model_projections():
         assert [item["function"]["name"] for item in schemas] == ["mcp__catalog__visible"]
 
 
-def test_hidden_tools_require_the_explicit_host_projection_contract_before_refresh():
-    class EarlierRegistryAPI(CoreRegistryHost):
-        def register_dynamic_tools(self, owner, tools, *, pin=False):
-            return super().register_dynamic_tools(owner, tools, pin=pin)
-
-    host = EarlierRegistryAPI()
+def test_tools_require_the_explicit_governed_host_contract_before_refresh():
+    host = CoreRegistryHost()
     feature = MCPAgent(host)
     caller = MCPConnection("http://127.0.0.1:1/mcp").call_tool
     owner = "mcp:host-projection"
     feature._mount_tools(owner, "catalog", [native_tool()], caller)
     original = dict(host._direct_tools)
     registration = host._explored_features[owner]
+    register = host.register_dynamic_tools
+
+    def missing_governed_contract(owner, tools, *, pin=False):
+        return register(owner, tools, pin=pin)
+
+    host.register_dynamic_tools = missing_governed_contract
     with pytest.raises(RuntimeError, match="Core 0.55.0"):
         feature._mount_tools(owner, "catalog", [native_tool("private", _meta={
             "ui": {"visibility": ["app"]},
@@ -126,7 +128,7 @@ async def test_bad_native_catalog_never_reaches_gateway_enablement_storage(
         result = await feature._load_via_gateway("invalid-app")
         assert result.status is ToolResultStatus.ERROR
         assert "echo" in result.error and "visibility" in result.error
-        assert "handles were withdrawn" in result.error
+        assert "handles are unavailable" in result.error
         assert "remains saved" not in result.error
         assert not host._direct_tools, "Retired transport handles must not survive a failed discovery"
         assert manager.connection is None
