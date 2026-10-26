@@ -1,0 +1,90 @@
+"""Native Apps metadata controls audience, never host permission."""
+
+from copy import deepcopy
+from unittest.mock import AsyncMock
+
+import pytest
+from mcp import types
+
+from kestrel_feature_mcp.dynamic_tools import build_wrappers
+
+
+def _record(ui=None):
+    record = {
+        "name": "refresh_dashboard", "title": "Refresh dashboard",
+        "description": "Read dashboard state", "inputSchema": {},
+        "outputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+        "_meta": {"private-server-data": {"value": 3}},
+    }
+    if ui is not None:
+        record["_meta"]["ui"] = ui
+    return record
+
+
+@pytest.mark.parametrize("visibility,visible", [
+    (None, True), ([], False), (["model"], True), (["app"], False),
+    (["model", "app"], True), (["app", "app"], False),
+])
+def test_native_tool_visibility_controls_only_model_projection(visibility, visible):
+    ui = {"resourceUri": "ui://dashboard/app.html"}
+    if visibility is not None:
+        ui["visibility"] = visibility
+    record = _record(ui)
+    (wrapper,) = build_wrappers("dashboard", [record], AsyncMock())
+    assert wrapper.schema.model_visible is visible
+    assert wrapper.resource_uri == "ui://dashboard/app.html"
+    assert wrapper.visibility == frozenset(visibility if visibility is not None else ["model", "app"])
+    assert wrapper.native_tool.model_dump(mode="json", by_alias=True, exclude_none=True) == (
+        types.Tool.model_validate(record).model_dump(mode="json", by_alias=True, exclude_none=True)
+    )
+    assert wrapper.schema.to_openai_format()["function"]["parameters"] == {}
+    assert "model_visible" not in wrapper.schema.to_openai_format()["function"]["parameters"]
+
+
+def test_app_helper_tool_does_not_need_to_declare_another_view():
+    (wrapper,) = build_wrappers("dashboard", [_record({"visibility": ["app"]})], AsyncMock())
+    assert wrapper.resource_uri is None
+    assert wrapper.schema.model_visible is False
+
+
+@pytest.mark.parametrize("ui", [
+    "ui://dashboard/app.html", [],
+    {"visibility": "app"}, {"visibility": ["unknown"]}, {"visibility": [False]},
+    {"visibility": None}, {"resourceUri": "https://example.com/ui"},
+    {"resourceUri": 3}, {"resourceUri": "ui://"},
+])
+def test_invalid_native_ui_metadata_is_refused(ui):
+    with pytest.raises(ValueError, match="MCP Apps"):
+        build_wrappers("dashboard", [_record(ui)], AsyncMock())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("visibility", [["app"], []])
+async def test_hidden_tools_cannot_be_called_without_a_live_app_admission(visibility):
+    caller = AsyncMock(return_value=types.CallToolResult(content=[]))
+    (wrapper,) = build_wrappers("dashboard", [_record({"visibility": visibility})], caller)
+    result = await wrapper.execute()
+    assert result["status"] == "error"
+    assert "view" in result["error"].lower()
+    caller.assert_not_awaited()
+
+
+def test_wrapper_retains_an_independent_native_tool_snapshot():
+    record = _record({"resourceUri": "ui://dashboard/app.html", "visibility": ["model", "app"]})
+    original = deepcopy(record)
+    (wrapper,) = build_wrappers("dashboard", [record], AsyncMock())
+    record["_meta"]["ui"]["visibility"].clear()
+    record["_meta"]["private-server-data"]["value"] = 9
+    assert wrapper.native_tool.model_dump(mode="json", by_alias=True, exclude_none=True) == (
+        types.Tool.model_validate(original).model_dump(mode="json", by_alias=True, exclude_none=True)
+    )
+    assert wrapper.schema.model_visible is True
+
+
+def test_deprecated_flat_ui_metadata_does_not_create_a_view_binding():
+    record = _record()
+    record["_meta"]["ui/resourceUri"] = "ui://dashboard/app.html"
+    (wrapper,) = build_wrappers("dashboard", [record], AsyncMock())
+    assert wrapper.resource_uri is None
+    assert wrapper.schema.model_visible is True
