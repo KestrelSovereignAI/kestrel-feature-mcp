@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from mcp import types
 
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_feature_mcp.dynamic_tools import (
@@ -270,8 +271,7 @@ class TestWrapper:
         # dict's "status" key. (Regression: a raw ToolResult records as error
         # because infer_tool_result_status reads the .failed classmethod.)
         caller = AsyncMock(return_value=_result("hello"))
-        w = MCPToolWrapper(handle_name="mcp__fetch__fetch", real_name="fetch",
-                           description="d", input_schema=None, caller=caller)
+        w = MCPToolWrapper(handle_name="mcp__fetch__fetch", tool=types.Tool(name="fetch", description="d", inputSchema={}), caller=caller)
         res = await w.execute(url="x")
         assert isinstance(res, dict) and res["status"] == "ok"
         assert "hello" in res["confirmation"]
@@ -280,16 +280,14 @@ class TestWrapper:
     @pytest.mark.asyncio
     async def test_execute_iserror_is_failed(self):
         caller = AsyncMock(return_value=_result("boom", is_error=True))
-        w = MCPToolWrapper(handle_name="h", real_name="fetch",
-                           description="", input_schema=None, caller=caller)
+        w = MCPToolWrapper(handle_name="h", tool=types.Tool(name="fetch", description="", inputSchema={}), caller=caller)
         res = await w.execute()
         assert isinstance(res, dict) and res["status"] == "error" and "boom" in res["error"]
 
     @pytest.mark.asyncio
     async def test_execute_exception_is_failed(self):
         caller = AsyncMock(side_effect=ConnectionError("transport down"))
-        w = MCPToolWrapper(handle_name="h", real_name="fetch",
-                           description="", input_schema=None, caller=caller)
+        w = MCPToolWrapper(handle_name="h", tool=types.Tool(name="fetch", description="", inputSchema={}), caller=caller)
         res = await w.execute()
         assert isinstance(res, dict) and res["status"] == "error" and "transport down" in res["error"]
 
@@ -297,8 +295,7 @@ class TestWrapper:
     async def test_programming_errors_are_not_transport_failures(self):
         async def broken_caller(name, arguments):
             raise RuntimeError("broken caller invariant")
-        wrapper = MCPToolWrapper(handle_name="h", real_name="echo",
-                                 description="", input_schema=None, caller=broken_caller)
+        wrapper = MCPToolWrapper(handle_name="h", tool=types.Tool(name="echo", description="", inputSchema={}), caller=broken_caller)
         with pytest.raises(RuntimeError, match="broken caller invariant"):
             await wrapper.execute()
 
@@ -306,8 +303,7 @@ class TestWrapper:
     async def test_disconnected_native_connection_is_a_known_failure(self):
         from kestrel_feature_mcp.connection import MCPConnection
         connection = MCPConnection("http://127.0.0.1:1/mcp")
-        wrapper = MCPToolWrapper(handle_name="h", real_name="echo",
-                                 description="", input_schema=None, caller=connection.call_tool)
+        wrapper = MCPToolWrapper(handle_name="h", tool=types.Tool(name="echo", description="", inputSchema={}), caller=connection.call_tool)
         result = await wrapper.execute()
         assert result["status"] == "error"
         assert "not connected" in result["error"]
@@ -315,16 +311,16 @@ class TestWrapper:
 
     def test_schema_uses_input_schema_as_parameters(self):
         schema = {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}
-        s = _MCPToolSchema("mcp__fetch__fetch", "Fetch a URL", schema)
+        s = _MCPToolSchema("mcp__fetch__fetch", types.Tool(name="native", description="Fetch a URL", inputSchema=schema))
         fmt = s.to_openai_format()
         assert fmt["type"] == "function"
         assert fmt["function"]["name"] == "mcp__fetch__fetch"
         assert fmt["function"]["parameters"] == schema
         assert s.is_concurrency_safe is False
 
-    def test_schema_defaults_to_open_object(self):
-        s = _MCPToolSchema("h", "", None)
-        assert s.to_openai_format()["function"]["parameters"] == {"type": "object", "properties": {}}
+    def test_schema_keeps_empty_native_schema(self):
+        s = _MCPToolSchema("h", types.Tool(name="native", description="", inputSchema={}))
+        assert s.to_openai_format()["function"]["parameters"] == {}
 
     def test_extract_multi_block(self):
         text, err = extract_mcp_result(_result(blocks=[SimpleNamespace(text="a"), SimpleNamespace(text="b")]))

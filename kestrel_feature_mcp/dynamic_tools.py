@@ -17,7 +17,10 @@ the gateway/container via the bound ``caller`` and returns a ToolResult.
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from copy import deepcopy
+from typing import Any, Awaitable, Callable, Dict, List
+
+from mcp import types
 
 from kestrel_sdk.tools.result import ToolResult
 from .connection import MCPCallOutcomeUnknownError, MCP_CONNECTION_ERRORS
@@ -26,6 +29,27 @@ logger = logging.getLogger(__name__)
 
 # An MCP call transport: ``await caller(real_tool_name, arguments) -> CallToolResult``.
 MCPCaller = Callable[[str, Dict[str, Any]], Awaitable[Any]]
+
+
+def _app_metadata(tool: types.Tool) -> tuple[frozenset[str], str | None]:
+    """Read the native Apps audience and resource association, without grants."""
+    meta = tool.meta or {}
+    if "ui" not in meta:
+        return frozenset({"model", "app"}), None
+    ui = meta["ui"]
+    if not isinstance(ui, dict):
+        raise ValueError("MCP Apps _meta.ui must be an object")
+    visibility = ui.get("visibility", ["model", "app"])
+    if not isinstance(visibility, list) or any(
+        value not in ("model", "app") for value in visibility
+    ):
+        raise ValueError("MCP Apps visibility must contain only model or app")
+    uri = ui.get("resourceUri")
+    if "resourceUri" in ui and (
+        not isinstance(uri, str) or not uri.startswith("ui://") or len(uri) <= 5
+    ):
+        raise ValueError("MCP Apps resourceUri must be a ui:// resource")
+    return frozenset(visibility), uri
 
 
 def extract_mcp_result(result) -> tuple[str, bool]:
@@ -50,12 +74,13 @@ def extract_mcp_result(result) -> tuple[str, bool]:
 class _MCPToolSchema:
     """Minimal AgentTool-schema duck type the host tool registry consumes."""
 
-    def __init__(self, name: str, description: str, input_schema: Optional[dict]):
+    def __init__(self, name: str, tool: types.Tool):
         self.name = name
-        self.description = description or ""
-        # MCP inputSchema IS JSON Schema → use it verbatim as the function
-        # parameters. Default to an open object when a server omits it.
-        self.parameters = input_schema or {"type": "object", "properties": {}}
+        self.description = tool.description or ""
+        # inputSchema is required by MCP and stays exactly as advertised.
+        self.parameters = tool.input_schema
+        visibility, _ = _app_metadata(tool)
+        self.model_visible = "model" in visibility
         self.command_prefix = None
         # MCP calls hit external servers/processes; keep them serialized rather
         # than letting the orchestrator batch them as concurrency-safe.
@@ -67,7 +92,7 @@ class _MCPToolSchema:
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.parameters,
+                "parameters": deepcopy(self.parameters),
             },
         }
 
@@ -75,25 +100,31 @@ class _MCPToolSchema:
 class MCPToolWrapper:
     """One downstream MCP tool, presented to the host as an AgentTool.
 
-    ``handle_name`` is the readable, namespaced name we propose to the registry
-    (which sanitises/bounds/uniquifies it for the provider). ``real_name`` is
-    the actual MCP tool name used against the server — the host never sees it,
-    so the registry is free to rename the handle.
+    ``handle_name`` is the readable, namespaced name proposed to the registry.
+    The native SDK Tool is the canonical snapshot of the advertised contract;
+    registry normalization never changes its downstream name or input schema.
     """
 
     def __init__(
         self,
         *,
         handle_name: str,
-        real_name: str,
-        description: str,
-        input_schema: Optional[dict],
+        tool: types.Tool,
         caller: MCPCaller,
     ):
         self.name = handle_name
-        self._real_name = real_name
+        self._native_tool = tool.model_copy(deep=True)
+        self.visibility, self.resource_uri = _app_metadata(self._native_tool)
         self._caller = caller
-        self.schema = _MCPToolSchema(handle_name, description, input_schema)
+        self.schema = _MCPToolSchema(handle_name, self._native_tool)
+
+    @property
+    def native_tool(self) -> types.Tool:
+        return self._native_tool.model_copy(deep=True)
+
+    @property
+    def _real_name(self) -> str:
+        return self._native_tool.name
 
     async def execute(self, **kwargs) -> Dict[str, Any]:
         """Run the MCP tool and return the ToolResult **dict envelope**.
@@ -106,6 +137,10 @@ class MCPToolWrapper:
         the ``ToolResult.failed`` *classmethod* (always truthy) and record every
         call as an error. (Caught by the #1979 DB-grounded dogfood.)
         """
+        if not self.schema.model_visible:
+            return ToolResult.failed(
+                "MCP app-only tool requires a live authorized view",
+            ).to_dict()
         try:
             result = await self._caller(self._real_name, kwargs)
         except MCPCallOutcomeUnknownError as error:
@@ -136,7 +171,7 @@ def build_wrappers(
     tool_dicts: List[Dict[str, Any]],
     caller: MCPCaller,
 ) -> List[MCPToolWrapper]:
-    """Build wrappers from a list of ``{name, description, inputSchema}`` dicts.
+    """Build wrappers from native SDK Tool records with host connection labels.
 
     ``handle_prefix`` namespaces the proposed handle name (e.g. ``"fetch"`` →
     ``mcp__fetch__<tool>``) for readability; the registry guarantees final
@@ -144,13 +179,11 @@ def build_wrappers(
     """
     wrappers: List[MCPToolWrapper] = []
     for td in tool_dicts:
-        real = td["name"]
+        native = types.Tool.model_validate(td)
         wrappers.append(
             MCPToolWrapper(
-                handle_name=f"mcp__{handle_prefix}__{real}",
-                real_name=real,
-                description=td.get("description", ""),
-                input_schema=td.get("inputSchema"),
+                handle_name=f"mcp__{handle_prefix}__{native.name}",
+                tool=native,
                 caller=caller,
             )
         )
