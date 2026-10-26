@@ -17,11 +17,14 @@ import pytest
 
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_feature_mcp.feature import MCPAgent
+from tests.unit.test_mcp_core_registry import CoreRegistryHost
 
 
 def _make_feature(*, manager=None, gateway=None) -> MCPAgent:
     """Build an MCPAgent with explicit manager state."""
-    feat = MCPAgent(MagicMock())
+    host = CoreRegistryHost()
+    host.agent_id = host.did
+    feat = MCPAgent(host)
     feat.manager = manager
     feat.gateway_manager = gateway
     return feat
@@ -85,7 +88,7 @@ class TestDockerUnavailableFails:
         create = AsyncMock(side_effect=DockerDaemonUnavailableError("test daemon unavailable"))
         monkeypatch.setattr(MCPToolManager, "create", create)
         feature = _make_feature(manager=None)
-        feature.agent.agent_id = "did:test:unavailable"
+        feature.agent.did = feature.agent.agent_id = "did:test:unavailable"
         result = await feature.load_tool("some/image")
         create.assert_awaited_once_with(owner_did="did:test:unavailable")
         assert result.status is ToolResultStatus.ERROR
@@ -102,4 +105,3 @@ class TestDockerUnavailableFails:
         # Stopping an already-stopped gateway is idempotent, not an error.
         result = await _make_feature(gateway=None).gateway_stop()
         assert result.status is ToolResultStatus.OK
-
