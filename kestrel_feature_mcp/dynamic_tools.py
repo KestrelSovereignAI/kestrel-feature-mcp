@@ -17,6 +17,7 @@ the gateway/container via the bound ``caller`` and returns a ToolResult.
 from __future__ import annotations
 
 import logging
+import json
 from copy import deepcopy
 from typing import Any, Awaitable, Callable, Dict, List
 
@@ -62,12 +63,18 @@ def extract_mcp_result(result) -> tuple[str, bool]:
     """
     if hasattr(result, "content") and result.content:
         parts = [
-            block.text if hasattr(block, "text") else str(block)
+            block.text if hasattr(block, "text") else json.dumps(
+                block.model_dump(mode="json", by_alias=True, exclude_none=True,
+                    exclude={"meta": True, "resource": {"meta": True}}),
+                ensure_ascii=False,
+            )
             for block in result.content
         ]
         text = "\n".join(parts)
     else:
-        text = str(result)
+        # A native result may carry only structuredContent. Its repr also
+        # contains private _meta and must never become model-visible text.
+        text = ""
     return text, bool(getattr(result, "is_error", False))
 
 
@@ -161,12 +168,20 @@ class MCPToolWrapper:
             return ToolResult.failed(f"MCP tool '{self._real_name}' failed: {e}").to_dict()
 
         text, is_error = extract_mcp_result(result)
+        data = {"mcp_tool": self._real_name}
+        if getattr(result, "structured_content", None) is not None:
+            # This is business output, including any keys its own schema
+            # defines. It is distinct from the native result/block _meta.
+            data["structuredContent"] = deepcopy(result.structured_content)
         if is_error:
             return ToolResult.failed(
                 f"MCP tool '{self._real_name}' reported an error:\n{text}",
-                data={"mcp_tool": self._real_name},
+                data=data,
             ).to_dict()
-        return ToolResult.ok(text, data={"mcp_tool": self._real_name}).to_dict()
+        # A complete native result may contain structured data alone (or
+        # legitimately no content). Acknowledge that explicit success without
+        # serializing its private metadata into the required confirmation.
+        return ToolResult.ok(text or "MCP tool completed", data=data).to_dict()
 
 
 def build_wrappers(

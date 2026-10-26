@@ -17,7 +17,10 @@ async def test_oversized_native_json_is_refused_without_waiting_for_stream_eof(m
     try:
         await connection.connect()
         with pytest.raises(MCPError, match="MCP response byte limit"):
-            await connection.read_resource("ui://status/view.html", incarnation=connection.incarnation)
+            try:
+                await connection.read_resource("ui://status/view.html", incarnation=connection.incarnation)
+            except TimeoutError:
+                pytest.fail("Oversized native reply waited for EOF instead of enforcing its byte limit")
         await asyncio.wait_for(mcp_http_server.settings["resource_wire_closed"].wait(), 1)
         assert mcp_http_server.settings["resource_reads"] == ["resources/read"]
     finally:
@@ -122,7 +125,10 @@ async def test_native_sse_can_outlive_the_total_body_budget_with_bounded_events(
     connection = MCPConnection(mcp_http_server.url, response_max_bytes=4096, call_timeout=1)
     try:
         await connection.connect()
-        result = await connection.read_resource("ui://status/view.html", incarnation=connection.incarnation)
+        try:
+            result = await connection.read_resource("ui://status/view.html", incarnation=connection.incarnation)
+        except MCPError as error:
+            pytest.fail(f"Valid bounded SSE events were incorrectly accumulated into a finite body cap: {error}")
         assert result.contents[0].text == "<!doctype html><p>Status</p>"
         assert mcp_http_server.settings["wire_comments_sent"] == 10
     finally:
