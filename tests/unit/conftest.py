@@ -54,6 +54,10 @@ async def mcp_http_server(request, tmp_path):
         async def _handle_list_tools(self, ctx, params):
             await asyncio.sleep(settings.get("list_delay", 0))
             listed = [] if settings.get("empty_tools") else await self.list_tools()
+            if settings.get("advertised_contract") is not None and listed:
+                listed[0] = listed[0].model_copy(update=settings["advertised_contract"], deep=True)
+            if settings.get("duplicate_tools") and listed:
+                listed.append(listed[0].model_copy(deep=True))
             if settings.get("repeat_cursor"):
                 return types.ListToolsResult(tools=listed, next_cursor="repeated")
             if settings.get("paginate"):

@@ -863,3 +863,45 @@ def test_server_extensions_cannot_supply_host_connection_labels():
     assert not {"connection", "url", "via"}.intersection(record)
     assert record["_meta"] == tool.meta
     assert "description" not in record, "an absent optional description stays omitted"
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"advertised_contract": {"input_schema": schema}}
+    for schema in [{}, {"type": "array"}]], indirect=True)
+async def test_native_sdk_refuses_malformed_root_schemas_before_publication(mcp_http_server):
+    # The native SDK's wire serializer already rejects these records. Do not
+    # bypass it to manufacture a private tools/list result for this test.
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        with pytest.raises(MCPError, match="invalid result"):
+            await connection.connect()
+        assert not connection.is_connected
+        assert not mcp_http_server.witness
+    finally:
+        await connection.close()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"advertised_contract": {
+    "meta": {"ui": {"visibility": ["unrecognized"]}},
+}}], indirect=True)
+async def test_invalid_apps_tool_contract_fails_discovery_before_publication(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        with pytest.raises(ValueError, match="MCP tool 'echo'"):
+            await connection.connect()
+        assert not connection.is_connected
+        assert not mcp_http_server.witness
+    finally:
+        await connection.close()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"duplicate_tools": True, "paginate": paginated}
+    for paginated in [False, True]], indirect=True)
+async def test_duplicate_native_tool_names_fail_the_whole_discovery(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        with pytest.raises(ValueError, match="(?i)duplicate.*echo"):
+            await connection.connect()
+        assert not connection.is_connected
+        assert not mcp_http_server.witness
+    finally:
+        await connection.close()

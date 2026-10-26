@@ -149,3 +149,22 @@ async def test_native_sdk_enforces_the_configured_per_event_sse_limit(mcp_http_s
         assert mcp_http_server.settings["resource_reads"] == ["resources/read"]
     finally:
         await connection.close()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"advertised_contract": {"output_schema": {
+    "type": "object", "properties": {"missing": {"type": "integer"}}, "required": ["missing"],
+}}}], indirect=True)
+async def test_native_sdk_output_schema_error_after_effects_is_unknown_without_replay(mcp_http_server):
+    from kestrel_feature_mcp.dynamic_tools import build_wrappers
+    connection = MCPConnection(mcp_http_server.url)
+    try:
+        tools = await connection.connect()
+        native = next(tool for tool in tools if tool.name == "echo")
+        wrapper = build_wrappers("schema", [native.model_dump(by_alias=True)], connection.call_tool)[0]
+        result = await wrapper.execute(text="effect before output validation")
+        assert mcp_http_server.witness == ["effect before output validation"]
+        assert result["status"] == "error"
+        assert result.get("data", {}).get("execution_outcome") == "unknown"
+        assert "Do not replay" in result["error"]
+    finally:
+        await connection.close()
