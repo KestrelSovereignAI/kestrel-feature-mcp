@@ -9,6 +9,7 @@ mount through the host's governed dynamic-tool registry.
 import asyncio
 from contextlib import AsyncExitStack
 from functools import wraps
+from inspect import signature
 import logging
 import json
 from urllib.parse import urlsplit
@@ -223,6 +224,15 @@ class MCPAgent(Feature):
         if not self._host_supports_dynamic_tools():
             raise RuntimeError("MCP execution requires the host's governed dynamic tool registry")
         wrappers = build_wrappers(handle_prefix, tool_dicts, caller)
+        if any(not wrapper.schema.model_visible for wrapper in wrappers):
+            # Core 0.55.0 introduced the governed registration contract and
+            # its model-visible projection together. An earlier host must
+            # refuse these records rather than publish app-only tools.
+            registration = signature(self.agent.register_dynamic_tools)
+            if "on_registered" not in registration.parameters:
+                raise RuntimeError(
+                    "MCP hidden tools require the governed projection API from Core 0.55.0 or newer"
+                )
         self.agent.unregister_dynamic_tools(owner)
         return self.agent.register_dynamic_tools(owner, wrappers)
 

@@ -355,3 +355,37 @@ for (const method of ['script', 'meta']) {
         }
     });
 }
+
+
+test('a resource head CSP can further restrict an approved host grant', async ({ page }) => {
+    const html = `<!doctype html><html><head>
+        <meta http-equiv="Content-Security-Policy" content="connect-src 'none'">
+        </head><body><script>
+        fetch(${JSON.stringify(hostOrigin + '/network-probe?resource-policy')}).then(
+            () => window.resourcePolicyResult = 'escaped',
+            () => window.resourcePolicyResult = 'denied');<\/script></body></html>`;
+    const proxy = await mount(page, { html, csp: { connectDomains: [hostOrigin] } });
+    await expect.poll(() => proxy.childFrames().length).toBe(1);
+    const view = proxy.childFrames()[0];
+    await expect.poll(() => view.evaluate(() => window.resourcePolicyResult)).toBeTruthy();
+    expect(await view.evaluate(() => window.resourcePolicyResult)).toBe('denied');
+    expect(networkRequests).toEqual([]);
+});
+
+test('noncanonical resource origin requests are denied without discarding a valid View', async ({ page }) => {
+    const proxy = await mount(page, { csp: { connectDomains: [hostOrigin + '/'] } });
+    await expect.poll(() => proxy.evaluate(() => window.resourceNotifications)).toBe(1);
+    expect(await proxy.evaluate(() => window.proxyErrors)).toEqual([]);
+    await expect.poll(() => page.evaluate(() => window.initialized)).toBe(true);
+    expect(await proxy.locator('iframe').getAttribute('srcdoc')).toContain("connect-src 'none'");
+});
+
+test('operator frame grants fail clearly when the proxy cannot support them', async ({ page }) => {
+    await page.goto(hostOrigin);
+    const error = await page.evaluate(async origin => {
+        const { approveSandboxPolicy } = await import('/host.js');
+        try { approveSandboxPolicy({}, {}, { frameDomains: [origin] }); return null; }
+        catch (error) { return error.message; }
+    }, hostOrigin);
+    expect(error).toBe('Sandbox proxy does not support nested network frame grants');
+});
