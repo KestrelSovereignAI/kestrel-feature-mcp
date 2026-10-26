@@ -140,7 +140,8 @@ test('invalid JSON and oversized UTF-8 payloads never reach protocol handlers', 
         messages.push(cycle);
         for (const message of messages) parent.postMessage(message, origin);
     }, hostOrigin);
-    await expect.poll(() => page.evaluate(() => window.errors.length)).toBe(5);
+    await expect.poll(() => page.evaluate(() => window.arrived.includes(14))).toBe(true);
+    expect(await page.evaluate(() => window.errors.length)).toBe(5);
     expect(await page.evaluate(() => window.accepted)).toEqual([]);
 });
 
@@ -159,6 +160,31 @@ test('closing removes the listener and cannot revive the old transport', async (
     await expect(page.evaluate(() => window.transport.start())).rejects.toThrow('cannot be restarted');
     await expect(page.evaluate(() => window.transport.send({ jsonrpc: '2.0', id: 21, result: {} })))
         .rejects.toThrow('not active');
+});
+
+test('sandbox origin and byte limits are validated before transport startup', async ({ page }) => {
+    await page.goto(hostOrigin);
+    const result = await page.evaluate(async sandbox => {
+        const { OriginBoundTransport } = await import('/host.js');
+        const refused = options => {
+            try {
+                new OriginBoundTransport({ targetWindow: window, ...options });
+                return null;
+            } catch (error) {
+                return error.name;
+            }
+        };
+        return {
+            sameOrigin: refused({ origin: location.origin, maxMessageBytes: 256 }),
+            path: refused({ origin: sandbox + '/path', maxMessageBytes: 256 }),
+            limits: [0, -1, NaN, Infinity, 1.5].map(limit => refused({
+                origin: sandbox, maxMessageBytes: limit,
+            })),
+        };
+    }, sandboxOrigin);
+    expect(result).toEqual({
+        sameOrigin: 'TypeError', path: 'TypeError', limits: Array(5).fill('TypeError'),
+    });
 });
 
 test('the current official App and AppBridge complete their native handshake', async ({ page }) => {
