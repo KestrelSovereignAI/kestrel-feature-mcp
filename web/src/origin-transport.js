@@ -39,19 +39,23 @@ export class OriginBoundTransport {
         };
     }
 
-    #validate(value) {
+    static validateMessage(value, maxMessageBytes) {
         // Bound validation work before the official recursive JSON schemas.
         // Stringification rejects cycles/BigInts; JSONValueSchema also refuses
         // non-JSON structured-clone values rather than coercing them on wire.
         const encoded = JSON.stringify(value);
-        if (typeof encoded !== 'string' || encoded.length > this.#limit
-            || new TextEncoder().encode(encoded).byteLength > this.#limit) {
+        if (typeof encoded !== 'string' || encoded.length > maxMessageBytes
+            || new TextEncoder().encode(encoded).byteLength > maxMessageBytes) {
             throw new TypeError('Sandbox message exceeds its byte limit or is not JSON');
         }
         const json = JSONValueSchema.safeParse(value);
         const message = json.success && JSONRPCMessageSchema.safeParse(json.data);
         if (!message || !message.success) throw new TypeError('Sandbox sent an invalid MCP JSON-RPC message');
         return message.data;
+    }
+
+    #validate(value) {
+        return OriginBoundTransport.validateMessage(value, this.#limit);
     }
 
     async start() {
