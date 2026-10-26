@@ -867,7 +867,9 @@ async def test_remote_discovery_preserves_the_standard_tool_record(remote_peer):
     try:
         result = await feature.load_tool(remote_peer.url)
         assert result.status is ToolResultStatus.OK, result.to_dict()
-        actual = next(tool for tool in result.data["tools"] if tool["name"] == "status_view")
+        assert "status_view" in result.data["tools"]
+        listed = await feature.list_tools()
+        actual = next(tool for tool in listed.data["tools"] if tool["name"] == "status_view")
         expected = next(tool for tool in await remote_peer.peer.mcp.list_tools()
                         if tool.name == "status_view")
         expected_wire = expected.model_dump(mode="json", by_alias=True, exclude_none=True)
