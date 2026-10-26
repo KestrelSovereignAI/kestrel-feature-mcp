@@ -53,3 +53,23 @@ def test_app_visibility_is_honored_in_actual_core_model_projections():
     assert len(host._direct_tools) == 2
     for schemas in [host._build_all_tools(), host.build_progressive_tool_schemas()]:
         assert [item["function"]["name"] for item in schemas] == ["mcp__catalog__visible"]
+
+
+def test_hidden_tools_require_the_explicit_host_projection_contract_before_refresh():
+    class EarlierRegistryAPI(CoreRegistryHost):
+        def register_dynamic_tools(self, owner, tools, *, pin=False):
+            return super().register_dynamic_tools(owner, tools, pin=pin)
+
+    host = EarlierRegistryAPI()
+    feature = MCPAgent(host)
+    caller = MCPConnection("http://127.0.0.1:1/mcp").call_tool
+    owner = "mcp:host-projection"
+    feature._mount_tools(owner, "catalog", [native_tool()], caller)
+    original = dict(host._direct_tools)
+    registration = host._explored_features[owner]
+    with pytest.raises(RuntimeError, match="Core 0.55.0"):
+        feature._mount_tools(owner, "catalog", [native_tool("private", _meta={
+            "ui": {"visibility": ["app"]},
+        })], caller)
+    assert host._direct_tools == original
+    assert host._explored_features[owner] is registration
