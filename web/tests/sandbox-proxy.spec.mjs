@@ -2,9 +2,10 @@ import { test, expect } from '@playwright/test';
 import { createServer } from 'node:http';
 import { build } from 'esbuild';
 import { readFileSync } from 'node:fs';
+import { createSandboxService } from '../src/sandbox-service.js';
 
 const servers = [];
-let hostOrigin, sandboxOrigin, hostBundle, proxyBundle, appBundle;
+let hostOrigin, sandboxOrigin, productionSandboxOrigin, hostBundle, proxyBundle, appBundle;
 let networkRequests = [];
 let operatorPolicy;
 // Original geometric glyph authored for these tests; repository Apache-2.0 license.
@@ -92,6 +93,15 @@ test.beforeAll(async () => {
     expect(Buffer.byteLength(appBundle)).toBeLessThan(1024 * 1024);
     hostOrigin = await listen();
     sandboxOrigin = await listen();
+    const serviceEntry = (await build({ entryPoints: ['src/sandbox-entry.js'], bundle: true,
+        platform: 'browser', format: 'esm', minify: true, write: false })).outputFiles[0].text;
+    const service = createSandboxService({ entryJavascript: serviceEntry, config: {
+        hostOrigin, maxMessageBytes: 8 * 1024 * 1024, maxHtmlBytes: 1024 * 1024,
+        policy: { connectDomains: [hostOrigin], resourceDomains: [hostOrigin], permissions: ['camera'] },
+    } });
+    await new Promise(resolve => service.listen(0, '127.0.0.1', resolve));
+    servers.push(service);
+    productionSandboxOrigin = 'http://127.0.0.1:' + service.address().port;
 });
 
 test.beforeEach(async ({ page }) => {
@@ -124,7 +134,7 @@ test.afterAll(async () => {
 });
 
 async function mount(page, { html = '<script type="module">' + appBundle + '</script>', csp,
-    sandbox = 'allow-scripts', permissions, policy = { connectDomains: [hostOrigin] }, outerAllow = '' } = {}) {
+    sandbox = 'allow-scripts', permissions, policy = { connectDomains: [hostOrigin] }, outerAllow = '', proxyOrigin = sandboxOrigin } = {}) {
     operatorPolicy = policy;
     await page.goto(hostOrigin);
     await page.evaluate(async ({ origin, html, csp, sandbox, permissions, outerAllow }) => {
@@ -148,9 +158,9 @@ async function mount(page, { html = '<script type="module">' + appBundle + '</sc
             targetWindow: proxy.contentWindow, origin, maxMessageBytes: 2 * 1024 * 1024,
         }));
         proxy.src = origin + '/proxy';
-    }, { origin: sandboxOrigin, html, csp, sandbox, permissions, outerAllow });
-    await expect.poll(() => page.frames().some(frame => frame.url() === sandboxOrigin + '/proxy')).toBe(true);
-    return page.frame({ url: sandboxOrigin + '/proxy' });
+    }, { origin: proxyOrigin, html, csp, sandbox, permissions, outerAllow });
+    await expect.poll(() => page.frames().some(frame => frame.url() === proxyOrigin + '/proxy')).toBe(true);
+    return page.frame({ url: proxyOrigin + '/proxy' });
 }
 
 test('native App and AppBridge initialize through the mandatory proxy and opaque View', async ({ page }) => {
@@ -440,4 +450,43 @@ test('View tool requests before initialization never reach the host', async ({ p
     ]);
     expect(await page.evaluate(() => messages.some(message => message.id === 'early-call'))).toBe(false);
     expect(await proxy.locator('iframe').count()).toBe(0);
+});
+
+
+test('the dedicated service completes the native handshake under its actual HTTP policies', async ({ page }) => {
+    const proxy = await mount(page, { proxyOrigin: productionSandboxOrigin,
+        permissions: { camera: {}, microphone: {} }, outerAllow: 'camera ' + productionSandboxOrigin });
+    await expect.poll(() => page.evaluate(() => window.initialized)).toBe(true);
+    const view = proxy.childFrames()[0];
+    await expect.poll(() => view.evaluate(() => window.nativeConnected)).toBe(true);
+    expect(await view.evaluate(() => self.origin)).toBe('null');
+    expect(await view.evaluate(() => ['camera', 'microphone'].map(name =>
+        document.featurePolicy.allowsFeature(name)))).toEqual([true, false]);
+    const settings = await page.evaluate(async origin => {
+        const response = await fetch(origin + '/config', { credentials: 'omit' });
+        if (!response.ok) throw new Error('Sandbox configuration refused');
+        return response.json();
+    }, productionSandboxOrigin);
+    expect(settings.hostOrigin).toBe(hostOrigin);
+    expect(settings.policy.permissions).toEqual(['camera']);
+    await page.evaluate(() => bridge.sendToolInput({ arguments: { from: 'production service' } }));
+    await expect.poll(() => view.evaluate(() => window.received)).toEqual([
+        { input: { arguments: { from: 'production service' } } },
+    ]);
+    await page.evaluate(() => bridge.teardownResource({}));
+    await expect.poll(() => view.evaluate(() => window.received.some(item => item.teardown))).toBe(true);
+    await page.evaluate(() => bridge.close());
+});
+
+test('real service headers preserve approved View resource grants without widening defaults', async ({ page }) => {
+    const html = `<script>const face = new FontFace('OwnedServiceTest', ${JSON.stringify('url(' + hostOrigin + '/view-test-font.ttf)')});
+        face.load().then(() => window.fontResult = face.status, () => window.fontResult = 'denied');<\/script>`;
+    const proxy = await mount(page, { proxyOrigin: productionSandboxOrigin, html,
+        csp: { resourceDomains: [hostOrigin] } });
+    await expect.poll(() => proxy.childFrames().length).toBe(1);
+    const view = proxy.childFrames()[0];
+    await expect.poll(() => view.evaluate(() => window.fontResult)).toBeTruthy();
+    expect(await view.evaluate(() => window.fontResult)).toBe('loaded');
+    expect(networkRequests).toEqual(['/view-test-font.ttf']);
+    expect(await view.evaluate(() => document.featurePolicy.allowsFeature('camera'))).toBe(false);
 });

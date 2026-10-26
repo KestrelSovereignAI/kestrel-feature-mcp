@@ -163,3 +163,13 @@ export function startSandboxProxy({ hostOrigin, maxMessageBytes, maxHtmlBytes, p
     postHost({ jsonrpc: '2.0', method: 'ui/notifications/sandbox-proxy-ready', params: {} });
     return dispose;
 }
+
+
+/** HTTP-level maximum; the two iframe allow lists narrow it per View. */
+export function sandboxPermissionsPolicy(policy) {
+    approveSandboxPolicy({}, {}, policy);
+    const features = keys => buildAllowAttribute(Object.fromEntries(keys.map(key => [key, {}])))
+        .split(';').map(value => value.trim()).filter(Boolean);
+    const granted = new Set(features(policy.permissions ?? []));
+    return features(DEVICE_KEYS).map(name => `${name}=${granted.has(name) ? '*' : '()'}`).join(', ');
+}

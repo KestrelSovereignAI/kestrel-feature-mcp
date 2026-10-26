@@ -16,6 +16,7 @@
     "esbuild": "^0.28.2"
   },
   "scripts": {
-    "test": "playwright test --reporter=line"
+    "test": "playwright test --reporter=line",
+    "test:node": "node --test node-tests/*.test.mjs"
   }
 }
