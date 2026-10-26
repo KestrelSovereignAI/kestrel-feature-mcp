@@ -15,6 +15,11 @@ async function listen() {
             response.setHeader('Content-Type', 'text/javascript');
             return response.end(path === '/host.js' ? hostBundle : proxyBundle);
         }
+        if (path === '/early-navigation') {
+            networkRequests.push(request.url);
+            response.setHeader('Content-Type', 'text/html');
+            return response.end('<!doctype html><body>Foreign resource</body>');
+        }
         if (path === '/network-probe') {
             networkRequests.push(request.url);
             response.setHeader('Access-Control-Allow-Origin', '*');
@@ -328,3 +333,16 @@ test('resource metadata cannot grant device permissions and malformed operator p
     });
     expect(errors).toEqual(Array(6).fill('TypeError'));
 });
+
+for (const method of ['script', 'meta']) {
+    test(`early ${method} navigation cannot replace the opaque resource before its first load`, async ({ page }) => {
+        const target = hostOrigin + '/early-navigation?' + method;
+        const html = method === 'script'
+            ? `<script>location.href = ${JSON.stringify(target)};<\/script>`
+            : `<meta http-equiv="refresh" content="0; url=${target}">`;
+        const proxy = await mount(page, { html });
+        await expect.poll(() => proxy.evaluate(() => window.viewLoads)).toBeGreaterThanOrEqual(1);
+        expect(networkRequests).toEqual([]);
+        expect(await proxy.childFrames()[0].evaluate(() => self.origin)).toBe('null');
+    });
+}
