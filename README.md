@@ -310,6 +310,14 @@ fresh host admission instead of resending under the previous approval.
 The App execution component conservatively treats a call admitted without a
 complete governed native result as unconfirmed, including native pre-execution
 errors. Consumers must not turn that uncertainty into an automatic retry.
+Construct the App executor with its actual host, for example
+`AppExecutor(host=agent, max_pending_calls=configured_limit)`. The host must
+declare `supports_deferred_tool_results` as exactly `True` (Core 0.55.2 or
+newer). App results use the SDK's deferred delivery contract: completed,
+allowing post-tool policy on the unchanged public result is required before
+private native output can be delivered. Denial, ASK/stop, replacement,
+redaction and incomplete hooks withhold it, even if the public values did not
+change. Required structured audit must still complete before delivery.
 Withdrawing a View before native admission raises `ResourceConflict`; withdrawal
 after admission raises `ResourceOutcomeUnknown`. An awaiting caller's own
 cancellation remains cancellation. Closing a View joins its owned calls and
