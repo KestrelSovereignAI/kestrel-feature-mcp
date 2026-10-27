@@ -15,7 +15,7 @@ from typing import Callable, Mapping, TYPE_CHECKING
 
 from mcp import types
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
-from kestrel_sdk.tools import GovernedToolBinding
+from kestrel_sdk.tools import DeferredToolResult, DeferredToolResultHost, GovernedToolBinding
 
 from .connection import BoundMCPCaller
 from .apps_resources import AppResource, read_app_resource
@@ -40,6 +40,7 @@ class _Invocation:
     registered: RegisteredAppTool
     native: types.CallToolResult | None = None
     projection: dict | None = None
+    delivery_approved: bool = False
     started: bool = False
     finished: bool = False
 
@@ -151,9 +152,11 @@ class AppView:
 class AppExecutor:
     """Per-feature admission context; source strings never confer authority."""
 
-    def __init__(self, *, max_pending_calls: int):
+    def __init__(self, *, host: DeferredToolResultHost, max_pending_calls: int):
         if type(max_pending_calls) is not int or max_pending_calls <= 0:
             raise ValueError("MCP Apps pending-call limit must be a positive integer")
+        if getattr(host, "supports_deferred_tool_results", False) is not True:
+            raise ValueError("MCP Apps require a host that supports deferred tool results")
         self._max_pending_calls = max_pending_calls
         self._invocation: ContextVar[_Invocation | None] = ContextVar(
             "mcp_app_invocation", default=None,
@@ -201,13 +204,26 @@ class AppExecutor:
         invocation.started = True
         return invocation
 
-    def capture(self, invocation: _Invocation, native: types.CallToolResult, projection: dict) -> None:
+    def capture(self, invocation: _Invocation, native: types.CallToolResult,
+                projection: dict) -> DeferredToolResult:
         if self._invocation.get() is not invocation or invocation.finished or not invocation.started:
             raise ResourceOutcomeUnknown("MCP App invocation context changed after execution; do not replay")
         if not isinstance(native, types.CallToolResult) or native.result_type != "complete":
             raise ResourceOutcomeUnknown("MCP App tool returned no complete native result; do not replay")
         invocation.native = native.model_copy(deep=True)
         invocation.projection = deepcopy(projection)
+
+        def approve_delivery():
+            # Core calls this once, only after complete, allowing post-tool
+            # policy on the unchanged public envelope. It does not execute
+            # tools or replace the required audit boundary below.
+            if self._invocation.get() is not invocation or invocation.finished:
+                raise MCPAppResultWithheld("MCP App policy context expired; delivery withheld. Do not replay")
+            invocation.view.require_current()
+            invocation.delivery_approved = True
+            return []
+
+        return DeferredToolResult(projection, publish=approve_delivery)
 
     async def invoke(self, view: AppView, name: str, arguments: dict) -> types.CallToolResult:
         if view.executor is not self:
@@ -266,6 +282,10 @@ class AppExecutor:
                 if projected != invocation.projection:
                     raise MCPAppResultWithheld(
                         "The governed result changed after execution; native MCP output was withheld. Do not replay",
+                    )
+                if not invocation.delivery_approved:
+                    raise MCPAppResultWithheld(
+                        "Post-tool policy did not approve native MCP delivery; result withheld. Do not replay",
                     )
                 # Never forward the private native result before invoke returns:
                 # at this point Core has confirmed its required structured audit.

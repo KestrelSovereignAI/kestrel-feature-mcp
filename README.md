@@ -270,38 +270,47 @@ Docker catalog discovery uses the current OCI catalog JSON API. Set `KESTREL_MCP
 
 The installation CI matrix also runs the production connection through the
 official [MCP conformance harness](https://github.com/modelcontextprotocol/conformance),
-pinned to `0.2.0-alpha.12` with an npm integrity lock. It runs `tools_call` and
-`request-metadata` explicitly at `2026-07-28`, with no expected-failure baseline.
-These checks cover native tool exchange, wire schemas, per-request metadata and
-version negotiation retry. Optional client capabilities that Kestrel does not
-advertise are reported as skipped by the official scenario. The OAuth, input
-request and extension scenarios remain outside this initial CI profile; passing
-these two scenarios does not establish full client conformance (epic #3679 A7).
+pinned to `0.2.0-alpha.12` with an npm integrity lock. The canonical
+[`profile.json`](tests/conformance/profile.json) selects `tools_call`,
+`request-metadata`, `http-standard-headers`, `http-custom-headers`,
+`http-invalid-tool-headers`, and
+`json-schema-ref-no-deref` at `2026-07-28`, with no expected-failure baseline.
+These checks exercise native tool exchange, request metadata, version negotiation,
+standard headers on tool calls and resource reads, custom header value encoding,
+rejection of malformed header declarations while retaining valid tools, and refusal
+to fetch external JSON Schema references. Optional client capabilities
+and unexercised request methods are reported as skipped by the official scenarios.
+OAuth, input requests, and extension scenarios remain outside this profile.
+Passing these six scenarios does not establish full client
+conformance (epic #3679 A7).
 
 To run the same profile locally with Python test dependencies and Node 24+:
 
 ```bash
 npm ci --prefix tests/conformance --ignore-scripts --no-audit --no-fund
-for scenario in tools_call request-metadata; do
+version=$(.venv/bin/python -c 'from tests.conformance.client import load_profile; print(load_profile()["protocol_version"])') || exit $?
+scenarios=$(.venv/bin/python -c 'from tests.conformance.client import load_profile; print(" ".join(load_profile()["scenarios"]))') || exit $?
+for scenario in $scenarios; do
   tests/conformance/node_modules/.bin/conformance client \
     --command '.venv/bin/python tests/conformance/client.py' \
-    --scenario "$scenario" --spec-version 2026-07-28 --timeout 60000 \
+    --scenario "$scenario" --spec-version "$version" --timeout 60000 \
     --output-dir "tests/conformance/results/$scenario" || exit $?
 done
 ```
 
-Update the pinned harness and lock together, rerun both scenarios, and review
+Update the pinned harness and lock together, rerun the profile, and review
 new required scenarios as the remaining host capabilities land.
 
-## MCP Apps components (0.8.0)
+## MCP Apps components (0.9.0)
 
 The MCP Apps host is under development in #3679. Version 0.8.0 ships the native
 tool contracts, bounded resources, governed App execution and standalone sandbox
-service described below. These components do not yet
+service described below. Version 0.9.0 adds completed post-tool policy as a
+mandatory boundary for private native delivery. These components do not yet
 advertise Apps support: authenticated view routes, initial result associations
 and the chat renderer still need to be composed and accepted together.
-MCP tool loading requires the governed registration API provided by Core 0.55.0
-or newer. An unsupported host is refused before connecting or saving enablement.
+Use Core 0.55.2 or newer for governed registration and completed post-tool policy
+support. An unsupported host is refused before connecting or saving enablement.
 When a server rejects a call with `HeaderMismatch`, Kestrel retires the original
 catalog. Reload the connection to discover and admit the new contract before
 calling again. The [transport specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#client-behavior)
@@ -310,6 +319,14 @@ fresh host admission instead of resending under the previous approval.
 The App execution component conservatively treats a call admitted without a
 complete governed native result as unconfirmed, including native pre-execution
 errors. Consumers must not turn that uncertainty into an automatic retry.
+Construct the App executor with its actual host, for example
+`AppExecutor(host=agent, max_pending_calls=configured_limit)`. The host must
+declare `supports_deferred_tool_results` as exactly `True` (Core 0.55.2 or
+newer). App results use the SDK's deferred delivery contract: completed,
+allowing post-tool policy on the unchanged public result is required before
+private native output can be delivered. Denial, ASK/stop, replacement,
+redaction and incomplete hooks withhold it, even if the public values did not
+change. Required structured audit must still complete before delivery.
 Withdrawing a View before native admission raises `ResourceConflict`; withdrawal
 after admission raises `ResourceOutcomeUnknown`. An awaiting caller's own
 cancellation remains cancellation. Closing a View joins its owned calls and

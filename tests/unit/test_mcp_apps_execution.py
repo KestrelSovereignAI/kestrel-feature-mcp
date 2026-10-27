@@ -5,12 +5,14 @@ from contextlib import AsyncExitStack
 from contextvars import copy_context
 from dataclasses import dataclass
 import json
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 from mcp import types
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
+from kestrel_sdk.tools import DeferredToolResult
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
@@ -19,7 +21,7 @@ from kestrel_sovereign.features.security.permissions import PermissionLevel, Per
 from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
-from kestrel_feature_mcp.apps_execution import AppExecutor, RegisteredAppTool
+from kestrel_feature_mcp.apps_execution import AppExecutor, MCPAppResultWithheld, RegisteredAppTool
 from kestrel_feature_mcp.connection import MCPConnection, bind_tool_caller
 from kestrel_feature_mcp.dynamic_tools import MCPToolWrapper
 from tests.unit.test_mcp_core_registry import CoreRegistryHost
@@ -84,7 +86,7 @@ async def app_boundary(mcp_http_server, tmp_path):
         native = await connection.connect()
         cleanup.push_async_callback(connection.close)
         caller = bind_tool_caller(connection, lambda: True, "native-apps", tool_names=[tool.name for tool in native])
-        executor = AppExecutor(max_pending_calls=2)
+        executor = AppExecutor(host=host, max_pending_calls=2)
         wrappers = [MCPToolWrapper(handle_name="app__" + tool.name, tool=tool,
                     caller=caller, app_executor=executor) for tool in native]
         registered = []
@@ -206,7 +208,7 @@ async def test_app_cannot_call_model_only_or_foreign_tools(app_boundary, mcp_htt
     for name in ["echo", "not-advertised", "app__app_mutate"]:
         with pytest.raises(ResourceConflict, match="not available"):
             await peer.executor.invoke(peer.view, name, {})
-    foreign = AppExecutor(max_pending_calls=2)
+    foreign = AppExecutor(host=peer.host, max_pending_calls=2)
     with pytest.raises(ResourceConflict, match="another host"):
         await foreign.invoke(peer.view, "app_mutate", {"text": "foreign"})
     assert not mcp_http_server.witness
@@ -425,6 +427,114 @@ async def test_changed_governed_projection_cannot_reveal_the_unmodified_private_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["deny", "ask", "stop", "raise", "timeout", "invalid", "replace-equal"])
+async def test_native_app_delivery_requires_completed_post_policy_even_without_projection_edits(
+    app_boundary, mcp_http_server, policy,
+):
+    peer = app_boundary
+    tool = await allow(peer, "app_mutate")
+
+    class WithholdNativeDelivery(Hook):
+        def __init__(self):
+            super().__init__("withhold-native-app-delivery", [HookEvent.POST_TOOL_USE], timeout=0.01)
+
+        async def execute(self, value):
+            assert value.tool_name == tool.binding.name
+            if policy == "deny":
+                return HookOutput.deny("Native delivery refused")
+            if policy == "ask":
+                return HookOutput.ask("post-policy-approval", "Delivery needs approval")
+            if policy == "stop":
+                return HookOutput(continue_execution=False)
+            if policy == "raise":
+                raise RuntimeError("Post-tool policy did not complete")
+            if policy == "timeout":
+                await asyncio.sleep(10)
+            if policy == "replace-equal":
+                value.tool_response = dict(value.tool_response)
+                return HookOutput.allow()
+            return None
+
+    peer.host.hooks_manager.register(WithholdNativeDelivery())
+    with pytest.raises(MCPAppResultWithheld, match="Post-tool policy did not approve"):
+        await peer.executor.invoke(peer.view, "app_mutate", {"text": "effect-before-post-policy"})
+    assert mcp_http_server.witness == ["effect-before-post-policy"]
+    rows = await peer.backend.fetch_all("SELECT session_id, tool_name, result_status FROM a2a_tool_dispatches")
+    assert len(rows) == 1 and tuple(rows[0]) == (peer.view.session_id, tool.binding.name, "success")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transfer", [False, True])
+async def test_in_process_hook_cannot_bypass_host_completion_by_consuming_the_factory(
+    app_boundary, mcp_http_server, transfer,
+):
+    peer = app_boundary
+    tool = await allow(peer, "app_mutate")
+
+    class PrematureCompletion(Hook):
+        def __init__(self):
+            super().__init__("premature-native-app-completion", [HookEvent.POST_TOOL_USE])
+
+        async def execute(self, value):
+            result = value.tool_response
+            if transfer:
+                result = result.for_tool(tool.binding.name, [])
+            result.finalize(result, allowed=True)
+            return HookOutput.allow()
+
+    peer.host.hooks_manager.register(PrematureCompletion())
+    with pytest.raises(MCPAppResultWithheld, match="governed result changed"):
+        await peer.executor.invoke(peer.view, "app_mutate", {"text": "host-completion-required"})
+    assert mcp_http_server.witness == ["host-completion-required"]
+    row = await peer.backend.fetch_one("SELECT result_status FROM a2a_tool_dispatches")
+    assert row[0] == "success"
+
+
+@pytest.mark.asyncio
+async def test_native_app_result_waits_for_post_policy_then_required_sql(app_boundary, mcp_http_server):
+    peer = app_boundary
+    await allow(peer, "app_mutate")
+    policy_started, release_policy = asyncio.Event(), asyncio.Event()
+    policy_results = []
+    peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
+
+    class CompletePostPolicy(Hook):
+        def __init__(self):
+            super().__init__("complete-native-app-policy", [HookEvent.POST_TOOL_USE])
+
+        async def execute(self, value):
+            policy_results.append(value.tool_response)
+            policy_started.set()
+            await release_policy.wait()
+            return HookOutput.allow()
+
+    peer.host.hooks_manager.register(CompletePostPolicy())
+    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "policy-first"}))
+    try:
+        await asyncio.wait_for(policy_started.wait(), 5)
+        assert len(policy_results) == 1 and isinstance(policy_results[0], DeferredToolResult)
+        serialized = json.dumps(policy_results[0])
+        assert "policy-first" in serialized
+        assert "private-result" not in serialized and "private-block" not in serialized
+        assert not call.done() and not peer.store.dispatch_started.is_set()
+        assert mcp_http_server.witness == ["policy-first"]
+        release_policy.set()
+        await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
+        assert not call.done(), "Policy approval cannot replace required SQL completion"
+        peer.store.release_dispatch.set()
+        result = await call
+        assert result.structured_content == {"text": "policy-first"}
+        assert result.meta["private-result"] == {"view": "only"}
+        assert mcp_http_server.witness == ["policy-first"]
+    finally:
+        release_policy.set()
+        peer.store.release_dispatch.set()
+        if not call.done():
+            call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("withdraw", ["owner", "connection", "registration"])
 @pytest.mark.parametrize("uncertain", [False, True])
 async def test_currency_loss_after_native_effect_is_never_reported_as_nothing_ran(app_boundary, mcp_http_server, withdraw, uncertain):
@@ -528,7 +638,11 @@ async def test_invalid_view_configuration_is_refused_before_native_io(app_bounda
     peer = app_boundary
     for limit in [0, -1, True, None, 1.5]:
         with pytest.raises(ValueError, match="positive integer"):
-            AppExecutor(max_pending_calls=limit)
+            AppExecutor(host=peer.host, max_pending_calls=limit)
+    for host in [None, object(), SimpleNamespace(supports_deferred_tool_results=False),
+                 SimpleNamespace(supports_deferred_tool_results=1)]:
+        with pytest.raises(ValueError, match="supports deferred tool results"):
+            AppExecutor(host=host, max_pending_calls=2)
     original = dict(source=peer.view.source, registered=peer.registered,
         session_id="mcp-app:configured", owner_is_current=lambda: True)
     for changes, error, message in [

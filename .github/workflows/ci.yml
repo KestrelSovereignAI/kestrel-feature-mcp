@@ -156,7 +156,7 @@ jobs:
 
   install-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     needs: build-check
     strategy:
       matrix:
@@ -194,16 +194,18 @@ jobs:
       - name: Install pinned official conformance harness
         run: npm ci --prefix tests/conformance --ignore-scripts --no-audit --no-fund
         timeout-minutes: 3
-      - name: Verify native MCP tool calls and request metadata
+      - name: Verify the frozen native MCP client profile
         run: |
           set -e
-          for scenario in tools_call request-metadata; do
+          version=$(.venv-test/bin/python -c 'from tests.conformance.client import load_profile; print(load_profile()["protocol_version"])')
+          scenarios=$(.venv-test/bin/python -c 'from tests.conformance.client import load_profile; print(" ".join(load_profile()["scenarios"]))')
+          for scenario in $scenarios; do
             tests/conformance/node_modules/.bin/conformance client \
               --command '.venv-test/bin/python tests/conformance/client.py' \
-              --scenario "$scenario" --spec-version 2026-07-28 --timeout 60000 \
+              --scenario "$scenario" --spec-version "$version" --timeout 60000 \
               --output-dir "tests/conformance/results/$scenario"
           done
-        timeout-minutes: 3
+        timeout-minutes: 10
       - name: Preserve official conformance reports
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

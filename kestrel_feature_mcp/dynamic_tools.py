@@ -170,7 +170,7 @@ class MCPToolWrapper:
             # A complete native result may legitimately have no text content.
             projected = ToolResult.ok(text or "MCP tool completed", data=data).to_dict()
         if invocation is not None:
-            self.app_executor.capture(invocation, result, projected)
+            return self.app_executor.capture(invocation, result, projected)
         return projected
 
 
