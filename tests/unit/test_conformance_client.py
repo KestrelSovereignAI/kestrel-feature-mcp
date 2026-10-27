@@ -17,7 +17,7 @@ def test_frozen_profile_covers_the_supported_native_transport_paths():
     assert profile["protocol_version"] == "2026-07-28"
     assert profile["scenarios"] == [
         "tools_call", "request-metadata", "http-standard-headers",
-        "http-custom-headers", "json-schema-ref-no-deref",
+        "http-custom-headers", "http-invalid-tool-headers", "json-schema-ref-no-deref",
     ]
 
 
@@ -214,8 +214,60 @@ async def test_bad_custom_header_fixture_context_is_refused_before_io(monkeypatc
     connect.assert_not_called()
 
 
+async def test_native_catalog_excludes_every_invalid_header_declaration_and_keeps_valid_tools(
+    tracked_connections, mcp_http_server,
+):
+    peer = mcp_http_server
+
+    @peer.mcp.tool()
+    async def valid_tool(region: str) -> str:
+        return region
+
+    invalid = {
+        "empty_header": {"value": {"type": "string", "x-mcp-header": ""}},
+        **{kind + "_header": {"value": {"type": kind, "x-mcp-header": "Value"}}
+           for kind in ["object", "array", "null", "number"]},
+        **{"duplicate_" + name: {
+            "first": {"type": "string", "x-mcp-header": "Region"},
+            "second": {"type": "string", "x-mcp-header": header},
+        } for name, header in [("same_case", "Region"), ("diff_case", "region")]},
+        **{name + "_in_name": {"value": {"type": "string", "x-mcp-header": header}}
+           for name, header in [("space", "bad name"), ("colon", "bad:name"),
+                                ("non_ascii", "région"), ("control_char", "bad\x00name")]},
+    }
+    contracts = {"valid_tool": {"input_schema": {
+        "type": "object", "properties": {"region": {"type": "string", "x-mcp-header": "Region"}},
+        "required": ["region"],
+    }}}
+    for suffix, properties in invalid.items():
+        name = "invalid_" + suffix
+
+        async def rejected_tool(value: str) -> str:
+            raise AssertionError("A rejected tool reached the native server")
+
+        peer.mcp.tool(name=name)(rejected_tool)
+        contracts[name] = {"input_schema": {"type": "object", "properties": properties}}
+    peer.settings["advertised_tool_contracts"] = contracts
+    connection = client.MCPConnection(peer.url)
+    try:
+        # Assert the actual production catalog, rather than having the driver
+        # filter fixture names before making a passing call.
+        tools = await connection.connect()
+        assert {tool.name for tool in tools} == {"echo", "fail", "valid_tool"}
+    finally:
+        await connection.close()
+    await client.run_scenario(peer.url, "http-invalid-tool-headers", "2026-07-28")
+    assert len(tracked_connections) == 2
+    assert all(not conn.is_connected and conn._task is None for conn in tracked_connections)
+    calls = [(scope, json.loads(body)) for scope, body in peer.requests
+             if body and json.loads(body).get("method") == "tools/call"]
+    assert len(calls) == 1 and calls[0][1]["params"]["name"] == "valid_tool"
+    assert calls[0][1]["params"]["arguments"] == {"region": "us-west1"}
+    assert dict(calls[0][0]["headers"])[b"mcp-param-region"] == b"us-west1"
+
+
 @pytest.mark.parametrize("scenario", [
-    "http-standard-headers", "http-custom-headers", "json-schema-ref-no-deref",
+    "http-standard-headers", "http-custom-headers", "http-invalid-tool-headers", "json-schema-ref-no-deref",
 ])
 async def test_missing_added_fixture_tools_close_without_partial_calls(
     tracked_connections, mcp_http_server, monkeypatch, scenario,

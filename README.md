@@ -272,14 +272,16 @@ The installation CI matrix also runs the production connection through the
 official [MCP conformance harness](https://github.com/modelcontextprotocol/conformance),
 pinned to `0.2.0-alpha.12` with an npm integrity lock. The canonical
 [`profile.json`](tests/conformance/profile.json) selects `tools_call`,
-`request-metadata`, `http-standard-headers`, `http-custom-headers`, and
+`request-metadata`, `http-standard-headers`, `http-custom-headers`,
+`http-invalid-tool-headers`, and
 `json-schema-ref-no-deref` at `2026-07-28`, with no expected-failure baseline.
 These checks exercise native tool exchange, request metadata, version negotiation,
 standard headers on tool calls and resource reads, custom header value encoding,
-and refusal to fetch external JSON Schema references. Optional client capabilities
+rejection of malformed header declarations while retaining valid tools, and refusal
+to fetch external JSON Schema references. Optional client capabilities
 and unexercised request methods are reported as skipped by the official scenarios.
-OAuth, input requests, invalid header declarations, and extension scenarios remain
-outside this profile. Passing these five scenarios does not establish full client
+OAuth, input requests, and extension scenarios remain outside this profile.
+Passing these six scenarios does not establish full client
 conformance (epic #3679 A7).
 
 To run the same profile locally with Python test dependencies and Node 24+:

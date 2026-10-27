@@ -5,6 +5,7 @@
     "request-metadata",
     "http-standard-headers",
     "http-custom-headers",
+    "http-invalid-tool-headers",
     "json-schema-ref-no-deref"
   ]
 }

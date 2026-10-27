@@ -60,6 +60,8 @@ async def run_scenario(server_url: str, scenario: str, version: str) -> None:
         calls = custom_header_calls()
     elif scenario == "http-standard-headers":
         calls = [{"name": name, "arguments": {}} for name in ("test_headers", "my-hyphenated-tool")]
+    elif scenario == "http-invalid-tool-headers":
+        calls = [{"name": "valid_tool", "arguments": {"region": "us-west1"}}]
     elif scenario == "json-schema-ref-no-deref":
         calls = []
     elif scenario in {"tools_call", "request-metadata"}:
