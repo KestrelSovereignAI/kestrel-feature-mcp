@@ -301,14 +301,15 @@ done
 Update the pinned harness and lock together, rerun the profile, and review
 new required scenarios as the remaining host capabilities land.
 
-## MCP Apps components (0.8.0)
+## MCP Apps components (0.9.0)
 
 The MCP Apps host is under development in #3679. Version 0.8.0 ships the native
 tool contracts, bounded resources, governed App execution and standalone sandbox
-service described below. These components do not yet
+service described below. Version 0.9.0 adds completed post-tool policy as a
+mandatory boundary for private native delivery. These components do not yet
 advertise Apps support: authenticated view routes, initial result associations
 and the chat renderer still need to be composed and accepted together.
-MCP tool loading requires the governed registration API provided by Core 0.55.0
+Use Core 0.55.2 or newer for governed registration and completed post-tool policy
 or newer. An unsupported host is refused before connecting or saving enablement.
 When a server rejects a call with `HeaderMismatch`, Kestrel retires the original
 catalog. Reload the connection to discover and admit the new contract before

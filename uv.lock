@@ -144,9 +144,9 @@ name = "aiologic"
 version = "0.17.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "sniffio", marker = "python_full_version < '3.14'" },
+    { name = "sniffio", marker = "python_full_version < '3.13'" },
     { name = "typing-extensions", marker = "python_full_version < '3.13'" },
-    { name = "wrapt", marker = "python_full_version < '3.14'" },
+    { name = "wrapt", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/f1/7a/d51f2fde1e8ae8a83431f8e97b7a71e9358cdb1d4d2ce6be387fa44d68de/aiologic-0.17.1.tar.gz", hash = "sha256:2e1b93b9e88ced318c2a63ad7b382688f40cbfe40e3d42258d49dc9c5aea179d", size = 252354, upload-time = "2026-06-27T20:41:33.25Z" }
 wheels = [
@@ -663,7 +663,7 @@ name = "culsans"
 version = "0.11.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "aiologic", marker = "python_full_version < '3.14'" },
+    { name = "aiologic", marker = "python_full_version < '3.13'" },
     { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d9/e3/49afa1bc180e0d28008ec6bcdf82a4072d1c7a41032b5b759b60814ca4b0/culsans-0.11.0.tar.gz", hash = "sha256:0b43d0d05dce6106293d114c86e3fb4bfc63088cfe8ff08ed3fe36891447fe33", size = 107546, upload-time = "2025-12-31T23:15:38.196Z" }
@@ -1565,7 +1565,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-mcp"
-version = "0.8.0"
+version = "0.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -1593,8 +1593,8 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'test'", specifier = ">=46" },
     { name = "docker", specifier = ">=7.1.0" },
     { name = "jsonschema", specifier = ">=4.26,<5" },
-    { name = "kestrel-sovereign", marker = "extra == 'test'", specifier = ">=0.55.0,<1" },
-    { name = "kestrel-sovereign-sdk", extras = ["httpx2"], specifier = ">=0.43.0,<1" },
+    { name = "kestrel-sovereign", marker = "extra == 'test'", specifier = ">=0.55.2,<1" },
+    { name = "kestrel-sovereign-sdk", extras = ["httpx2"], specifier = ">=0.44.1,<1" },
     { name = "mcp", specifier = ">=2.3,<3" },
     { name = "packaging", marker = "extra == 'test'" },
     { name = "pydantic", specifier = ">=2.12,<3" },
@@ -1714,7 +1714,7 @@ all = [
 
 [[package]]
 name = "kestrel-sovereign"
-version = "0.55.0"
+version = "0.55.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1782,22 +1782,22 @@ dependencies = [
     { name = "urllib3" },
     { name = "uvicorn" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9f/5e/e8904b25796526c15b2195ff83864a96b439f8ff6fecd931925f8a8e89f1/kestrel_sovereign-0.55.0.tar.gz", hash = "sha256:d24b7f7408f1953a816f28f857bfa6495996e0d6b0c8feadf9415884956ff6bf", size = 6477251, upload-time = "2026-10-26T08:00:34.525Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7b/11/9a4987b84ff695644776498f10c75a1cfbbefdb060f5601f3c7bec1bd83f/kestrel_sovereign-0.55.2.tar.gz", hash = "sha256:c77befa54b18f975754a587d6110446942059b3322e29132e638b9745a2eb6ea", size = 6488305, upload-time = "2026-10-27T01:54:40.199Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/6e/85df44f7642138ba61fb68dd38a8facdf5d65e223a3ae7259d4138165987/kestrel_sovereign-0.55.0-py3-none-any.whl", hash = "sha256:d5d48a43cf37fb34f931f757996f20f28cc24ff5eaf5fb7c1558eaac4dcd5e26", size = 7062510, upload-time = "2026-10-26T08:00:31.522Z" },
+    { url = "https://files.pythonhosted.org/packages/83/78/09213a6ccb460d349c6c6c56adb70b09391a6d529a046181896d3c9e9ee7/kestrel_sovereign-0.55.2-py3-none-any.whl", hash = "sha256:cfd05acfad8a26a6eed81a446cbcad5cd11ee1bb5efa797e1c72c83fee6260b2", size = 7074818, upload-time = "2026-10-27T01:54:37.377Z" },
 ]
 
 [[package]]
 name = "kestrel-sovereign-sdk"
-version = "0.43.0"
+version = "0.44.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/16/ee/f338dbe6d560a2d7cf59cda42300a82662c38fb7360ca3b144f80e19e256/kestrel_sovereign_sdk-0.43.0.tar.gz", hash = "sha256:bc639f24c57b7d2ab0bfd007f46496f86c854945226da683e8fb025347daadc3", size = 538249, upload-time = "2026-10-26T03:14:48.036Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4f/04/7b07be66e0070eb639685f7399dcbc2bb4f8714268fa6ae17eef95dfad94/kestrel_sovereign_sdk-0.44.1.tar.gz", hash = "sha256:08cda3be82f98fcdfab9f98c5eaab9664b056d8a2da3536a5da97f7b7c0685d0", size = 547686, upload-time = "2026-10-26T22:02:44.719Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/63/c2/3ca8ac1265d4015ff130a475450582f53c2176208a36b0ff1629e82a34f8/kestrel_sovereign_sdk-0.43.0-py3-none-any.whl", hash = "sha256:b84aa2b47a1b535500747d17e3cea3021b50ee1cfc7761d404f74ab67a34d99c", size = 646365, upload-time = "2026-10-26T03:14:46.421Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/5a/5d1bdef6c311d52f07440d107d39c6483a307082c0a481f54659e4466e98/kestrel_sovereign_sdk-0.44.1-py3-none-any.whl", hash = "sha256:8329a7d39fe6e83a803cb83f6aa3f09ceb1dc68ef05b627cdd4e5e8bfc155551", size = 655527, upload-time = "2026-10-26T22:02:46.333Z" },
 ]
 
 [package.optional-dependencies]
