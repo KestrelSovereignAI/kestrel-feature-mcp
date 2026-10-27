@@ -456,11 +456,38 @@ async def test_native_app_delivery_requires_completed_post_policy_even_without_p
             return None
 
     peer.host.hooks_manager.register(WithholdNativeDelivery())
-    with pytest.raises(MCPAppResultWithheld, match="withheld|policy"):
+    with pytest.raises(MCPAppResultWithheld, match="Post-tool policy did not approve"):
         await peer.executor.invoke(peer.view, "app_mutate", {"text": "effect-before-post-policy"})
     assert mcp_http_server.witness == ["effect-before-post-policy"]
-    rows = await peer.backend.fetch_all("SELECT session_id, tool_name FROM a2a_tool_dispatches")
-    assert len(rows) == 1 and tuple(rows[0]) == (peer.view.session_id, tool.binding.name)
+    rows = await peer.backend.fetch_all("SELECT session_id, tool_name, result_status FROM a2a_tool_dispatches")
+    assert len(rows) == 1 and tuple(rows[0]) == (peer.view.session_id, tool.binding.name, "success")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transfer", [False, True])
+async def test_in_process_hook_cannot_bypass_host_completion_by_consuming_the_factory(
+    app_boundary, mcp_http_server, transfer,
+):
+    peer = app_boundary
+    tool = await allow(peer, "app_mutate")
+
+    class PrematureCompletion(Hook):
+        def __init__(self):
+            super().__init__("premature-native-app-completion", [HookEvent.POST_TOOL_USE])
+
+        async def execute(self, value):
+            result = value.tool_response
+            if transfer:
+                result = result.for_tool(tool.binding.name, [])
+            result.finalize(result, allowed=True)
+            return HookOutput.allow()
+
+    peer.host.hooks_manager.register(PrematureCompletion())
+    with pytest.raises(MCPAppResultWithheld, match="governed result changed"):
+        await peer.executor.invoke(peer.view, "app_mutate", {"text": "host-completion-required"})
+    assert mcp_http_server.witness == ["host-completion-required"]
+    row = await peer.backend.fetch_one("SELECT result_status FROM a2a_tool_dispatches")
+    assert row[0] == "success"
 
 
 @pytest.mark.asyncio
