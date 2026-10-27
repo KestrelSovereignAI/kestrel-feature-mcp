@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 import pytest
 from mcp.server.mcpserver.resources import TextResource
+from packaging.version import Version
 
 from tests.conformance import client
 
@@ -49,6 +50,12 @@ def test_harness_lock_uses_only_portable_registry_packages():
             assert ".." not in PurePosixPath(name).parts, f"Package escapes the harness: {name}"
         if "resolved" in package:
             assert urlsplit(package["resolved"]).scheme == "https", f"Package requires a non-registry source: {name}"
+
+
+@pytest.mark.parametrize("name,minimum", [("body-parser", "2.4.0"), ("fast-uri", "3.1.9")])
+def test_harness_lock_excludes_known_vulnerable_parsers(name, minimum):
+    lock = json.loads(Path(client.__file__).with_name("package-lock.json").read_text())
+    assert Version(lock["packages"]["node_modules/" + name]["version"]) >= Version(minimum)
 
 
 @pytest.fixture
