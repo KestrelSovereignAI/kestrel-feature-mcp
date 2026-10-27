@@ -219,6 +219,9 @@ async def test_native_catalog_excludes_every_invalid_header_declaration_and_keep
 ):
     peer = mcp_http_server
 
+    peer.mcp.remove_tool("echo")
+    peer.mcp.remove_tool("fail")
+
     @peer.mcp.tool()
     async def valid_tool(region: str) -> str:
         return region
@@ -253,7 +256,7 @@ async def test_native_catalog_excludes_every_invalid_header_declaration_and_keep
         # Assert the actual production catalog, rather than having the driver
         # filter fixture names before making a passing call.
         tools = await connection.connect()
-        assert {tool.name for tool in tools} == {"echo", "fail", "valid_tool"}
+        assert {tool.name for tool in tools} == {"valid_tool"}
     finally:
         await connection.close()
     await client.run_scenario(peer.url, "http-invalid-tool-headers", "2026-07-28")
@@ -264,6 +267,24 @@ async def test_native_catalog_excludes_every_invalid_header_declaration_and_keep
     assert len(calls) == 1 and calls[0][1]["params"]["name"] == "valid_tool"
     assert calls[0][1]["params"]["arguments"] == {"region": "us-west1"}
     assert dict(calls[0][0]["headers"])[b"mcp-param-region"] == b"us-west1"
+
+
+async def test_invalid_header_scenario_refuses_an_unexpected_native_catalog(
+    tracked_connections, mcp_http_server,
+):
+    @mcp_http_server.mcp.tool()
+    async def valid_tool(region: str) -> str:
+        return region
+
+    # The normal fixture's echo/fail tools are valid but absent from the
+    # official fixture. An unexpected catalog must fail before valid_tool is
+    # called; otherwise the harness's valid-tool observation would turn green.
+    with pytest.raises(RuntimeError, match="unexpected.*catalog"):
+        await client.run_scenario(mcp_http_server.url, "http-invalid-tool-headers", "2026-07-28")
+    assert len(tracked_connections) == 1
+    assert not tracked_connections[0].is_connected and tracked_connections[0]._task is None
+    assert not any(json.loads(body).get("method") == "tools/call"
+                   for _, body in mcp_http_server.requests if body)
 
 
 @pytest.mark.parametrize("scenario", [

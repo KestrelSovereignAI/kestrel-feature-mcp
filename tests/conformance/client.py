@@ -83,6 +83,10 @@ async def run_scenario(server_url: str, scenario: str, version: str) -> None:
             missing = required - {tool.name for tool in tools}
             if missing:
                 raise RuntimeError(f"The official {scenario} fixture did not advertise {', '.join(sorted(missing))}")
+        # Assert the SDK's rejection instead of filtering fixture names here.
+        # Without this, the harness would score uncalled invalid tools green.
+        if scenario == "http-invalid-tool-headers" and {tool.name for tool in tools} != {"valid_tool"}:
+            raise RuntimeError("The official invalid-header fixture exposed an unexpected native catalog")
         for call in calls:
             result = await connection.call_tool(call["name"], call["arguments"])
             if result.is_error:
