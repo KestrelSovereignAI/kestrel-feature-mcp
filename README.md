@@ -310,7 +310,7 @@ mandatory boundary for private native delivery. These components do not yet
 advertise Apps support: authenticated view routes, initial result associations
 and the chat renderer still need to be composed and accepted together.
 Use Core 0.55.2 or newer for governed registration and completed post-tool policy
-or newer. An unsupported host is refused before connecting or saving enablement.
+support. An unsupported host is refused before connecting or saving enablement.
 When a server rejects a call with `HeaderMismatch`, Kestrel retires the original
 catalog. Reload the connection to discover and admit the new contract before
 calling again. The [transport specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#client-behavior)
