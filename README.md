@@ -270,27 +270,33 @@ Docker catalog discovery uses the current OCI catalog JSON API. Set `KESTREL_MCP
 
 The installation CI matrix also runs the production connection through the
 official [MCP conformance harness](https://github.com/modelcontextprotocol/conformance),
-pinned to `0.2.0-alpha.12` with an npm integrity lock. It runs `tools_call` and
-`request-metadata` explicitly at `2026-07-28`, with no expected-failure baseline.
-These checks cover native tool exchange, wire schemas, per-request metadata and
-version negotiation retry. Optional client capabilities that Kestrel does not
-advertise are reported as skipped by the official scenario. The OAuth, input
-request and extension scenarios remain outside this initial CI profile; passing
-these two scenarios does not establish full client conformance (epic #3679 A7).
+pinned to `0.2.0-alpha.12` with an npm integrity lock. The canonical
+[`profile.json`](tests/conformance/profile.json) selects `tools_call`,
+`request-metadata`, `http-standard-headers`, `http-custom-headers`, and
+`json-schema-ref-no-deref` at `2026-07-28`, with no expected-failure baseline.
+These checks exercise native tool exchange, request metadata, version negotiation,
+standard headers on tool calls and resource reads, custom header value encoding,
+and refusal to fetch external JSON Schema references. Optional client capabilities
+and unexercised request methods are reported as skipped by the official scenarios.
+OAuth, input requests, invalid header declarations, and extension scenarios remain
+outside this profile. Passing these five scenarios does not establish full client
+conformance (epic #3679 A7).
 
 To run the same profile locally with Python test dependencies and Node 24+:
 
 ```bash
 npm ci --prefix tests/conformance --ignore-scripts --no-audit --no-fund
-for scenario in tools_call request-metadata; do
+version=$(.venv/bin/python -c 'from tests.conformance.client import load_profile; print(load_profile()["protocol_version"])') || exit $?
+scenarios=$(.venv/bin/python -c 'from tests.conformance.client import load_profile; print(" ".join(load_profile()["scenarios"]))') || exit $?
+for scenario in $scenarios; do
   tests/conformance/node_modules/.bin/conformance client \
     --command '.venv/bin/python tests/conformance/client.py' \
-    --scenario "$scenario" --spec-version 2026-07-28 --timeout 60000 \
+    --scenario "$scenario" --spec-version "$version" --timeout 60000 \
     --output-dir "tests/conformance/results/$scenario" || exit $?
 done
 ```
 
-Update the pinned harness and lock together, rerun both scenarios, and review
+Update the pinned harness and lock together, rerun the profile, and review
 new required scenarios as the remaining host capabilities land.
 
 ## MCP Apps components (0.8.0)

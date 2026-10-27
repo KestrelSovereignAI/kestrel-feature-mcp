@@ -1,0 +1,10 @@
+{
+  "protocol_version": "2026-07-28",
+  "scenarios": [
+    "tools_call",
+    "request-metadata",
+    "http-standard-headers",
+    "http-custom-headers",
+    "json-schema-ref-no-deref"
+  ]
+}
