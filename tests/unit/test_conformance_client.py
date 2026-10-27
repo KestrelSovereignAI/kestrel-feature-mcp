@@ -176,7 +176,7 @@ async def test_added_scenarios_drive_native_io_and_close_the_original_connection
     calls = [(scope, json.loads(body)) for scope, body in peer.requests
              if body and json.loads(body).get("method") == "tools/call"]
     if scenario == "http-standard-headers":
-        assert [body["params"]["name"] for _, body in calls] == ["test_headers", "my-hyphenated-tool"]
+        assert [body["params"]["name"] for _, body in calls] == ["my-hyphenated-tool", "test_headers"]
         for scope, body in calls:
             headers = dict(scope["headers"])
             assert headers[b"mcp-method"] == b"tools/call"
