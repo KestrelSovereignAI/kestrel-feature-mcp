@@ -574,9 +574,37 @@ async def test_global_result_budget_still_bounds_all_chats(app_boundary, publica
     for chat, caller in [("original-chat", ALICE), ("another-chat", BOB)]:
         for index in range(2):
             await publish(app_boundary, registry, text=f"{chat}-{index}", chat=chat, caller=caller)
-    withheld = await execute_initial(app_boundary, text="global-limit", chat="third-chat")
+    withheld = await execute_initial(app_boundary, text="global-limit", chat="third-chat",
+        caller=CallerContext.authenticated("charlie"))
     assert [part["type"] for part in withheld["parts"]] == ["notice"]
     assert len(registry._publications) == 4 and len(mcp_http_server.witness) == 5
+
+
+@pytest.mark.asyncio
+async def test_owner_result_budget_cannot_be_evaded_by_changing_chats(app_boundary, publications, mcp_http_server):
+    registry, _, _ = publications
+    await publish(app_boundary, registry, text="one")
+    await publish(app_boundary, registry, text="two")
+    withheld = await execute_initial(app_boundary, text="same-owner-another-chat", chat="another-chat")
+    assert [part["type"] for part in withheld["parts"]] == ["notice"]
+    assert len(registry._publications) == 2 and mcp_http_server.witness == ["one", "two", "same-owner-another-chat"]
+
+
+@pytest.mark.asyncio
+async def test_global_view_budget_bounds_distinct_authenticated_principals(app_boundary, publications):
+    registry, _, reader_chat = publications
+    for caller, chat in [(ALICE, "alice-chat"), (BOB, "bob-chat")]:
+        reference, _ = await publish(app_boundary, registry, caller=caller, chat=chat)
+        reader_chat[1] = chat
+        with caller_context_scope(caller):
+            registry.open_view(reference)
+            registry.open_view(reference)
+    charlie = CallerContext.authenticated("charlie")
+    reference, _ = await publish(app_boundary, registry, caller=charlie, chat="charlie-chat")
+    reader_chat[1] = "charlie-chat"
+    with caller_context_scope(charlie), pytest.raises(ResourceConflict, match="View limit reached"):
+        registry.open_view(reference)
+    assert len(registry._views) == 4
 
 
 @pytest.mark.asyncio
