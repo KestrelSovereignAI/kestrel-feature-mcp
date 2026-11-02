@@ -32,15 +32,14 @@ def test_frozen_mcp_install_uses_public_current_https_dependencies():
         assert packages[name]["source"] == {"registry": "https://pypi.org/simple"}
 
 
-def test_app_execution_tests_require_the_host_post_policy_completion_contract():
+def test_app_execution_tests_require_audited_host_selected_publication_context():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     (core,) = [Requirement(raw) for raw in project["optional-dependencies"]["test"]
                if Requirement(raw).name == "kestrel-sovereign"]
-    for old in ["0.55.0", "0.55.1"]:
+    for old in ["0.55.0", "0.55.1", "0.55.2", "0.56.0", "0.57.0", "0.58.0"]:
         assert not core.specifier.contains(old)
-    assert core.specifier.contains("0.55.2")
-    assert core.specifier.contains("0.56.0")
+    assert core.specifier.contains("0.59.0")
     packages = {item["name"]: item for item in tomllib.loads(
         (ROOT / "uv.lock").read_text())["package"]}
-    assert Version(packages["kestrel-sovereign"]["version"]) >= Version("0.55.2")
+    assert Version(packages["kestrel-sovereign"]["version"]) >= Version("0.59.0")
     assert packages["kestrel-sovereign"]["source"] == {"registry": "https://pypi.org/simple"}

@@ -301,7 +301,7 @@ done
 Update the pinned harness and lock together, rerun the profile, and review
 new required scenarios as the remaining host capabilities land.
 
-## MCP Apps components (0.9.0)
+## MCP Apps components (0.10.0)
 
 The MCP Apps host is under development in #3679. Version 0.8.0 ships the native
 tool contracts, bounded resources, governed App execution and standalone sandbox
@@ -339,18 +339,38 @@ Initial publication requires SDK 0.46.0 and the Core 0.59.0 host contracts
 both exactly `True`. Pass a synchronous `initial_publisher` to `AppExecutor`;
 the callback receives the original tool, actual chat destination, native result
 and arguments only after the policy and audit boundary. Headless or expired
-chat collectors do not create a View. Publication failures preserve the completed
+chat collectors do not create a result association. Publication failures preserve the completed
 tool result and emit a UI failure notice without suggesting tool replay.
 
-`AppPublications` is an in-process composition component. The host supplies the
-original publisher identity and independently authenticates every reader of that
+`AppPublications` is an in-process composition component. Construct it with the
+actual `host`, `agent_id` and configured limits; use its `executor` when building
+the wrappers retained by Core's registration callback. It owns the executor and
+publisher together, so no construction trampoline or separate publisher is needed.
+The host supplies the original publisher identity and independently authenticates every reader of that
 original principal, agent and chat. A serialized part carries only a random
 locator and session metadata; possession grants no read or execution authority.
-The component enforces configured result count, native payload bytes, physical
-View count and retention time. Reopening a View reads a copy of the stored native
+The `publication_owner(context)` callback returns an immutable, comparable
+principal snapshot, or `None` when there is no authorized interactive publisher.
+`require_reader(owner, context)` must independently authenticate the current
+reader, check that original principal and exact agent/chat, then return `None` or
+raise. Expected denials may use `ResourceError` or `PermissionError`; locator
+failures have one non-disclosing error. A failed View authority check withdraws
+the View, preserving its original cause and no-replay outcome after admission.
+Cancellation and process control retain their existing semantics. Callbacks must
+be ordinary synchronous functions or bound methods; returned awaitables and
+generators are refused. The monotonic clock also permits synchronous builtins.
+
+Configure `max_publications`, `max_views`, `max_publications_per_owner`,
+`max_views_per_owner`, `max_payload_bytes`, `max_pending_calls` and
+`retention_seconds`. The two owner limits count across that principal's chats;
+setting them below the feature totals reserves capacity for other principals.
+Payload limits count the native result and arguments as UTF-8 JSON before retained
+copies are made. Reopening a View reads a copy of the stored native
 result without invoking the tool again. Registration replacement or withdrawal
 revokes associated Views synchronously; the host must then await `drain_retired()`
 before closing the original connection, and `close()` before feature teardown.
+`drain_retired()` also expires idle results and stale original connections or
+registrations before joining their Views, reclaiming both result and View capacity.
 Each registration needs fresh tool wrappers, so a result staged before an audit
 await cannot be reassociated with a replacement registration of the same object.
 No Apps capability is advertised until those host integrations are present.

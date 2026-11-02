@@ -5,6 +5,7 @@ HTTP authentication tests; no route advertises this in-process component yet.
 """
 
 import asyncio
+import inspect
 import json
 
 import pytest
@@ -12,7 +13,8 @@ import pytest_asyncio
 
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 from kestrel_sovereign.agent.parts import part_collector
-from kestrel_sovereign.auth import CallerContext, caller_context_scope, current_caller_context
+from kestrel_sovereign.auth import AuthMethod, CallerContext, caller_context_scope, current_caller_context
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, is_execution_control_error
 from kestrel_sovereign.features.security.permissions import PermissionLevel
 
 from kestrel_feature_mcp.apps_publication import AppPublications
@@ -27,41 +29,52 @@ pytestmark = pytest.mark.parametrize("mcp_http_server", [
 ], indirect=True)
 
 
-class Publisher:
-    registry = None
-
-    def publish(self, *args):
-        return self.registry.publish(*args)
+@pytest.fixture
+def initial_publisher():
+    return None
 
 
 @pytest.fixture
-def initial_publisher():
-    return Publisher()
+def publication_state():
+    return {"clock": [10.0], "chat": [None, "original-chat"]}
+
+
+@pytest.fixture
+def app_executor_factory(publication_state):
+    def create(*, host, max_pending_calls, initial_publisher):
+        assert initial_publisher is None
+        state = publication_state
+        state["chat"][0] = host.did
+
+        def original_owner(context):
+            caller = current_caller_context()
+            if caller is None or caller.auth_method not in {AuthMethod.API_KEY, AuthMethod.JWT, AuthMethod.OAUTH_SESSION}:
+                return None
+            return caller
+
+        def require_reader(owner, context):
+            caller = original_owner(context)
+            if (caller is None or caller != owner
+                    or state["chat"] != [context.agent_id, context.session_id]):
+                raise ResourceConflict("The original authenticated chat reader is required")
+
+        registry = AppPublications(host=host, max_pending_calls=max_pending_calls, agent_id=host.did,
+            publication_owner=original_owner, require_reader=require_reader,
+            max_publications=4, max_views=4, max_payload_bytes=8192,
+            max_publications_per_owner=2, max_views_per_owner=2,
+            retention_seconds=30, clock=lambda: state["clock"][0])
+        state["registry"] = registry
+        return registry.executor
+    return create
 
 
 @pytest_asyncio.fixture
-async def publications(app_boundary, initial_publisher):
+async def publications(app_boundary, publication_state):
     peer = app_boundary
-    now = [10.0]
-    reader_chat = [peer.host.did, "original-chat"]
-
-    def original_owner(context):
-        return current_caller_context()
-
-    def require_reader(owner, context):
-        caller = current_caller_context()
-        if (caller is None or caller != owner
-                or reader_chat != [context.agent_id, context.session_id]):
-            raise ResourceConflict("The original authenticated chat reader is required")
-
-    registry = AppPublications(executor=peer.executor, agent_id=peer.host.did,
-        publication_owner=original_owner, require_reader=require_reader,
-        max_publications=2, max_views=2, max_payload_bytes=8192,
-        retention_seconds=30, clock=lambda: now[0])
-    initial_publisher.registry = registry
+    registry = publication_state["registry"]
     registry.register("mcp:original", peer.registered, is_current=lambda: peer.owner_current[0])
     try:
-        yield registry, now, reader_chat
+        yield registry, publication_state["clock"], publication_state["chat"]
     finally:
         await registry.close()
 
@@ -70,15 +83,15 @@ ALICE = CallerContext.authenticated("alice")
 BOB = CallerContext.authenticated("bob")
 
 
-async def execute_initial(peer, *, text="once", chat="original-chat"):
+async def execute_initial(peer, *, text="once", chat="original-chat", caller=ALICE):
     tool = await allow(peer, "app_mutate")
-    with caller_context_scope(ALICE), part_collector(host=peer.host, session_id=chat):
+    with caller_context_scope(caller), part_collector(host=peer.host, session_id=chat):
         result = await tool.binding.invoke({"text": text}, session_id=chat, source="chat")
     return result
 
 
-async def publish(peer, registry, *, text="once", chat="original-chat"):
-    result = await execute_initial(peer, text=text, chat=chat)
+async def publish(peer, registry, *, text="once", chat="original-chat", caller=ALICE):
+    result = await execute_initial(peer, text=text, chat=chat, caller=caller)
     parts = [part for part in result["parts"] if part["type"] == "mcp_app"]
     assert len(parts) == 1
     part = parts[0]
@@ -125,7 +138,7 @@ async def test_private_result_reopens_without_replaying_native_effect(app_bounda
 async def test_chat_locator_cannot_authenticate_reader(app_boundary, publications, caller):
     registry, _, _ = publications
     reference, _ = await publish(app_boundary, registry)
-    with caller_context_scope(caller), pytest.raises(ResourceConflict, match="authenticated chat reader"):
+    with caller_context_scope(caller), pytest.raises(ResourceConflict, match="result is unavailable"):
         registry.open_view(reference)
 
 
@@ -135,7 +148,7 @@ async def test_same_principal_still_requires_original_agent_and_chat(app_boundar
     registry, _, chat = publications
     reference, _ = await publish(app_boundary, registry)
     chat[wrong_field] = "another-owner"
-    with caller_context_scope(ALICE), pytest.raises(ResourceConflict, match="authenticated chat reader"):
+    with caller_context_scope(ALICE), pytest.raises(ResourceConflict, match="result is unavailable"):
         registry.open_view(reference)
 
 
@@ -145,9 +158,9 @@ async def test_live_view_rechecks_independent_reader_at_every_operation(app_boun
     reference, _ = await publish(app_boundary, registry)
     with caller_context_scope(ALICE):
         view = registry.open_view(reference)
-    with caller_context_scope(BOB), pytest.raises(ResourceConflict, match="authenticated chat reader"):
+    with caller_context_scope(BOB), pytest.raises(ResourceConflict, match="result is unavailable"):
         registry.initial_result(reference, view)
-    with caller_context_scope(None), pytest.raises(ResourceConflict, match="authenticated chat reader"):
+    with caller_context_scope(None), pytest.raises(ResourceConflict, match="result is unavailable"):
         view.list_tools()
 
 
@@ -175,6 +188,43 @@ async def test_retention_boundary_revokes_views_without_result_replay(app_bounda
             view.list_tools()
     await registry.drain_retired()
     assert not registry._views and mcp_http_server.witness == ["once"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("withdraw", ["retention", "owner", "registration", "connection"])
+async def test_idle_drain_reclaims_expired_and_stale_associations(app_boundary, publications, withdraw):
+    registry, clock, _ = publications
+    reference, _ = await publish(app_boundary, registry)
+    with caller_context_scope(ALICE):
+        view = registry.open_view(reference)
+    if withdraw == "retention":
+        clock[0] = 40.0
+    elif withdraw == "owner":
+        app_boundary.owner_current[0] = False
+    elif withdraw == "registration":
+        app_boundary.host.unregister_dynamic_tools("mcp:original")
+    else:
+        await app_boundary.connection.close()
+    # No subsequent resource/result read is needed to withdraw the View.
+    await registry.drain_retired()
+    assert view._closed and not registry._publications and not registry._views
+
+
+@pytest.mark.asyncio
+async def test_idle_retention_drain_recovers_both_publication_and_view_capacity(app_boundary, publications, mcp_http_server):
+    registry, clock, _ = publications
+    first, _ = await publish(app_boundary, registry, text="one")
+    await publish(app_boundary, registry, text="two")
+    with caller_context_scope(ALICE):
+        registry.open_view(first)
+        registry.open_view(first)
+    clock[0] = 40.0
+    await registry.drain_retired()
+    assert not registry._views and not registry._publications
+    reference, _ = await publish(app_boundary, registry, text="after-retention")
+    with caller_context_scope(ALICE):
+        registry.open_view(reference)
+    assert mcp_http_server.witness == ["one", "two", "after-retention"]
 
 
 @pytest.mark.asyncio
@@ -266,11 +316,12 @@ async def test_reader_callback_must_explicitly_return_none_or_raise(app_boundary
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("value", [0, -1, True, 0.5])
-@pytest.mark.parametrize("field", ["max_publications", "max_views", "max_payload_bytes"])
+@pytest.mark.parametrize("field", ["max_publications", "max_views", "max_payload_bytes", "max_publications_per_owner", "max_views_per_owner"])
 async def test_invalid_publication_limits_fail_before_retaining_native_data(app_boundary, field, value):
-    kwargs = dict(executor=app_boundary.executor, agent_id=app_boundary.host.did,
+    kwargs = dict(host=app_boundary.host, max_pending_calls=2, agent_id=app_boundary.host.did,
         publication_owner=lambda context: None, require_reader=lambda owner, context: None,
-        max_publications=2, max_views=2, max_payload_bytes=8192, retention_seconds=30)
+        max_publications=4, max_views=4, max_payload_bytes=8192,
+            max_publications_per_owner=2, max_views_per_owner=2, retention_seconds=30)
     kwargs[field] = value
     with pytest.raises(ValueError, match="positive integers"):
         AppPublications(**kwargs)
@@ -280,9 +331,10 @@ async def test_invalid_publication_limits_fail_before_retaining_native_data(app_
 @pytest.mark.parametrize("value", [0, -1, True, float("nan"), float("inf")])
 async def test_invalid_retention_fails_before_retaining_native_data(app_boundary, value):
     with pytest.raises(ValueError, match="positive and finite"):
-        AppPublications(executor=app_boundary.executor, agent_id=app_boundary.host.did,
+        AppPublications(host=app_boundary.host, max_pending_calls=2, agent_id=app_boundary.host.did,
             publication_owner=lambda context: None, require_reader=lambda owner, context: None,
-            max_publications=2, max_views=2, max_payload_bytes=8192, retention_seconds=value)
+            max_publications=4, max_views=4, max_payload_bytes=8192,
+            max_publications_per_owner=2, max_views_per_owner=2, retention_seconds=value)
 
 
 @pytest.mark.asyncio
@@ -291,9 +343,10 @@ async def test_async_authorization_callbacks_cannot_escape_as_principal_snapshot
     async def invalid(*args):
         return None
 
-    kwargs = dict(executor=app_boundary.executor, agent_id=app_boundary.host.did,
+    kwargs = dict(host=app_boundary.host, max_pending_calls=2, agent_id=app_boundary.host.did,
         publication_owner=lambda context: None, require_reader=lambda owner, context: None,
-        max_publications=2, max_views=2, max_payload_bytes=8192, retention_seconds=30)
+        max_publications=4, max_views=4, max_payload_bytes=8192,
+            max_publications_per_owner=2, max_views_per_owner=2, retention_seconds=30)
     kwargs[field] = invalid
     with pytest.raises(TypeError, match="synchronous function or method"):
         AppPublications(**kwargs)
@@ -301,14 +354,15 @@ async def test_async_authorization_callbacks_cannot_escape_as_principal_snapshot
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("changes", "error"), [
-    ({"executor": None}, TypeError), ({"agent_id": None}, ValueError),
+    ({"host": None}, ValueError), ({"agent_id": None}, ValueError),
     ({"agent_id": " "}, ValueError), ({"clock": None}, TypeError),
     ({"publication_owner": None}, TypeError), ({"require_reader": None}, TypeError),
 ])
 async def test_invalid_publication_owner_configuration_fails_at_construction(app_boundary, changes, error):
-    kwargs = dict(executor=app_boundary.executor, agent_id=app_boundary.host.did,
+    kwargs = dict(host=app_boundary.host, max_pending_calls=2, agent_id=app_boundary.host.did,
         publication_owner=lambda context: None, require_reader=lambda owner, context: None,
-        max_publications=2, max_views=2, max_payload_bytes=8192, retention_seconds=30)
+        max_publications=4, max_views=4, max_payload_bytes=8192,
+            max_publications_per_owner=2, max_views_per_owner=2, retention_seconds=30)
     with pytest.raises(error):
         AppPublications(**(kwargs | changes))
 
@@ -398,15 +452,69 @@ async def test_physical_close_and_feature_shutdown_join_the_same_required_audit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [PermissionError, TypeError, RuntimeError, ExecutionAuthorityError])
+async def test_reader_failure_after_native_effect_preserves_no_replay_outcome(app_boundary, publications, mcp_http_server, error_type):
+    peer = app_boundary
+    registry, _, _ = publications
+    reference, _ = await publish(peer, registry)
+    peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
+    error = error_type("private-reader-diagnostic")
+    with caller_context_scope(ALICE):
+        view = registry.open_view(reference)
+        call = asyncio.create_task(registry.executor.invoke(view, "app_mutate", {"text": "reader-withdrawn"}))
+        try:
+            await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
+            def refuse(owner, context):
+                raise error
+
+            registry._require_reader = refuse
+            peer.store.release_dispatch.set()
+            with pytest.raises(ResourceOutcomeUnknown, match="replay|retry") as caught:
+                await call
+            causes = []
+            current = caught.value
+            while current is not None and current not in causes:
+                causes.append(current)
+                current = current.__cause__
+            assert error in causes
+            assert is_execution_control_error(caught.value) is (error_type is ExecutionAuthorityError)
+        finally:
+            peer.store.release_dispatch.set()
+            if not call.done():
+                call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+    assert mcp_http_server.witness == ["once", "reader-withdrawn"]
+    rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+    assert [tuple(row) for row in rows] == [("success",), ("success",)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+async def test_reader_process_control_is_preserved_as_the_original_exception(app_boundary, publications, error_type):
+    registry, _, _ = publications
+    reference, _ = await publish(app_boundary, registry)
+    error = error_type("original-process-control")
+    with caller_context_scope(ALICE):
+        view = registry.open_view(reference)
+        def stop(owner, context):
+            raise error
+
+        registry._require_reader = stop
+        with pytest.raises(error_type) as caught:
+            view.require_current()
+    assert caught.value is error
+
+
+@pytest.mark.asyncio
 async def test_original_connection_loss_withholds_both_initial_result_and_resource(app_boundary, publications):
     registry, _, _ = publications
     reference, _ = await publish(app_boundary, registry)
     with caller_context_scope(ALICE):
         view = registry.open_view(reference)
         await app_boundary.connection.close()
-        with pytest.raises((ResourceConflict, ValueError)):
+        with pytest.raises(ResourceConflict):
             registry.initial_result(reference, view)
-        with pytest.raises((ResourceConflict, ValueError)):
+        with pytest.raises(ResourceConflict):
             await view.read_resource(view.source.tool.resource_uri, max_html_bytes=8192)
 
 
@@ -443,6 +551,98 @@ async def test_physical_view_limit_recovers_only_after_owned_close(app_boundary,
 
 
 @pytest.mark.asyncio
+async def test_busy_chat_cannot_exhaust_another_chats_result_and_view_budget(app_boundary, publications, mcp_http_server):
+    registry, _, reader_chat = publications
+    first, _ = await publish(app_boundary, registry, text="one")
+    await publish(app_boundary, registry, text="two")
+    with caller_context_scope(ALICE):
+        registry.open_view(first)
+        registry.open_view(first)
+    withheld = await execute_initial(app_boundary, text="chat-limit")
+    assert [part["type"] for part in withheld["parts"]] == ["notice"]
+    second, _ = await publish(app_boundary, registry, text="other-chat", chat="another-chat", caller=BOB)
+    reader_chat[1] = "another-chat"
+    with caller_context_scope(BOB):
+        view = registry.open_view(second)
+        assert registry.initial_result(second, view)[0] == {"text": "other-chat"}
+    assert len(registry._views) == 3 and mcp_http_server.witness == ["one", "two", "chat-limit", "other-chat"]
+
+
+@pytest.mark.asyncio
+async def test_global_result_budget_still_bounds_all_chats(app_boundary, publications, mcp_http_server):
+    registry, _, _ = publications
+    for chat, caller in [("original-chat", ALICE), ("another-chat", BOB)]:
+        for index in range(2):
+            await publish(app_boundary, registry, text=f"{chat}-{index}", chat=chat, caller=caller)
+    withheld = await execute_initial(app_boundary, text="global-limit", chat="third-chat")
+    assert [part["type"] for part in withheld["parts"]] == ["notice"]
+    assert len(registry._publications) == 4 and len(mcp_http_server.witness) == 5
+
+
+@pytest.mark.asyncio
+async def test_missing_expired_and_refused_locators_have_one_non_disclosing_error(app_boundary, publications):
+    registry, clock, _ = publications
+    reference, _ = await publish(app_boundary, registry)
+    messages = []
+    for locator, caller in [("not-a-result", ALICE), (reference, BOB)]:
+        with caller_context_scope(caller), pytest.raises(ResourceConflict) as caught:
+            registry.open_view(locator)
+        messages.append(str(caught.value))
+    clock[0] = 40.0
+    with caller_context_scope(ALICE), pytest.raises(ResourceConflict) as caught:
+        registry.open_view(reference)
+    messages.append(str(caught.value))
+    assert len(set(messages)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["coroutine", "generator", "async-generator"])
+async def test_returned_deferred_owner_work_is_rejected_without_retaining_private_data(app_boundary, publications, mcp_http_server, kind):
+    registry, _, _ = publications
+    async def coroutine():
+        return ALICE
+
+    def generator():
+        yield ALICE
+
+    async def async_generator():
+        yield ALICE
+
+    values = []
+    def owner(context):
+        value = {"coroutine": coroutine, "generator": generator, "async-generator": async_generator}[kind]()
+        values.append(value)
+        return value
+
+    registry._publication_owner = owner
+    try:
+        result = await execute_initial(app_boundary)
+        assert [part["type"] for part in result["parts"]] == ["notice"]
+        assert not registry._publications and mcp_http_server.witness == ["once"]
+        if kind == "coroutine":
+            assert values[0].cr_frame is None
+        elif kind == "generator":
+            assert values[0].gi_frame is None
+    finally:
+        for value in values:
+            if inspect.isasyncgen(value):
+                await value.aclose()
+            else:
+                value.close()
+
+
+@pytest.mark.asyncio
+async def test_unbound_initial_caller_is_refused_before_real_native_io(app_boundary, publications, mcp_http_server):
+    peer = app_boundary
+    with pytest.raises(ValueError, match="original bound native caller"):
+        MCPToolWrapper(handle_name="bad_initial_binding", tool=peer.tool("app_mutate").tool.native_tool,
+            caller=peer.connection.call_tool, app_executor=peer.executor)
+    assert not mcp_http_server.witness
+    rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+    assert not rows
+
+
+@pytest.mark.asyncio
 async def test_native_private_payload_limit_is_counted_before_retention(app_boundary, publications, mcp_http_server):
     registry, _, _ = publications
     registry._max_payload_bytes = 1
@@ -454,10 +654,100 @@ async def test_native_private_payload_limit_is_counted_before_retention(app_boun
 
 
 @pytest.mark.asyncio
-async def test_unbound_interactive_publisher_retains_no_private_result(app_boundary, publications, mcp_http_server):
+@pytest.mark.parametrize("caller", [None, CallerContext.anonymous(), CallerContext.a2a_transport()])
+async def test_unbound_interactive_publisher_retains_no_private_result(app_boundary, publications, mcp_http_server, caller):
     registry, _, _ = publications
     tool = await allow(app_boundary, "app_mutate")
-    with caller_context_scope(None), part_collector(host=app_boundary.host, session_id="original-chat"):
+    with caller_context_scope(caller), part_collector(host=app_boundary.host, session_id="original-chat"):
         result = await tool.binding.invoke({"text": "unbound"}, session_id="original-chat", source="chat")
     assert not registry._publications and '"mcp_app"' not in json.dumps(result)
     assert mcp_http_server.witness == ["unbound"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["max_publications_per_owner", "max_views_per_owner"])
+async def test_owner_budget_cannot_exceed_its_global_budget(app_boundary, field):
+    options = dict(host=app_boundary.host, max_pending_calls=2, agent_id=app_boundary.host.did,
+        publication_owner=lambda context: None, require_reader=lambda owner, context: None,
+        max_publications=4, max_views=4, max_payload_bytes=8192,
+        max_publications_per_owner=2, max_views_per_owner=2, retention_seconds=30)
+    options[field] = 5
+    with pytest.raises(ValueError, match="owner limits cannot exceed"):
+        AppPublications(**options)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [True, float("nan"), float("inf"), "10"])
+async def test_invalid_clock_output_fails_before_an_executor_is_published(app_boundary, value):
+    with pytest.raises(ValueError, match="monotonic clock"):
+        AppPublications(host=app_boundary.host, max_pending_calls=2, agent_id=app_boundary.host.did,
+            publication_owner=lambda context: None, require_reader=lambda owner, context: None,
+            max_publications=4, max_views=4, max_payload_bytes=8192,
+            max_publications_per_owner=2, max_views_per_owner=2, retention_seconds=30, clock=lambda: value)
+
+
+@pytest.mark.asyncio
+async def test_generator_and_async_clock_functions_are_rejected_at_construction(app_boundary):
+    def generator(*args):
+        yield None
+
+    async def async_clock():
+        return 10
+
+    options = dict(host=app_boundary.host, max_pending_calls=2, agent_id=app_boundary.host.did,
+        publication_owner=lambda context: None, require_reader=lambda owner, context: None,
+        max_publications=4, max_views=4, max_payload_bytes=8192,
+        max_publications_per_owner=2, max_views_per_owner=2, retention_seconds=30)
+    for changes in [{"publication_owner": generator}, {"require_reader": generator}, {"clock": async_clock}]:
+        with pytest.raises(TypeError, match="synchronous function or method"):
+            AppPublications(**(options | changes))
+
+
+@pytest.mark.asyncio
+async def test_missing_registration_and_closed_publisher_withhold_completed_results(app_boundary, publications, mcp_http_server):
+    registry, _, _ = publications
+    registry.retire("mcp:original")
+    missing = await execute_initial(app_boundary, text="missing-registration")
+    await registry.close()
+    closed = await execute_initial(app_boundary, text="closed-publisher")
+    for result in [missing, closed]:
+        assert result["status"] == "ok" and [part["type"] for part in result["parts"]] == ["notice"]
+    with caller_context_scope(ALICE), pytest.raises(ResourceConflict, match="result is unavailable"):
+        registry.open_view("not-a-capability")
+    assert not registry._publications and mcp_http_server.witness == ["missing-registration", "closed-publisher"]
+
+
+@pytest.mark.asyncio
+async def test_tool_wrapper_cannot_join_another_owners_registration(app_boundary, publications):
+    registry, _, _ = publications
+    with pytest.raises(ValueError, match="already belonged"):
+        registry.register("mcp:another-owner", app_boundary.registered, is_current=lambda: True)
+
+
+@pytest.mark.asyncio
+async def test_actual_chat_destination_cannot_publish_into_a_different_agent_store(app_boundary, publications, mcp_http_server):
+    registry, _, _ = publications
+    registry._agent_id = "did:key:another-configured-agent"
+    result = await execute_initial(app_boundary)
+    assert [part["type"] for part in result["parts"]] == ["notice"]
+    assert not registry._publications and mcp_http_server.witness == ["once"]
+
+
+@pytest.mark.asyncio
+async def test_payload_budget_accepts_exact_native_utf8_boundary_and_refuses_one_byte_less(app_boundary, publications, mcp_http_server):
+    registry, clock, _ = publications
+    text = "€"
+    reference, _ = await publish(app_boundary, registry, text=text)
+    with caller_context_scope(ALICE):
+        view = registry.open_view(reference)
+        arguments, native = registry.initial_result(reference, view)
+    native_bytes = len(native.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
+    input_bytes = len(json.dumps(arguments, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+    clock[0] = 40.0
+    await registry.drain_retired()
+    registry._max_payload_bytes = native_bytes + input_bytes
+    await publish(app_boundary, registry, text=text)
+    registry._max_payload_bytes -= 1
+    result = await execute_initial(app_boundary, text=text)
+    assert [part["type"] for part in result["parts"]] == ["notice"]
+    assert len(registry._publications) == 1 and mcp_http_server.witness == [text, text, text]

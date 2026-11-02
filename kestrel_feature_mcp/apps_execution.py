@@ -10,7 +10,10 @@ import asyncio
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
-from inspect import isasyncgenfunction, iscoroutinefunction, isfunction, ismethod
+from inspect import (
+    isasyncgen, isasyncgenfunction, isawaitable, isbuiltin, iscoroutine,
+    iscoroutinefunction, isfunction, isgenerator, isgeneratorfunction, ismethod,
+)
 from types import MappingProxyType
 from typing import Callable, Mapping, TYPE_CHECKING
 
@@ -31,11 +34,21 @@ InitialAppPublisher = Callable[
 ]
 
 
-def require_synchronous_callback(callback, *, label: str) -> None:
+def require_synchronous_callback(callback, *, label: str, allow_builtin: bool = False) -> None:
     """Private delivery callbacks run inline and cannot escape as awaitables."""
-    if (not (isfunction(callback) or ismethod(callback))
-            or iscoroutinefunction(callback) or isasyncgenfunction(callback)):
+    if (not (isfunction(callback) or ismethod(callback) or (allow_builtin and isbuiltin(callback)))
+            or iscoroutinefunction(callback) or isasyncgenfunction(callback) or isgeneratorfunction(callback)):
         raise TypeError(f"MCP Apps {label} requires a synchronous function or method")
+
+
+def call_synchronous_callback(callback, *args, label: str):
+    """Reject deferred work returned by an otherwise ordinary host callback."""
+    value = callback(*args)
+    if isawaitable(value) or isgenerator(value) or isasyncgen(value):
+        if iscoroutine(value) or isgenerator(value):
+            value.close()
+        raise TypeError(f"MCP Apps {label} must complete synchronously")
+    return value
 
 
 class MCPAppResultWithheld(ResourceOutcomeUnknown):
@@ -75,7 +88,17 @@ class AppView:
     def require_current(self) -> None:
         if self._closed:
             raise ResourceConflict("MCP App View expired; reopen it without replaying prior calls")
-        owner_current = self._owner_is_current()
+        try:
+            owner_current = call_synchronous_callback(self._owner_is_current, label="View authority")
+        except ResourceConflict:
+            raise
+        except Exception as error:
+            # This is the host's authority-check boundary, not tool execution.
+            # Any failed checker withdraws the View. Retain the exact cause so
+            # Core's control/commit evidence remains discoverable, while the
+            # owned-call boundary can classify an already admitted effect as
+            # unknown/withheld. Cancellation and process control stay intact.
+            raise ResourceConflict("MCP App View authority check failed; reopen without replaying prior calls") from error
         if self._closed or owner_current is not True:
             raise ResourceConflict("MCP App View expired; reopen it without replaying prior calls")
         for registered in self._tools.values():
@@ -197,8 +220,10 @@ class AppExecutor:
         publisher = self._initial_publisher
         if publisher is None or tool.resource_uri is None:
             return projection
-        if tool.app_executor is not self or not isinstance(tool.bound_caller, BoundMCPCaller):
-            raise MCPAppResultWithheld("MCP App result lost its original connection; do not replay")
+        try:
+            self.require_initial_tool(tool)
+        except ValueError as error:
+            raise MCPAppResultWithheld("MCP App result lost its original connection; do not replay") from error
         if not isinstance(native, types.CallToolResult) or native.result_type != "complete":
             raise MCPAppResultWithheld("MCP App has no complete native result; do not replay")
         captured = native.model_copy(deep=True)
@@ -212,10 +237,19 @@ class AppExecutor:
                 tool.bound_caller.require_current()
             except ValueError as error:
                 raise MCPAppResultWithheld("MCP App connection expired before publication; do not replay") from error
-            return publisher(tool, context, captured, arguments)
+            return call_synchronous_callback(publisher, tool, context, captured, arguments,
+                label="initial publication")
 
         deferred = DeferredToolResult(projection, publish=publish)
         return deferred
+
+    def require_initial_tool(self, tool: MCPToolWrapper) -> None:
+        """Refuse unsupported initial publication setup before the native effect."""
+        if self._initial_publisher is None or tool.resource_uri is None:
+            return
+        if tool.app_executor is not self or not isinstance(tool.bound_caller, BoundMCPCaller):
+            raise ValueError("MCP App initial publication requires its original bound native caller")
+        tool.bound_caller.require_current()
 
     def open_view(
         self, source: RegisteredAppTool, registered: list[RegisteredAppTool], *,
@@ -253,6 +287,7 @@ class AppExecutor:
         """Recheck the actual View after approval, immediately before MCP I/O."""
         invocation = self._invocation.get()
         if invocation is None:
+            self.require_initial_tool(tool)
             return None
         if invocation.started or invocation.finished:
             raise ResourceConflict("MCP App invocation admission cannot be reused")

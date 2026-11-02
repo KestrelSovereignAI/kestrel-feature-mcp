@@ -108,6 +108,8 @@ class MCPToolWrapper:
         self._caller = caller
         self.app_executor = app_executor
         self.schema = _MCPToolSchema(handle_name, self._native_tool)
+        if app_executor is not None:
+            app_executor.require_initial_tool(self)
 
     @property
     def bound_caller(self) -> MCPCaller:
