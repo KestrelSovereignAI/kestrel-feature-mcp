@@ -651,11 +651,16 @@ async def test_invalid_view_configuration_is_refused_before_native_io(app_bounda
             AppExecutor(host=host, max_pending_calls=2)
     original = dict(source=peer.view.source, registered=peer.registered,
         session_id="mcp-app:configured", owner_is_current=lambda: True)
+    async def async_owner():
+        return True
+
     for changes, error, message in [
         ({"session_id": " "}, ValueError, "session_id"),
         ({"registered": []}, ValueError, "retained"),
         ({"registered": [*peer.registered, peer.registered[0]]}, ValueError, "Duplicate"),
         ({"owner_is_current": None}, TypeError, "owner predicate"),
+        ({"owner_is_current": async_owner}, TypeError, "synchronous"),
+        ({"owner_is_current": lambda: 1}, ResourceConflict, "expired"),
         ({"source": peer.tool("echo")}, ValueError, "associated"),
     ]:
         with pytest.raises(error, match=message):

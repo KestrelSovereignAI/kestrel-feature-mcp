@@ -31,6 +31,13 @@ InitialAppPublisher = Callable[
 ]
 
 
+def require_synchronous_callback(callback, *, label: str) -> None:
+    """Private delivery callbacks run inline and cannot escape as awaitables."""
+    if (not (isfunction(callback) or ismethod(callback))
+            or iscoroutinefunction(callback) or isasyncgenfunction(callback)):
+        raise TypeError(f"MCP Apps {label} requires a synchronous function or method")
+
+
 class MCPAppResultWithheld(ResourceOutcomeUnknown):
     """The call completed, but native delivery was refused; never replay it."""
 
@@ -66,7 +73,10 @@ class AppView:
     _calls: set[asyncio.Task] = field(default_factory=set, init=False, repr=False)
 
     def require_current(self) -> None:
-        if self._closed or not self._owner_is_current():
+        if self._closed:
+            raise ResourceConflict("MCP App View expired; reopen it without replaying prior calls")
+        owner_current = self._owner_is_current()
+        if self._closed or owner_current is not True:
             raise ResourceConflict("MCP App View expired; reopen it without replaying prior calls")
         for registered in self._tools.values():
             if not registered.binding.is_current:
@@ -166,9 +176,7 @@ class AppExecutor:
         if getattr(host, "supports_deferred_tool_results", False) is not True:
             raise ValueError("MCP Apps require a host that supports deferred tool results")
         if initial_publisher is not None:
-            if (not (isfunction(initial_publisher) or ismethod(initial_publisher))
-                    or iscoroutinefunction(initial_publisher) or isasyncgenfunction(initial_publisher)):
-                raise TypeError("MCP Apps initial publication requires a synchronous function or method")
+            require_synchronous_callback(initial_publisher, label="initial publication")
             if (getattr(host, "supports_audited_deferred_tool_results", False) is not True
                     or getattr(host, "supports_tool_publication_context", False) is not True):
                 raise ValueError("MCP Apps initial publication requires audited host-selected chat context")
@@ -215,6 +223,15 @@ class AppExecutor:
     ) -> AppView:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("An MCP App View requires a session_id")
+        tools = self.registration_tools(source, registered)
+        require_synchronous_callback(owner_is_current, label="View owner predicate")
+        view = AppView(self, source, source.tool.bound_caller, session_id, tools, owner_is_current)
+        view.require_current()
+        return view
+
+    def registration_tools(self, source: RegisteredAppTool,
+                           registered: list[RegisteredAppTool]) -> Mapping[str, RegisteredAppTool]:
+        """Validate and seal the exact original batch, independently of a View."""
         caller = source.tool.bound_caller
         if not isinstance(caller, BoundMCPCaller):
             raise TypeError("An MCP App View requires its originating bound native caller")
@@ -230,11 +247,7 @@ class AppExecutor:
             tools[name] = item
         if tools.get(source.tool.native_tool.name) is not source:
             raise ValueError("MCP App source must be retained in its original registration batch")
-        if not callable(owner_is_current):
-            raise TypeError("MCP App View requires a live owner predicate")
-        view = AppView(self, source, caller, session_id, MappingProxyType(tools), owner_is_current)
-        view.require_current()
-        return view
+        return MappingProxyType(tools)
 
     def admit(self, tool: MCPToolWrapper) -> _Invocation | None:
         """Recheck the actual View after approval, immediately before MCP I/O."""

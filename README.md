@@ -307,8 +307,10 @@ The MCP Apps host is under development in #3679. Version 0.8.0 ships the native
 tool contracts, bounded resources, governed App execution and standalone sandbox
 service described below. Version 0.9.0 adds completed post-tool policy as a
 mandatory boundary for private native delivery. These components do not yet
-advertise Apps support: authenticated view routes, initial result associations
-and the chat renderer still need to be composed and accepted together.
+advertise Apps support. The current source also stages the initial native result
+through Core's completed policy and required SQL audit, then retains bounded
+private result associations for their original registration. Authenticated view
+routes and the chat renderer still need to be composed and accepted together.
 Use Core 0.55.2 or newer for governed registration and completed post-tool policy
 support. An unsupported host is refused before connecting or saving enablement.
 When a server rejects a call with `HeaderMismatch`, Kestrel retires the original
@@ -331,6 +333,25 @@ Withdrawing a View before native admission raises `ResourceConflict`; withdrawal
 after admission raises `ResourceOutcomeUnknown`. An awaiting caller's own
 cancellation remains cancellation. Closing a View joins its owned calls and
 required audit finalization; it cannot undo effects already accepted remotely.
+
+Initial publication requires SDK 0.46.0 and the Core 0.59.0 host contracts
+`supports_audited_deferred_tool_results` and `supports_tool_publication_context`,
+both exactly `True`. Pass a synchronous `initial_publisher` to `AppExecutor`;
+the callback receives the original tool, actual chat destination, native result
+and arguments only after the policy and audit boundary. Headless or expired
+chat collectors do not create a View. Publication failures preserve the completed
+tool result and emit a UI failure notice without suggesting tool replay.
+
+`AppPublications` is an in-process composition component. The host supplies the
+original publisher identity and independently authenticates every reader of that
+original principal, agent and chat. A serialized part carries only a random
+locator and session metadata; possession grants no read or execution authority.
+The component enforces configured result count, native payload bytes, physical
+View count and retention time. Reopening a View reads a copy of the stored native
+result without invoking the tool again. Registration replacement or withdrawal
+revokes associated Views synchronously; the host must then await `drain_retired()`
+before closing the original connection, and `close()` before feature teardown.
+No Apps capability is advertised until those host integrations are present.
 
 The package includes a standalone public sandbox service. Run it on a separate
 origin that receives no host identity cookies, behind your normal HTTPS ingress:
