@@ -351,6 +351,8 @@ View count and retention time. Reopening a View reads a copy of the stored nativ
 result without invoking the tool again. Registration replacement or withdrawal
 revokes associated Views synchronously; the host must then await `drain_retired()`
 before closing the original connection, and `close()` before feature teardown.
+Each registration needs fresh tool wrappers, so a result staged before an audit
+await cannot be reassociated with a replacement registration of the same object.
 No Apps capability is advertised until those host integrations are present.
 
 The package includes a standalone public sandbox service. Run it on a separate

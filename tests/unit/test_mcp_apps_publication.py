@@ -10,12 +10,14 @@ import json
 import pytest
 import pytest_asyncio
 
-from kestrel_sdk.resources import ResourceConflict
+from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 from kestrel_sovereign.agent.parts import part_collector
 from kestrel_sovereign.auth import CallerContext, caller_context_scope, current_caller_context
 from kestrel_sovereign.features.security.permissions import PermissionLevel
 
 from kestrel_feature_mcp.apps_publication import AppPublications
+from kestrel_feature_mcp.apps_execution import RegisteredAppTool
+from kestrel_feature_mcp.dynamic_tools import MCPToolWrapper
 from tests.unit.test_mcp_apps_execution import app_boundary as app_boundary, allow
 
 
@@ -83,6 +85,17 @@ async def publish(peer, registry, *, text="once", chat="original-chat"):
     assert set(part["data"]) == {"reference", "session_id"}
     assert part["data"]["session_id"] == chat
     return part["data"]["reference"], result
+
+
+def replace_core_registration(peer, *, reuse_wrappers=False):
+    wrappers = [item.tool if reuse_wrappers else MCPToolWrapper(handle_name=item.binding.name,
+        tool=item.tool.native_tool, caller=item.tool.bound_caller, app_executor=peer.executor)
+        for item in peer.registered]
+    peer.host.unregister_dynamic_tools("mcp:original")
+    registered = []
+    peer.host.register_dynamic_tools("mcp:original", wrappers,
+        on_registered=lambda tool, binding: registered.append(RegisteredAppTool(tool, binding)))
+    return registered
 
 
 @pytest.mark.asyncio
@@ -170,7 +183,8 @@ async def test_owner_replacement_revokes_old_results_and_physical_views(app_boun
     reference, _ = await publish(app_boundary, registry)
     with caller_context_scope(ALICE):
         view = registry.open_view(reference)
-        registry.register("mcp:original", app_boundary.registered, is_current=lambda: True)
+        replacement = replace_core_registration(app_boundary)
+        registry.register("mcp:original", replacement, is_current=lambda: True)
         with pytest.raises(ResourceConflict, match="unavailable"):
             registry.initial_result(reference, view)
         with pytest.raises(ResourceConflict):
@@ -188,6 +202,29 @@ async def test_invalid_replacement_preserves_original_usable_association(app_bou
     with caller_context_scope(ALICE):
         view = registry.open_view(reference)
         assert registry.initial_result(reference, view)[0] == {"text": "once"}
+
+
+@pytest.mark.asyncio
+async def test_staged_result_cannot_be_retargeted_by_rebinding_the_same_wrapper(app_boundary, publications, mcp_http_server):
+    peer = app_boundary
+    registry, _, _ = publications
+    peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
+    call = asyncio.create_task(execute_initial(peer, text="old-registration"))
+    try:
+        await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
+        replacement = replace_core_registration(peer, reuse_wrappers=True)
+        with pytest.raises(ValueError, match="already belonged"):
+            registry.register("mcp:original", replacement, is_current=lambda: True)
+        peer.store.release_dispatch.set()
+        result = await call
+        assert [part["type"] for part in result["parts"]] == ["notice"]
+        assert not registry._publications
+    finally:
+        peer.store.release_dispatch.set()
+        if not call.done():
+            call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+    assert mcp_http_server.witness == ["old-registration"]
 
 
 @pytest.mark.asyncio
@@ -263,6 +300,49 @@ async def test_async_authorization_callbacks_cannot_escape_as_principal_snapshot
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("changes", "error"), [
+    ({"executor": None}, TypeError), ({"agent_id": None}, ValueError),
+    ({"agent_id": " "}, ValueError), ({"clock": None}, TypeError),
+    ({"publication_owner": None}, TypeError), ({"require_reader": None}, TypeError),
+])
+async def test_invalid_publication_owner_configuration_fails_at_construction(app_boundary, changes, error):
+    kwargs = dict(executor=app_boundary.executor, agent_id=app_boundary.host.did,
+        publication_owner=lambda context: None, require_reader=lambda owner, context: None,
+        max_publications=2, max_views=2, max_payload_bytes=8192, retention_seconds=30)
+    with pytest.raises(error):
+        AppPublications(**(kwargs | changes))
+
+
+@pytest.mark.asyncio
+async def test_invalid_registration_callbacks_cannot_admit_or_replace_a_batch(app_boundary, publications):
+    registry, _, _ = publications
+    async def async_current():
+        return True
+
+    original = dict(owner="mcp:original", tools=app_boundary.registered, is_current=lambda: True)
+    for changes, error, match in [
+        ({"owner": ""}, ValueError, "registration owner"),
+        ({"tools": None}, ValueError, "registration owner"),
+        ({"is_current": None}, ValueError, "registration owner"),
+        ({"is_current": async_current}, TypeError, "synchronous"),
+        ({"is_current": lambda: 1}, ResourceConflict, "registration is unavailable"),
+    ]:
+        with pytest.raises(error, match=match):
+            registry.register(**(original | changes))
+    await registry.close()
+    with pytest.raises(ResourceConflict, match="closed"):
+        registry.register(**original)
+
+
+@pytest.mark.asyncio
+async def test_foreign_physical_view_cannot_be_closed_through_a_different_publisher(app_boundary, publications):
+    registry, _, _ = publications
+    with pytest.raises(ResourceConflict, match="another publisher"):
+        await registry.close_view(app_boundary.view)
+    assert not app_boundary.view._closed
+
+
+@pytest.mark.asyncio
 async def test_retirement_joins_real_pending_core_approval_before_connection_cleanup(app_boundary, publications, mcp_http_server):
     peer = app_boundary
     registry, _, _ = publications
@@ -285,6 +365,36 @@ async def test_retirement_joins_real_pending_core_approval_before_connection_cle
     assert not registry._views and mcp_http_server.witness == ["once"]
     rows = await peer.backend.fetch_all("SELECT session_id FROM a2a_tool_dispatches")
     assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_physical_close_and_feature_shutdown_join_the_same_required_audit(app_boundary, publications, mcp_http_server):
+    peer = app_boundary
+    registry, _, _ = publications
+    reference, _ = await publish(peer, registry)
+    peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
+    closers = []
+    with caller_context_scope(ALICE):
+        view = registry.open_view(reference)
+        call = asyncio.create_task(registry.executor.invoke(view, "app_mutate", {"text": "shutdown-once"}))
+        try:
+            await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
+            closers = [asyncio.create_task(registry.close_view(view)), asyncio.create_task(registry.close())]
+            await asyncio.sleep(0)
+            assert view._closed and all(not closer.done() for closer in closers)
+            peer.store.release_dispatch.set()
+            results = await asyncio.gather(*closers, return_exceptions=True)
+            assert results == [None, None]
+            with pytest.raises(ResourceOutcomeUnknown):
+                await call
+        finally:
+            peer.store.release_dispatch.set()
+            if not call.done():
+                call.cancel()
+            await asyncio.gather(call, *closers, return_exceptions=True)
+    assert not registry._views and mcp_http_server.witness == ["once", "shutdown-once"]
+    rows = await peer.backend.fetch_all("SELECT session_id FROM a2a_tool_dispatches")
+    assert [tuple(row) for row in rows] == [("original-chat",), ("original-chat",)]
 
 
 @pytest.mark.asyncio

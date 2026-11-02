@@ -16,6 +16,7 @@ import json
 import math
 import secrets
 import time
+from weakref import WeakSet
 
 from mcp import types
 from kestrel_sdk.resources import ResourceConflict
@@ -89,6 +90,10 @@ class AppPublications:
         self._max_payload_bytes, self._retention_seconds = max_payload_bytes, retention_seconds
         self._clock = clock
         self._batches: dict[str, _Batch] = {}
+        # A deferred factory retains its original wrapper across the SQL await.
+        # Never let a later registration reuse that object to retarget the
+        # staged native result. Weak keys do not retain retired tool catalogs.
+        self._known_tools: WeakSet[MCPToolWrapper] = WeakSet()
         self._publications: dict[str, _Publication] = {}
         # Retain revoked Views until their owned approvals/effects/audit finish.
         self._views: set[AppView] = set()
@@ -112,8 +117,11 @@ class AppPublications:
             return
         batch = _Batch(tuple(tools), is_current)
         batch.require_current()
+        if any(item.tool in self._known_tools for item in tools):
+            raise ValueError("MCP App tool wrapper already belonged to an original registration; build fresh wrappers")
         # Complete validation precedes withdrawing a currently usable batch.
         self.retire(owner)
+        self._known_tools.update(item.tool for item in tools)
         self._batches[owner] = batch
 
     def retire(self, owner: str) -> None:
@@ -204,8 +212,14 @@ class AppPublications:
     async def close_view(self, view: AppView) -> None:
         if view not in self._views:
             raise ResourceConflict("MCP App View belongs to another publisher")
+        await self._close_owned_view(view)
+
+    async def _close_owned_view(self, view: AppView) -> None:
+        # Both an admitted physical close and a teardown snapshot can own this
+        # same join. revoke() cancels once; close() retains its original calls
+        # through audit settlement. Either owner may release the settled entry.
         await view.close()
-        self._views.remove(view)
+        self._views.discard(view)
         for publication in self._publications.values():
             publication.views.discard(view)
 
@@ -214,7 +228,7 @@ class AppPublications:
         async with AsyncExitStack() as cleanup:
             for view in tuple(self._views):
                 if view._closed:
-                    cleanup.push_async_callback(self.close_view, view)
+                    cleanup.push_async_callback(self._close_owned_view, view)
 
     async def close(self) -> None:
         self._closed = True
