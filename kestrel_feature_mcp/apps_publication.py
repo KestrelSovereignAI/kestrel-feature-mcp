@@ -16,6 +16,7 @@ import json
 import math
 import secrets
 import time
+from typing import TYPE_CHECKING
 from weakref import WeakSet
 
 from mcp import types
@@ -26,7 +27,8 @@ from .apps_execution import (
     AppExecutor, AppView, MCPAppResultWithheld, RegisteredAppTool,
     call_synchronous_callback, require_synchronous_callback,
 )
-from .dynamic_tools import MCPToolWrapper
+if TYPE_CHECKING:
+    from .dynamic_tools import MCPToolWrapper
 
 
 @dataclass(eq=False)
@@ -36,9 +38,11 @@ class _Batch:
     active: bool = True
 
     def is_live(self) -> bool:
-        return (self.active and call_synchronous_callback(self.is_current, label="registration authority") is True
-                and all(tool.binding.is_current for tool in self.tools)
-                and self.tools[0].tool.bound_caller.is_current)
+        if not self.active:
+            return False
+        owner_current = call_synchronous_callback(self.is_current, label="registration authority")
+        return (owner_current is True and all(tool.binding.is_current for tool in self.tools)
+                and self.tools[0].tool.bound_caller.is_current and self.active)
 
     def require_current(self) -> None:
         if not self.is_live():
@@ -103,6 +107,7 @@ class AppPublications:
         self._publications: dict[str, _Publication] = {}
         # Retain revoked Views until their owned approvals/effects/audit finish.
         self._views: dict[AppView, object] = {}
+        self._known_views: WeakSet[AppView] = WeakSet()
         self._closed = False
         self._now()
         # One constructor owns both sides of initial publication; a callback
@@ -156,10 +161,26 @@ class AppPublications:
             view.revoke()
 
     def _prune(self) -> None:
+        """Expiry is global; a source's predicate governs only its own records."""
         now = self._now()
         for reference, publication in tuple(self._publications.items()):
-            if now >= publication.expires_at or not publication.batch.is_live():
+            if now >= publication.expires_at:
                 self._discard(reference, publication)
+
+    def _prune_source(self, batch: _Batch) -> bool:
+        live = False
+        try:
+            live = batch.is_live()
+            return live
+        finally:
+            if not live:
+                # A failed predicate supplies no authority. Fence only this
+                # original batch, then propagate the SAME failure to its owner.
+                # No alternate source, grant or successful outcome is invented.
+                batch.active = False
+                for reference, publication in tuple(self._publications.items()):
+                    if publication.batch is batch:
+                        self._discard(reference, publication)
 
     def publish(self, tool: MCPToolWrapper, context: ToolPublicationContext,
                 native: types.CallToolResult, arguments: dict) -> list[dict]:
@@ -171,7 +192,8 @@ class AppPublications:
         if len(candidates) != 1:
             raise MCPAppResultWithheld("MCP App lost its unique original registration; do not replay")
         batch, source = candidates[0]
-        batch.require_current()
+        if not self._prune_source(batch):
+            raise MCPAppResultWithheld("MCP App original registration expired; do not replay")
         owner = call_synchronous_callback(self._publication_owner, context, label="publication owner")
         if owner is None:
             return []
@@ -197,7 +219,8 @@ class AppPublications:
         if self._closed or publication is None:
             raise ResourceConflict("MCP App result is unavailable; do not replay the completed tool")
         try:
-            publication.batch.require_current()
+            if not self._prune_source(publication.batch):
+                raise ResourceConflict("MCP App original registration expired")
             if call_synchronous_callback(self._require_reader, publication.owner, publication.context,
                     label="reader authorization") is not None:
                 raise TypeError("MCP App reader authorization must return None or raise")
@@ -223,6 +246,7 @@ class AppPublications:
             session_id=publication.context.session_id, owner_is_current=current)
         publication.views.add(view)
         self._views[view] = publication.owner
+        self._known_views.add(view)
         return view
 
     def initial_result(self, reference: str, view: AppView) -> tuple[dict, types.CallToolResult]:
@@ -234,9 +258,10 @@ class AppPublications:
         return deepcopy(publication.arguments), publication.native.model_copy(deep=True)
 
     async def close_view(self, view: AppView) -> None:
-        if view not in self._views:
+        if view not in self._known_views:
             raise ResourceConflict("MCP App View belongs to another publisher")
-        await self._close_owned_view(view)
+        if view in self._views:
+            await self._close_owned_view(view)
 
     async def _close_owned_view(self, view: AppView) -> None:
         # Both an admitted physical close and a teardown snapshot can own this
@@ -249,7 +274,16 @@ class AppPublications:
 
     async def drain_retired(self) -> None:
         """Join revoked Views before retiring their connection or feature owner."""
-        self._prune()
+        # Every source is attempted, and revoked work is joined LAST, even if a
+        # source's trusted generation checker fails. AsyncExitStack preserves
+        # the failure instead of silently treating the drain as successful.
+        async with AsyncExitStack() as cleanup:
+            cleanup.push_async_callback(self._join_retired_views)
+            cleanup.callback(self._prune)
+            for batch in tuple(self._batches.values()):
+                cleanup.callback(self._prune_source, batch)
+
+    async def _join_retired_views(self) -> None:
         async with AsyncExitStack() as cleanup:
             for view in tuple(self._views):
                 if view._closed:

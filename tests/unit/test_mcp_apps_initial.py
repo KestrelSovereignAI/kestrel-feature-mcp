@@ -134,7 +134,9 @@ async def test_closed_connection_cannot_publish_a_staged_initial_result(app_boun
                 call.cancel()
             await asyncio.gather(call, return_exceptions=True)
     assert not initial_publisher.publications and mcp_http_server.witness == ["once"]
-    assert not any(part["type"] == "mcp_app" for part in result.get("parts", []))
+    assert result["status"] == "ok"
+    assert [part["type"] for part in result["parts"]] == ["notice"]
+    assert "Do not run it again" in result["parts"][0]["data"]["body"]
 
 
 @pytest.mark.asyncio

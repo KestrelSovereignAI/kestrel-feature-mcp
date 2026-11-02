@@ -303,16 +303,18 @@ new required scenarios as the remaining host capabilities land.
 
 ## MCP Apps components (0.10.0)
 
-The MCP Apps host is under development in #3679. Version 0.8.0 ships the native
+The MCP Apps host is under development in #3679. Version 0.8.0 introduced the native
 tool contracts, bounded resources, governed App execution and standalone sandbox
-service described below. Version 0.9.0 adds completed post-tool policy as a
+service described below. Version 0.9.0 added completed post-tool policy as a
 mandatory boundary for private native delivery. These components do not yet
-advertise Apps support. The current source also stages the initial native result
+advertise Apps support. Version 0.10.0 also stages the initial native result
 through Core's completed policy and required SQL audit, then retains bounded
 private result associations for their original registration. Authenticated view
 routes and the chat renderer still need to be composed and accepted together.
-Use Core 0.55.2 or newer for governed registration and completed post-tool policy
-support. An unsupported host is refused before connecting or saving enablement.
+Base MCP connections and governed tools require Core 0.55.2 or newer. Initial
+publication and result associations require Core 0.59.0 or newer, as detailed
+below; the test profile uses that floor for the complete suite. An unsupported
+host is refused before connecting or saving enablement.
 When a server rejects a call with `HeaderMismatch`, Kestrel retires the original
 catalog. Reload the connection to discover and admit the new contract before
 calling again. The [transport specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#client-behavior)
@@ -354,8 +356,10 @@ principal snapshot, or `None` when there is no authorized interactive publisher.
 `require_reader(owner, context)` must independently authenticate the current
 reader, check that original principal and exact agent/chat, then return `None` or
 raise. Expected denials may use `ResourceError` or `PermissionError`; locator
-failures have one non-disclosing error. A failed View authority check withdraws
-the View, preserving its original cause and no-replay outcome after admission.
+failures have one non-disclosing error. A failed View authority check refuses
+that operation, preserving its original cause and no-replay outcome after admission.
+An unauthorized reader does not revoke the legitimate owner's View or sibling
+calls. Source withdrawal, expiry and explicit close own permanent revocation.
 Cancellation and process control retain their existing semantics. Callbacks must
 be ordinary synchronous functions or bound methods; returned awaitables and
 generators are refused. The monotonic clock also permits synchronous builtins.
@@ -371,6 +375,9 @@ revokes associated Views synchronously; the host must then await `drain_retired(
 before closing the original connection, and `close()` before feature teardown.
 `drain_retired()` also expires idle results and stale original connections or
 registrations before joining their Views, reclaiming both result and View capacity.
+Source predicates are checked only for their own records during publication or
+read. A failing predicate fences its original batch; a drain attempts every
+source and joins all revoked work before propagating the original failure.
 Each registration needs fresh tool wrappers, so a result staged before an audit
 await cannot be reassociated with a replacement registration of the same object.
 No Apps capability is advertised until those host integrations are present.

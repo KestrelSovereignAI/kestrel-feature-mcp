@@ -452,6 +452,43 @@ async def test_physical_close_and_feature_shutdown_join_the_same_required_audit(
 
 
 @pytest.mark.asyncio
+async def test_second_close_of_the_same_original_view_is_idempotent(app_boundary, publications):
+    registry, _, _ = publications
+    reference, _ = await publish(app_boundary, registry)
+    with caller_context_scope(ALICE):
+        view = registry.open_view(reference)
+    await registry.close_view(view)
+    await registry.close_view(view)
+    assert view._closed and view not in registry._views
+
+
+@pytest.mark.asyncio
+async def test_source_retirement_drains_a_real_inflight_native_http_call(app_boundary, publications, mcp_http_server):
+    peer = app_boundary
+    registry, _, _ = publications
+    reference, _ = await publish(peer, registry)
+    mcp_http_server.settings["app_tool_delay"] = 0.2
+    with caller_context_scope(ALICE):
+        view = registry.open_view(reference)
+        call = asyncio.create_task(peer.executor.invoke(view, "app_mutate", {"text": "native-inflight"}))
+        try:
+            async with asyncio.timeout(5):
+                while "native-inflight" not in mcp_http_server.witness:
+                    await asyncio.sleep(0.01)
+            peer.owner_current[0] = False
+            await registry.drain_retired()
+            with pytest.raises(ResourceOutcomeUnknown, match="replay|retry"):
+                await call
+        finally:
+            if not call.done():
+                call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+    assert not registry._views and mcp_http_server.witness == ["once", "native-inflight"]
+    rows = await peer.backend.fetch_all("SELECT session_id FROM a2a_tool_dispatches")
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [PermissionError, TypeError, RuntimeError, ExecutionAuthorityError])
 async def test_reader_failure_after_native_effect_preserves_no_replay_outcome(app_boundary, publications, mcp_http_server, error_type):
     peer = app_boundary
@@ -668,6 +705,107 @@ async def test_unbound_initial_caller_is_refused_before_real_native_io(app_bound
     assert not mcp_http_server.witness
     rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
     assert not rows
+
+
+@pytest.mark.asyncio
+async def test_non_view_initial_tool_stale_after_construction_is_definite_failure(app_boundary, publications, mcp_http_server):
+    peer = app_boundary
+    tool = await allow(peer, "app_mutate")
+    await peer.connection.close()
+    with caller_context_scope(ALICE), part_collector(host=peer.host, session_id="original-chat"):
+        result = await tool.binding.invoke({"text": "never-sent"}, session_id="original-chat", source="chat")
+    assert result["status"] == "error" and "rediscover" in result["error"]
+    assert not mcp_http_server.witness
+    rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+    assert [tuple(row) for row in rows] == [("error",)]
+
+
+@pytest.mark.asyncio
+async def test_refused_reader_does_not_cancel_the_original_owners_pending_call(app_boundary, publications, mcp_http_server):
+    peer = app_boundary
+    registry, _, _ = publications
+    reference, _ = await publish(peer, registry)
+    peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
+    with caller_context_scope(ALICE):
+        view = registry.open_view(reference)
+        call = asyncio.create_task(peer.executor.invoke(view, "app_mutate", {"text": "authorized-owner"}))
+        try:
+            await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
+            with caller_context_scope(BOB), pytest.raises(ResourceConflict):
+                view.list_tools()
+            assert not view._closed and not call.done()
+            assert registry.initial_result(reference, view)[0] == {"text": "once"}
+            peer.store.release_dispatch.set()
+            assert (await call).structured_content == {"text": "authorized-owner"}
+        finally:
+            peer.store.release_dispatch.set()
+            if not call.done():
+                call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+    assert mcp_http_server.witness == ["once", "authorized-owner"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault_kind", ["raises", "awaitable"])
+async def test_faulty_source_is_isolated_and_drain_joins_its_required_audit(app_boundary, publications, mcp_http_server, fault_kind):
+    peer = app_boundary
+    registry, _, reader_chat = publications
+    good_ref, _ = await publish(peer, registry, text="good-source")
+    with caller_context_scope(ALICE):
+        good_view = registry.open_view(good_ref)
+    fault = [False]
+    async def deferred_current():
+        return True
+
+    def source_current():
+        if fault[0]:
+            if fault_kind == "raises":
+                raise ValueError("original-source-predicate-fault")
+            return deferred_current()
+        return True
+
+    wrappers = [MCPToolWrapper(handle_name="isolated__" + item.tool.native_tool.name,
+        tool=item.tool.native_tool, caller=item.tool.bound_caller, app_executor=peer.executor)
+        for item in peer.registered]
+    isolated = []
+    peer.host.register_dynamic_tools("mcp:isolated", wrappers,
+        on_registered=lambda tool, binding: isolated.append(RegisteredAppTool(tool, binding)))
+    registry.register("mcp:isolated", isolated, is_current=source_current)
+    tool = next(item for item in isolated if item.tool.native_tool.name == "app_mutate")
+    await peer.permissions.set_permission("mcp:isolated", tool.binding.name, PermissionLevel.ALLOW)
+    with caller_context_scope(BOB), part_collector(host=peer.host, session_id="isolated-chat"):
+        result = await tool.binding.invoke({"text": "isolated-source"}, session_id="isolated-chat", source="chat")
+    reference = next(part for part in result["parts"] if part["type"] == "mcp_app")["data"]["reference"]
+    reader_chat[1] = "isolated-chat"
+    peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
+    draining = None
+    with caller_context_scope(BOB):
+        bad_view = registry.open_view(reference)
+        call = asyncio.create_task(peer.executor.invoke(bad_view, "app_mutate", {"text": "effect-before-source-fault"}))
+        try:
+            await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
+            fault[0] = True
+            reader_chat[1] = "original-chat"
+            with caller_context_scope(ALICE):
+                assert registry.initial_result(good_ref, good_view)[0] == {"text": "good-source"}
+            draining = asyncio.create_task(registry.drain_retired())
+            await asyncio.sleep(0)
+            assert bad_view._closed and not good_view._closed and not draining.done()
+            peer.store.release_dispatch.set()
+            with pytest.raises(ValueError if fault_kind == "raises" else TypeError):
+                await draining
+            with pytest.raises(ResourceOutcomeUnknown):
+                await call
+        finally:
+            peer.store.release_dispatch.set()
+            if not call.done():
+                call.cancel()
+            await asyncio.gather(call, *([draining] if draining is not None else []), return_exceptions=True)
+    await publish(peer, registry, text="good-after-fault")
+    assert bad_view not in registry._views and good_view in registry._views
+    assert mcp_http_server.witness == ["good-source", "isolated-source", "effect-before-source-fault", "good-after-fault"]
+    rows = await peer.backend.fetch_all("SELECT session_id FROM a2a_tool_dispatches")
+    assert len(rows) == 4
 
 
 @pytest.mark.asyncio

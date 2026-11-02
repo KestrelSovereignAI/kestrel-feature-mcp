@@ -94,7 +94,7 @@ class AppView:
             raise
         except Exception as error:
             # This is the host's authority-check boundary, not tool execution.
-            # Any failed checker withdraws the View. Retain the exact cause so
+            # A failed checker refuses this operation. Retain the exact cause so
             # Core's control/commit evidence remains discoverable, while the
             # owned-call boundary can classify an already admitted effect as
             # unknown/withheld. Cancellation and process control stay intact.

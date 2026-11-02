@@ -134,12 +134,12 @@ class MCPToolWrapper:
         the ``ToolResult.failed`` *classmethod* (always truthy) and record every
         call as an error. (Caught by the #1979 DB-grounded dogfood.)
         """
-        invocation = self.app_executor.admit(self) if self.app_executor is not None else None
-        if invocation is None and not self.schema.model_visible:
-            return ToolResult.failed(
-                "MCP app-only tool requires a live authorized view",
-            ).to_dict()
         try:
+            invocation = self.app_executor.admit(self) if self.app_executor is not None else None
+            if invocation is None and not self.schema.model_visible:
+                return ToolResult.failed(
+                    "MCP app-only tool requires a live authorized view",
+                ).to_dict()
             result = await self._caller(self._real_name, kwargs)
         except MCPCallOutcomeUnknownError as error:
             logger.error("MCP tool %r has an unconfirmed outcome (%s)", self._real_name,
