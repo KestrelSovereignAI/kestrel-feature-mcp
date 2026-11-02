@@ -67,8 +67,13 @@ class AppBoundary:
         return next(item for item in self.registered if item.tool.native_tool.name == name)
 
 
+@pytest.fixture
+def initial_publisher():
+    return None
+
+
 @pytest_asyncio.fixture
-async def app_boundary(mcp_http_server, tmp_path):
+async def app_boundary(mcp_http_server, tmp_path, initial_publisher, app_executor_factory):
     async with AsyncExitStack() as cleanup:
         backend = SQLiteBackend(str(tmp_path / "apps-audit.db"))
         await backend.connect()
@@ -86,7 +91,8 @@ async def app_boundary(mcp_http_server, tmp_path):
         native = await connection.connect()
         cleanup.push_async_callback(connection.close)
         caller = bind_tool_caller(connection, lambda: True, "native-apps", tool_names=[tool.name for tool in native])
-        executor = AppExecutor(host=host, max_pending_calls=2)
+        executor = app_executor_factory(host=host, max_pending_calls=2,
+            initial_publisher=initial_publisher.publish if initial_publisher is not None else None)
         wrappers = [MCPToolWrapper(handle_name="app__" + tool.name, tool=tool,
                     caller=caller, app_executor=executor) for tool in native]
         registered = []
@@ -645,11 +651,16 @@ async def test_invalid_view_configuration_is_refused_before_native_io(app_bounda
             AppExecutor(host=host, max_pending_calls=2)
     original = dict(source=peer.view.source, registered=peer.registered,
         session_id="mcp-app:configured", owner_is_current=lambda: True)
+    async def async_owner():
+        return True
+
     for changes, error, message in [
         ({"session_id": " "}, ValueError, "session_id"),
         ({"registered": []}, ValueError, "retained"),
         ({"registered": [*peer.registered, peer.registered[0]]}, ValueError, "Duplicate"),
         ({"owner_is_current": None}, TypeError, "owner predicate"),
+        ({"owner_is_current": async_owner}, TypeError, "synchronous"),
+        ({"owner_is_current": lambda: 1}, ResourceConflict, "expired"),
         ({"source": peer.tool("echo")}, ValueError, "associated"),
     ]:
         with pytest.raises(error, match=message):
@@ -659,3 +670,23 @@ async def test_invalid_view_configuration_is_refused_before_native_io(app_bounda
     assert not mcp_http_server.witness
     assert peer.approval_requests.empty()
     assert mcp_http_server.settings.get("resource_reads", []) == []
+
+
+@pytest.mark.asyncio
+async def test_reentrant_owner_revocation_refuses_the_original_view(app_boundary, mcp_http_server):
+    peer = app_boundary
+    holder = []
+    def current_owner():
+        if holder:
+            holder[0].revoke()
+        return True
+
+    view = peer.executor.open_view(peer.view.source, peer.registered,
+        session_id="mcp-app:reentrant-owner", owner_is_current=current_owner)
+    holder.append(view)
+    try:
+        with pytest.raises(ResourceConflict, match="expired"):
+            view.require_current()
+        assert view._closed and not mcp_http_server.witness
+    finally:
+        await view.close()

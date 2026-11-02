@@ -2,12 +2,49 @@
 
 from copy import deepcopy
 import json
+from types import SimpleNamespace
+from functools import partial
 
 import pytest
 from mcp import types
 
 from kestrel_feature_mcp.dynamic_tools import build_wrappers
 from kestrel_feature_mcp.connection import MCPConnection, describe_tools
+from kestrel_feature_mcp.apps_execution import AppExecutor
+
+
+@pytest.mark.parametrize("capability", ["supports_audited_deferred_tool_results", "supports_tool_publication_context"])
+@pytest.mark.parametrize("flag", [False, 1, None])
+def test_initial_publication_requires_both_exact_host_promises(capability, flag):
+    values = dict(supports_deferred_tool_results=True, supports_audited_deferred_tool_results=True,
+                  supports_tool_publication_context=True)
+    values[capability] = flag
+    with pytest.raises(ValueError, match="audited host-selected chat context"):
+        AppExecutor(host=SimpleNamespace(**values), max_pending_calls=2, initial_publisher=lambda *args: [])
+
+
+@pytest.mark.parametrize("kind", ["async-function", "async-method", "async-generator", "partial", "callable-object"])
+def test_initial_publisher_is_an_explicit_synchronous_function_or_method(kind):
+    async def asynchronous(*args):
+        return []
+
+    async def generator(*args):
+        yield {}
+
+    class Publisher:
+        async def publish(self, *args):
+            return []
+
+        def __call__(self, *args):
+            return []
+
+    publisher = {"async-function": asynchronous, "async-method": Publisher().publish,
+        "async-generator": generator, "partial": partial(lambda *args: [], "bound"),
+        "callable-object": Publisher()}[kind]
+    host = SimpleNamespace(supports_deferred_tool_results=True,
+        supports_audited_deferred_tool_results=True, supports_tool_publication_context=True)
+    with pytest.raises(TypeError, match="synchronous function or method"):
+        AppExecutor(host=host, max_pending_calls=2, initial_publisher=publisher)
 
 
 def _metadata_caller():

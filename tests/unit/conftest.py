@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 import pytest_asyncio
+import pytest
 import uvicorn
 from mcp import types
 from mcp_types.version import LATEST_PROTOCOL_VERSION
@@ -16,6 +17,12 @@ from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.shared.exceptions import MCPError
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from tests.http_peers import serve_http
+
+
+@pytest.fixture
+def app_executor_factory():
+    from kestrel_feature_mcp.apps_execution import AppExecutor
+    return AppExecutor
 
 
 @dataclass
@@ -90,7 +97,9 @@ async def mcp_http_server(request, tmp_path):
             return {"status": "ready"}
 
         if settings.get("apps_execution_tools"):
-            @apps.tool(resource_uri="ui://status/view.html", visibility=["app"], description="Record one View action")
+            @apps.tool(resource_uri="ui://status/view.html",
+                       visibility=settings.get("app_mutate_visibility", ["app"]),
+                       description="Record one View action")
             async def app_mutate(text: str) -> types.CallToolResult:
                 witness.append(text)
                 await asyncio.sleep(settings.get("app_tool_delay", 0))

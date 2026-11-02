@@ -108,6 +108,8 @@ class MCPToolWrapper:
         self._caller = caller
         self.app_executor = app_executor
         self.schema = _MCPToolSchema(handle_name, self._native_tool)
+        if app_executor is not None:
+            app_executor.require_initial_tool(self)
 
     @property
     def bound_caller(self) -> MCPCaller:
@@ -132,12 +134,12 @@ class MCPToolWrapper:
         the ``ToolResult.failed`` *classmethod* (always truthy) and record every
         call as an error. (Caught by the #1979 DB-grounded dogfood.)
         """
-        invocation = self.app_executor.admit(self) if self.app_executor is not None else None
-        if invocation is None and not self.schema.model_visible:
-            return ToolResult.failed(
-                "MCP app-only tool requires a live authorized view",
-            ).to_dict()
         try:
+            invocation = self.app_executor.admit(self) if self.app_executor is not None else None
+            if invocation is None and not self.schema.model_visible:
+                return ToolResult.failed(
+                    "MCP app-only tool requires a live authorized view",
+                ).to_dict()
             result = await self._caller(self._real_name, kwargs)
         except MCPCallOutcomeUnknownError as error:
             logger.error("MCP tool %r has an unconfirmed outcome (%s)", self._real_name,
@@ -171,6 +173,8 @@ class MCPToolWrapper:
             projected = ToolResult.ok(text or "MCP tool completed", data=data).to_dict()
         if invocation is not None:
             return self.app_executor.capture(invocation, result, projected)
+        if self.app_executor is not None:
+            return self.app_executor.capture_initial(self, result, projected, kwargs)
         return projected
 
 
