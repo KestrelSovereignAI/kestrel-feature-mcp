@@ -143,6 +143,24 @@ async def test_chat_locator_cannot_authenticate_reader(app_boundary, publication
 
 
 @pytest.mark.asyncio
+async def test_unauthorized_locator_holder_cannot_probe_a_faulty_source_predicate(app_boundary, publications):
+    registry, _, _ = publications
+    reference, _ = await publish(app_boundary, registry)
+    checks = []
+    def faulty_source():
+        checks.append(True)
+        raise ValueError("private-source-diagnostic")
+
+    registry._batches["mcp:original"].is_current = faulty_source
+    with caller_context_scope(BOB), pytest.raises(ResourceConflict, match="result is unavailable"):
+        registry.open_view(reference)
+    assert not checks
+    with caller_context_scope(ALICE), pytest.raises(ValueError, match="private-source-diagnostic"):
+        registry.open_view(reference)
+    assert checks == [True]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("wrong_field", [0, 1])
 async def test_same_principal_still_requires_original_agent_and_chat(app_boundary, publications, wrong_field):
     registry, _, chat = publications
@@ -777,6 +795,9 @@ async def test_faulty_source_is_isolated_and_drain_joins_its_required_audit(app_
         result = await tool.binding.invoke({"text": "isolated-source"}, session_id="isolated-chat", source="chat")
     reference = next(part for part in result["parts"] if part["type"] == "mcp_app")["data"]["reference"]
     reader_chat[1] = "isolated-chat"
+    fault[0] = True
+    await publish(peer, registry, text="good-before-drain")
+    fault[0] = False
     peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
     draining = None
     with caller_context_scope(BOB):
@@ -801,9 +822,10 @@ async def test_faulty_source_is_isolated_and_drain_joins_its_required_audit(app_
             if not call.done():
                 call.cancel()
             await asyncio.gather(call, *([draining] if draining is not None else []), return_exceptions=True)
-    await publish(peer, registry, text="good-after-fault")
+    with caller_context_scope(ALICE):
+        assert registry.initial_result(good_ref, good_view)[0] == {"text": "good-source"}
     assert bad_view not in registry._views and good_view in registry._views
-    assert mcp_http_server.witness == ["good-source", "isolated-source", "effect-before-source-fault", "good-after-fault"]
+    assert mcp_http_server.witness == ["good-source", "isolated-source", "good-before-drain", "effect-before-source-fault"]
     rows = await peer.backend.fetch_all("SELECT session_id FROM a2a_tool_dispatches")
     assert len(rows) == 4
 

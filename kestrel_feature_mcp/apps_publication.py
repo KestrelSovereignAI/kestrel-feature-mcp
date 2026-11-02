@@ -219,11 +219,11 @@ class AppPublications:
         if self._closed or publication is None:
             raise ResourceConflict("MCP App result is unavailable; do not replay the completed tool")
         try:
-            if not self._prune_source(publication.batch):
-                raise ResourceConflict("MCP App original registration expired")
             if call_synchronous_callback(self._require_reader, publication.owner, publication.context,
                     label="reader authorization") is not None:
                 raise TypeError("MCP App reader authorization must return None or raise")
+            if not self._prune_source(publication.batch):
+                raise ResourceConflict("MCP App original registration expired")
         except (ResourceError, PermissionError) as error:
             # Keep the original diagnostic in-process. A locator cannot disclose
             # whether another principal's record exists or its source expired.

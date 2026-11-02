@@ -377,7 +377,11 @@ before closing the original connection, and `close()` before feature teardown.
 registrations before joining their Views, reclaiming both result and View capacity.
 Source predicates are checked only for their own records during publication or
 read. A failing predicate fences its original batch; a drain attempts every
-source and joins all revoked work before propagating the original failure.
+source and joins all revoked work before raising a failure. If checks and joins
+both fail, earlier failures remain in the exception chain.
+On unplanned connection loss, retire the owner and drain promptly so stale
+results and Views do not keep holding capacity. Retire or replace a fenced
+owner to release its retained wrapper and binding references.
 Each registration needs fresh tool wrappers, so a result staged before an audit
 await cannot be reassociated with a replacement registration of the same object.
 No Apps capability is advertised until those host integrations are present.
