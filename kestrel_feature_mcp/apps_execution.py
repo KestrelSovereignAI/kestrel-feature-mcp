@@ -10,18 +10,25 @@ import asyncio
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
+from inspect import isasyncgenfunction, iscoroutinefunction, isfunction, ismethod
 from types import MappingProxyType
 from typing import Callable, Mapping, TYPE_CHECKING
 
 from mcp import types
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
-from kestrel_sdk.tools import DeferredToolResult, DeferredToolResultHost, GovernedToolBinding
+from kestrel_sdk.tools import (
+    DeferredToolResult, DeferredToolResultHost, GovernedToolBinding, ToolPublicationContext,
+)
 
 from .connection import BoundMCPCaller
 from .apps_resources import AppResource, read_app_resource
 
 if TYPE_CHECKING:
     from .dynamic_tools import MCPToolWrapper
+
+InitialAppPublisher = Callable[
+    ["MCPToolWrapper", ToolPublicationContext, types.CallToolResult, dict], list[dict]
+]
 
 
 class MCPAppResultWithheld(ResourceOutcomeUnknown):
@@ -152,15 +159,55 @@ class AppView:
 class AppExecutor:
     """Per-feature admission context; source strings never confer authority."""
 
-    def __init__(self, *, host: DeferredToolResultHost, max_pending_calls: int):
+    def __init__(self, *, host: DeferredToolResultHost, max_pending_calls: int,
+                 initial_publisher: InitialAppPublisher | None = None):
         if type(max_pending_calls) is not int or max_pending_calls <= 0:
             raise ValueError("MCP Apps pending-call limit must be a positive integer")
         if getattr(host, "supports_deferred_tool_results", False) is not True:
             raise ValueError("MCP Apps require a host that supports deferred tool results")
+        if initial_publisher is not None:
+            if (not (isfunction(initial_publisher) or ismethod(initial_publisher))
+                    or iscoroutinefunction(initial_publisher) or isasyncgenfunction(initial_publisher)):
+                raise TypeError("MCP Apps initial publication requires a synchronous function or method")
+            if (getattr(host, "supports_audited_deferred_tool_results", False) is not True
+                    or getattr(host, "supports_tool_publication_context", False) is not True):
+                raise ValueError("MCP Apps initial publication requires audited host-selected chat context")
+        self._initial_publisher = initial_publisher
         self._max_pending_calls = max_pending_calls
         self._invocation: ContextVar[_Invocation | None] = ContextVar(
             "mcp_app_invocation", default=None,
         )
+
+    def capture_initial(self, tool: MCPToolWrapper, native: types.CallToolResult,
+                        projection: dict, arguments: dict) -> dict:
+        """Keep native UI data private until the actual chat's audited callback.
+
+        The controller resolves the original registration and authenticates
+        readers independently. This callback supplies destination metadata,
+        never an HTTP capability or evidence that rendering completed.
+        """
+        publisher = self._initial_publisher
+        if publisher is None or tool.resource_uri is None:
+            return projection
+        if tool.app_executor is not self or not isinstance(tool.bound_caller, BoundMCPCaller):
+            raise MCPAppResultWithheld("MCP App result lost its original connection; do not replay")
+        if not isinstance(native, types.CallToolResult) or native.result_type != "complete":
+            raise MCPAppResultWithheld("MCP App has no complete native result; do not replay")
+        captured = native.model_copy(deep=True)
+        arguments = deepcopy(arguments)
+
+        def publish():
+            context = deferred.publication_context
+            if context is None:
+                return []
+            try:
+                tool.bound_caller.require_current()
+            except ValueError as error:
+                raise MCPAppResultWithheld("MCP App connection expired before publication; do not replay") from error
+            return publisher(tool, context, captured, arguments)
+
+        deferred = DeferredToolResult(projection, publish=publish)
+        return deferred
 
     def open_view(
         self, source: RegisteredAppTool, registered: list[RegisteredAppTool], *,

@@ -67,8 +67,13 @@ class AppBoundary:
         return next(item for item in self.registered if item.tool.native_tool.name == name)
 
 
+@pytest.fixture
+def initial_publisher():
+    return None
+
+
 @pytest_asyncio.fixture
-async def app_boundary(mcp_http_server, tmp_path):
+async def app_boundary(mcp_http_server, tmp_path, initial_publisher):
     async with AsyncExitStack() as cleanup:
         backend = SQLiteBackend(str(tmp_path / "apps-audit.db"))
         await backend.connect()
@@ -86,7 +91,8 @@ async def app_boundary(mcp_http_server, tmp_path):
         native = await connection.connect()
         cleanup.push_async_callback(connection.close)
         caller = bind_tool_caller(connection, lambda: True, "native-apps", tool_names=[tool.name for tool in native])
-        executor = AppExecutor(host=host, max_pending_calls=2)
+        executor = AppExecutor(host=host, max_pending_calls=2,
+            initial_publisher=initial_publisher.publish if initial_publisher is not None else None)
         wrappers = [MCPToolWrapper(handle_name="app__" + tool.name, tool=tool,
                     caller=caller, app_executor=executor) for tool in native]
         registered = []

@@ -90,7 +90,9 @@ async def mcp_http_server(request, tmp_path):
             return {"status": "ready"}
 
         if settings.get("apps_execution_tools"):
-            @apps.tool(resource_uri="ui://status/view.html", visibility=["app"], description="Record one View action")
+            @apps.tool(resource_uri="ui://status/view.html",
+                       visibility=settings.get("app_mutate_visibility", ["app"]),
+                       description="Record one View action")
             async def app_mutate(text: str) -> types.CallToolResult:
                 witness.append(text)
                 await asyncio.sleep(settings.get("app_tool_delay", 0))

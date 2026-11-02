@@ -171,6 +171,8 @@ class MCPToolWrapper:
             projected = ToolResult.ok(text or "MCP tool completed", data=data).to_dict()
         if invocation is not None:
             return self.app_executor.capture(invocation, result, projected)
+        if self.app_executor is not None:
+            return self.app_executor.capture_initial(self, result, projected, kwargs)
         return projected
 
 

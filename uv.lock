@@ -1594,7 +1594,7 @@ requires-dist = [
     { name = "docker", specifier = ">=7.1.0" },
     { name = "jsonschema", specifier = ">=4.26,<5" },
     { name = "kestrel-sovereign", marker = "extra == 'test'", specifier = ">=0.55.2,<1" },
-    { name = "kestrel-sovereign-sdk", extras = ["httpx2"], specifier = ">=0.44.1,<1" },
+    { name = "kestrel-sovereign-sdk", extras = ["httpx2"], specifier = ">=0.46.0,<1" },
     { name = "mcp", specifier = ">=2.3,<3" },
     { name = "packaging", marker = "extra == 'test'" },
     { name = "pydantic", specifier = ">=2.12,<3" },
@@ -1789,15 +1789,15 @@ wheels = [
 
 [[package]]
 name = "kestrel-sovereign-sdk"
-version = "0.44.1"
+version = "0.46.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4f/04/7b07be66e0070eb639685f7399dcbc2bb4f8714268fa6ae17eef95dfad94/kestrel_sovereign_sdk-0.44.1.tar.gz", hash = "sha256:08cda3be82f98fcdfab9f98c5eaab9664b056d8a2da3536a5da97f7b7c0685d0", size = 547686, upload-time = "2026-10-26T22:02:44.719Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0c/fd/7d5e752835918be43188da1e511fc0968d15de9f1c1cc2e5a095440f2113/kestrel_sovereign_sdk-0.46.0.tar.gz", hash = "sha256:9e48d4f787e9632e431e0cc490e91c40fd7929bffc43e411f67a89547ec677c9", size = 554192, upload-time = "2026-11-02T19:20:51Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a4/5a/5d1bdef6c311d52f07440d107d39c6483a307082c0a481f54659e4466e98/kestrel_sovereign_sdk-0.44.1-py3-none-any.whl", hash = "sha256:8329a7d39fe6e83a803cb83f6aa3f09ceb1dc68ef05b627cdd4e5e8bfc155551", size = 655527, upload-time = "2026-10-26T22:02:46.333Z" },
+    { url = "https://files.pythonhosted.org/packages/27/6c/0b47b41b971a3c45af4c3c519d4719d66ed4ce1c875250651cfe88d9d797/kestrel_sovereign_sdk-0.46.0-py3-none-any.whl", hash = "sha256:2c8f411dcad09810aa92ecce248c02d780cda1153bf24a8dbcc2e6755b4f21a9", size = 662186, upload-time = "2026-11-02T19:20:49.379Z" },
 ]
 
 [package.optional-dependencies]
