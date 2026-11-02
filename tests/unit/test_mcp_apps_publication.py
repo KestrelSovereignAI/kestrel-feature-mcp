@@ -764,7 +764,7 @@ async def test_refused_reader_does_not_cancel_the_original_owners_pending_call(a
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault_kind", ["raises", "awaitable"])
+@pytest.mark.parametrize("fault_kind", ["raises", "awaitable", "control-and-join-cancellation"])
 async def test_faulty_source_is_isolated_and_drain_joins_its_required_audit(app_boundary, publications, mcp_http_server, fault_kind):
     peer = app_boundary
     registry, _, reader_chat = publications
@@ -772,6 +772,7 @@ async def test_faulty_source_is_isolated_and_drain_joins_its_required_audit(app_
     with caller_context_scope(ALICE):
         good_view = registry.open_view(good_ref)
     fault = [False]
+    control = ExecutionAuthorityError("original-source-control")
     async def deferred_current():
         return True
 
@@ -779,6 +780,8 @@ async def test_faulty_source_is_isolated_and_drain_joins_its_required_audit(app_
         if fault[0]:
             if fault_kind == "raises":
                 raise ValueError("original-source-predicate-fault")
+            if fault_kind == "control-and-join-cancellation":
+                raise control
             return deferred_current()
         return True
 
@@ -812,9 +815,28 @@ async def test_faulty_source_is_isolated_and_drain_joins_its_required_audit(app_
             draining = asyncio.create_task(registry.drain_retired())
             await asyncio.sleep(0)
             assert bad_view._closed and not good_view._closed and not draining.done()
+            if fault_kind == "control-and-join-cancellation":
+                draining.cancel()
             peer.store.release_dispatch.set()
-            with pytest.raises(ValueError if fault_kind == "raises" else TypeError):
-                await draining
+            if fault_kind == "control-and-join-cancellation":
+                with pytest.raises(BaseExceptionGroup) as caught:
+                    await draining
+                assert is_execution_control_error(caught.value)
+                def explicit_errors(error):
+                    yield error
+                    if isinstance(error, BaseExceptionGroup):
+                        for child in error.exceptions:
+                            yield from explicit_errors(child)
+                    if error.__cause__ is not None:
+                        yield from explicit_errors(error.__cause__)
+                assert any(error is control for error in explicit_errors(caught.value))
+                assert any(isinstance(error, asyncio.CancelledError) for error in explicit_errors(caught.value))
+                # A failed join retains custody; a subsequent close releases
+                # only the already-settled View, without replaying its effect.
+                await registry.close_view(bad_view)
+            else:
+                with pytest.raises(ValueError if fault_kind == "raises" else TypeError):
+                    await draining
             with pytest.raises(ResourceOutcomeUnknown):
                 await call
         finally:

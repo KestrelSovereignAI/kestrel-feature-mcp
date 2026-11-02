@@ -378,7 +378,8 @@ registrations before joining their Views, reclaiming both result and View capaci
 Source predicates are checked only for their own records during publication or
 read. A failing predicate fences its original batch; a drain attempts every
 source and joins all revoked work before raising a failure. If checks and joins
-both fail, earlier failures remain in the exception chain.
+both fail, an explicit exception group preserves every original failure,
+including control errors and cancellation; the drain never reports success.
 On unplanned connection loss, retire the owner and drain promptly so stale
 results and Views do not keep holding capacity. Retire or replace a fenced
 owner to release its retained wrapper and binding references.

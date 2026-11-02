@@ -670,3 +670,23 @@ async def test_invalid_view_configuration_is_refused_before_native_io(app_bounda
     assert not mcp_http_server.witness
     assert peer.approval_requests.empty()
     assert mcp_http_server.settings.get("resource_reads", []) == []
+
+
+@pytest.mark.asyncio
+async def test_reentrant_owner_revocation_refuses_the_original_view(app_boundary, mcp_http_server):
+    peer = app_boundary
+    holder = []
+    def current_owner():
+        if holder:
+            holder[0].revoke()
+        return True
+
+    view = peer.executor.open_view(peer.view.source, peer.registered,
+        session_id="mcp-app:reentrant-owner", owner_is_current=current_owner)
+    holder.append(view)
+    try:
+        with pytest.raises(ResourceConflict, match="expired"):
+            view.require_current()
+        assert view._closed and not mcp_http_server.witness
+    finally:
+        await view.close()
