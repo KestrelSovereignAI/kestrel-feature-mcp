@@ -77,7 +77,9 @@ async def execute_initial(peer, *, text="once", chat="original-chat"):
 
 async def publish(peer, registry, *, text="once", chat="original-chat"):
     result = await execute_initial(peer, text=text, chat=chat)
-    part = next(part for part in result["parts"] if part["type"] == "mcp_app")
+    parts = [part for part in result["parts"] if part["type"] == "mcp_app"]
+    assert len(parts) == 1
+    part = parts[0]
     assert set(part["data"]) == {"reference", "session_id"}
     assert part["data"]["session_id"] == chat
     return part["data"]["reference"], result
@@ -272,6 +274,7 @@ async def test_retirement_joins_real_pending_core_approval_before_connection_cle
         try:
             await asyncio.wait_for(peer.approval_requests.get(), 5)
             registry.retire("mcp:original")
+            assert view._closed, "Withdrawal must revoke before asynchronous cleanup"
             await registry.drain_retired()
             with pytest.raises(ResourceConflict):
                 await call
