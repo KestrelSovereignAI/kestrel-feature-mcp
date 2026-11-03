@@ -1,0 +1,13 @@
+**
+!docker/
+docker/*
+!docker/Dockerfile.apps-sandbox
+!kestrel_feature_mcp/
+kestrel_feature_mcp/*
+!kestrel_feature_mcp/apps_sandbox/
+kestrel_feature_mcp/apps_sandbox/*
+!kestrel_feature_mcp/apps_sandbox/sandbox-entry.js
+!kestrel_feature_mcp/apps_sandbox/sandbox-service.mjs
+!kestrel_feature_mcp/apps_sandbox/parent-entry.js
+!kestrel_feature_mcp/apps_sandbox/THIRD_PARTY_NOTICES.txt
+!kestrel_feature_mcp/apps_sandbox/manifest.json

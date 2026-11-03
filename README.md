@@ -478,6 +478,21 @@ Only exact configured origins can be granted. HTTP limits are configurable
 through the deployment's `httpLimits` object: `maxHeaderBytes`,
 `requestTimeoutMs`, `headersTimeoutMs` and `keepAliveTimeoutMs`.
 
+For a standalone container, build from the repository root:
+
+```bash
+docker build -f docker/Dockerfile.apps-sandbox -t kestrel-mcp-apps-sandbox .
+docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  --mount type=bind,source=/absolute/path/to/sandbox.json,target=/etc/kestrel-mcp-apps/sandbox.json,readonly \
+  --publish 127.0.0.1:8090:8090 kestrel-mcp-apps-sandbox
+```
+
+Use the listener port from your explicit JSON configuration. The image follows
+maintained Node LTS, runs as a non-root user and contains only the five verified
+sandbox assets. Its build context excludes source, Git metadata and host
+configuration. Mount no host identity files or credentials, and expose the
+service through a separate HTTPS origin. Startup refuses corrupted assets.
+
 The source of the bundled assets is `web/`, its npm lock and the unchanged
 official SDK packages. Regenerate the checked-in bundles and original license
 notices together.

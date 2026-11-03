@@ -153,6 +153,10 @@ jobs:
       - name: Verify the installed public sandbox and credential boundary
         run: |
           "$RUNNER_TEMP/mcp-apps-install/bin/python" -I tests/packaging/sandbox_installed.py --node "$(command -v node)"
+      - name: Verify the standalone sandbox image and filtered build context
+        run: |
+          "$RUNNER_TEMP/mcp-apps-install/bin/python" -I tests/packaging/sandbox_container.py
+        timeout-minutes: 5
       - name: Verify native Apps through the Core chat and governed HTTP host
         run: |
           uv sync --locked --extra test --python 3.14
