@@ -24,6 +24,8 @@ from .connection import MCPConnection, MCP_CONNECTION_ERRORS, bind_tool_caller, 
 from .constants import SESSION_CONNECT_TIMEOUT_DEFAULT
 from .remote import RemoteMCPServer, RemoteMCPError, connection_error_message, remote_name_for_url, remote_owner
 from .dynamic_tools import build_wrappers
+from .apps_execution import RegisteredAppTool
+from .apps_host import MCPAppsFeatureMixin
 from .images import normalize_image_ref
 from .registry import (
     get_registry,
@@ -142,7 +144,7 @@ def _official_record_blocks(records: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-class MCPAgent(Feature):
+class MCPAgent(MCPAppsFeatureMixin, Feature):
     """
     A Feature Agent that manages Model Context Protocol (MCP) tools.
     It encapsulates the complexity of Docker container management and tool discovery,
@@ -162,6 +164,7 @@ class MCPAgent(Feature):
         self._lifecycle_generation = 0
         self._owner_did: str | None = None
         self._closing = False
+        self._init_apps()
 
     @property
     def tool_description(self) -> str:
@@ -182,6 +185,8 @@ class MCPAgent(Feature):
                     self.manager = None
             self._owner_did = owner_did
             self._closing = False
+            if self._apps_settings.enabled and self._apps_host is None:
+                self._start_apps()
         logger.info("MCPAgent initialized; Docker connects only for container operations.")
 
     def _require_open(self, generation: int | None = None) -> None:
@@ -198,7 +203,8 @@ class MCPAgent(Feature):
                 from .manager import MCPToolManager, DockerDaemonUnavailableError
 
                 try:
-                    self.manager = await MCPToolManager.create(owner_did=self._connection_owner_did())
+                    self.manager = await MCPToolManager.create(owner_did=self._connection_owner_did(),
+                                                              **self._manager_connection_settings())
                 except DockerDaemonUnavailableError as error:
                     logger.warning("Local Docker daemon unavailable; Docker MCP tools are disabled: %s", error)
                     return False
@@ -237,12 +243,26 @@ class MCPAgent(Feature):
         of tools mounted. A host without a dynamic registry is unsupported.
         """
         self._require_governed_host()
-        wrappers = build_wrappers(handle_prefix, tool_dicts, caller)
-        self.agent.unregister_dynamic_tools(owner)
-        return self.agent.register_dynamic_tools(owner, wrappers)
+        publications = self._apps_publications
+        wrappers = build_wrappers(handle_prefix, tool_dicts, caller,
+            app_executor=publications.executor if publications is not None else None)
+        self._unmount_tools(owner)
+        if publications is None:
+            return self.agent.register_dynamic_tools(owner, wrappers)
+        registered = []
+        count = self.agent.register_dynamic_tools(owner, wrappers,
+            on_registered=lambda tool, binding: registered.append(RegisteredAppTool(tool, binding)))
+        generation = self._lifecycle_generation
+        publications.register(owner, registered, is_current=lambda: (
+            self._apps_publications is publications and not self._closing
+            and self._lifecycle_generation == generation
+            and self.agent.features.get(self.name) is self and self.enabled is True))
+        return count
 
     def _unmount_tools(self, owner: str) -> int:
         """Remove all tools mounted under ``owner`` (inverse of _mount_tools)."""
+        if self._apps_publications is not None:
+            self._apps_publications.retire(owner)
         if not self._host_supports_dynamic_tools():
             return 0
         return self.agent.unregister_dynamic_tools(owner)
@@ -502,7 +522,7 @@ class MCPAgent(Feature):
             owner = remote_owner(name)
             self._unmount_tools(owner)
             await self._retire_remote(name)
-            record = RemoteMCPServer(name, endpoint, MCPConnection(endpoint))
+            record = RemoteMCPServer(name, endpoint, self._new_mcp_connection(endpoint))
             self._remote_connections[name] = record
             published = False
             persistent = False
@@ -703,7 +723,7 @@ class MCPAgent(Feature):
             else:
                 await self._retire_gateway()
                 self._require_open()
-                self.gateway_manager = MCPGatewayManager()
+                self.gateway_manager = MCPGatewayManager(**self._manager_connection_settings())
                 before = set()
                 tools = await self.gateway_manager.start([server_name])
 
@@ -1163,7 +1183,7 @@ class MCPAgent(Feature):
             changed = True
             await self._retire_gateway()
             self._require_open()
-            self.gateway_manager = MCPGatewayManager()
+            self.gateway_manager = MCPGatewayManager(**self._manager_connection_settings())
             tools = await self.gateway_manager.start(server_list)
 
             self._require_open()
@@ -1422,8 +1442,11 @@ class MCPAgent(Feature):
         """Attempt every owned cleanup, then propagate any cleanup failure."""
         self._closing = True
         self._lifecycle_generation += 1
+        if self._apps_host is not None:
+            self._apps_host.withdraw_private_data()
         async with self._lifecycle_transition:
             self._closing = True
+            await self._close_apps()
             await self._shutdown_connections()
 
     async def _shutdown_connections(self):

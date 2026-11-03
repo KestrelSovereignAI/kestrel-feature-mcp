@@ -183,6 +183,13 @@ class AppPublications:
             if publication.batch is batch:
                 self._discard(reference, publication)
 
+    async def retire_connection(self, connection) -> None:
+        """Fence and join original batches before their native transport closes."""
+        for owner, batch in tuple(self._batches.items()):
+            if batch.tools[0].tool.bound_caller.connection is connection:
+                self.retire(owner)
+        await self.drain_retired()
+
     def _discard(self, reference: str, publication: _Publication) -> None:
         self._publications.pop(reference, None)
         for view in publication.views:

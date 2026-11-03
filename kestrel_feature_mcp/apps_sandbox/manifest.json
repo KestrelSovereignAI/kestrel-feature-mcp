@@ -5,7 +5,7 @@
     "version": "0.28.2"
   },
   "sources": {
-    "build-assets.mjs": "8b08803fad3400bde0e0a51dae6a6704b687eb34f01b3526fa1c3bd2d22e5dc7",
+    "build-assets.mjs": "7ce93673b0d0922c71e0818a84973c2954dae6291c6aecc0e60158b4f590155d",
     "build-notices.mjs": "c1e124b406cb7bbfaea7246b35d2119735ac7ec13d2caaec6bbf9b30ed2163e6",
     "build.mjs": "59ff7f106ce843f69c28f32839ea22c993629174bde0d49611a1c3b4c2e6884e",
     "licenses/ajv-8.18.0-LICENSE": "a05350a88e318e4f5f2c2a1ff1e2e88daa4dd38e6e78b71cccae422bdc762cc3",
@@ -18,7 +18,9 @@
     "package-lock.json": "f568aaab946582a82476dc3b1fe6bfe7be974007f3a9e51bbd4e47f18c1c480e",
     "package.json": "d37ed1d709015d0c16bd078b9930cc788e9ff1b6481a84f72bfda7aea207877b",
     "src/origin-transport.js": "7df4d94e870edd9a73ba34f5ce0773e07709aa6809a4111c6534eccb7f459689",
-    "src/sandbox-assets.js": "1aa971db660c1c48dcce549e87ff9f37a5e3e18e02618e62b6c0942dbbf0fc2b",
+    "src/parent-entry.js": "eabf3062e84981fce204df20558620d74a3f9a6f5defe853aaffbaab9e972390",
+    "src/parent-view.js": "28a99605983426bcd143b2e3aefd36f1719d0922d90232b0692aebb1eb9065b0",
+    "src/sandbox-assets.js": "c160ca5779aa5bc66fc080941cb0f42e9913123a711b3e2d9ff6a8b0461e101d",
     "src/sandbox-cli.js": "fd5040123976a121a34a8e8349f8d8ddb8f33cb942992da81156488058f46050",
     "src/sandbox-config.js": "05cb572ecdd4675f089279a77dd6b8abd038c6bb5ec4143b03fa34bc8c03040d",
     "src/sandbox-entry.js": "644ef47a17025c0b71c9ef627d36a2b30d81995774783786757bb26abda58288",
@@ -190,7 +192,9 @@
     "node_modules/zod/v4/locales/zh-CN.js": "8fc02f2bd4d92f46b24b8d82da0ee95c962fc80c14dd7dd469500e14de08d320",
     "node_modules/zod/v4/locales/zh-TW.js": "01d9b119e318d8b9f1a8fa720d06424457429425a61d0730984b750e6a5edf7d",
     "src/origin-transport.js": "7df4d94e870edd9a73ba34f5ce0773e07709aa6809a4111c6534eccb7f459689",
-    "src/sandbox-assets.js": "1aa971db660c1c48dcce549e87ff9f37a5e3e18e02618e62b6c0942dbbf0fc2b",
+    "src/parent-entry.js": "eabf3062e84981fce204df20558620d74a3f9a6f5defe853aaffbaab9e972390",
+    "src/parent-view.js": "28a99605983426bcd143b2e3aefd36f1719d0922d90232b0692aebb1eb9065b0",
+    "src/sandbox-assets.js": "c160ca5779aa5bc66fc080941cb0f42e9913123a711b3e2d9ff6a8b0461e101d",
     "src/sandbox-cli.js": "fd5040123976a121a34a8e8349f8d8ddb8f33cb942992da81156488058f46050",
     "src/sandbox-config.js": "05cb572ecdd4675f089279a77dd6b8abd038c6bb5ec4143b03fa34bc8c03040d",
     "src/sandbox-entry.js": "644ef47a17025c0b71c9ef627d36a2b30d81995774783786757bb26abda58288",
@@ -347,8 +351,9 @@
     }
   ],
   "assets": {
+    "parent-entry.js": "3e566c591174d0b7c06971536860635852d3331ab53e31858d0ba280aa23124f",
     "sandbox-entry.js": "f6a8cc9ed1b7c0ec8818a0fabf18eb4d55af109f367f6ac4ac857da79a3e3c61",
-    "sandbox-service.mjs": "e6fd132f3b04140aaa5c8ee73211a1dd96456c905c3e304a241030ebca941c9e",
+    "sandbox-service.mjs": "a07224730c5275af85d034cea281d1e6cacc18b670eb8574c96d0429b5ea59b3",
     "THIRD_PARTY_NOTICES.txt": "5176f1d103deea45d829e91f31e0d683425bd7eee067c37c135130f20829863f"
   }
 }

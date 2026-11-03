@@ -181,6 +181,8 @@ class MCPConnection:
         call_timeout: float = CALL_TOOL_TIMEOUT,
         close_timeout: float = SESSION_CLOSE_TIMEOUT_DEFAULT,
         response_max_bytes: int = RESPONSE_MAX_BYTES_DEFAULT,
+        extensions=None,
+        before_close=None,
     ) -> None:
         if not all(math.isfinite(value) and value > 0
                    for value in (connect_timeout, call_timeout, close_timeout)):
@@ -195,6 +197,10 @@ class MCPConnection:
         request_headers["Accept-Encoding"] = "identity;q=1, *;q=0"
         self._headers = dict(request_headers)
         self._auth = auth
+        self._extensions = tuple(extensions or ())
+        if before_close is not None and not callable(before_close):
+            raise TypeError("MCP connection retirement must be callable")
+        self._before_close = before_close
         self._connect_timeout = connect_timeout
         self._call_timeout = call_timeout
         self._close_timeout = close_timeout
@@ -266,6 +272,7 @@ class MCPConnection:
                 client = await resources.enter_async_context(Client(
                     transport,
                     cache=None,
+                    extensions=self._extensions,
                     # Operator-input continuations need the host's governed
                     # surface. Never let the SDK reissue a tool call implicitly.
                     input_required_max_rounds=0,
@@ -387,6 +394,8 @@ class MCPConnection:
             self._incarnation = None
 
     async def close(self) -> None:
+        if self._before_close is not None:
+            await self._before_close(self)
         task = self._task
         if task is None:
             return

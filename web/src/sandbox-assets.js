@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
-export const SANDBOX_GENERATED_FILES = Object.freeze(['sandbox-entry.js', 'sandbox-service.mjs', 'THIRD_PARTY_NOTICES.txt', 'manifest.json']);
+export const SANDBOX_GENERATED_FILES = Object.freeze(['sandbox-entry.js', 'sandbox-service.mjs', 'parent-entry.js', 'THIRD_PARTY_NOTICES.txt', 'manifest.json']);
 export const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 
 /** Detect missing/corrupted packaged assets before creating a public listener. */

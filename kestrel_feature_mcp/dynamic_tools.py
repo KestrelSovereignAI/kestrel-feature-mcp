@@ -182,6 +182,7 @@ def build_wrappers(
     handle_prefix: str,
     tool_dicts: List[Dict[str, Any]],
     caller: MCPCaller,
+    *, app_executor: AppExecutor | None = None,
 ) -> List[MCPToolWrapper]:
     """Build wrappers from native SDK Tool records with host connection labels.
 
@@ -197,6 +198,7 @@ def build_wrappers(
                 handle_name=f"mcp__{handle_prefix}__{native.name}",
                 tool=native,
                 caller=caller,
+                app_executor=app_executor,
             )
         )
     return wrappers
