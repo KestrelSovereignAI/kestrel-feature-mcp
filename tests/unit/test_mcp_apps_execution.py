@@ -690,3 +690,92 @@ async def test_reentrant_owner_revocation_refuses_the_original_view(app_boundary
         assert view._closed and not mcp_http_server.witness
     finally:
         await view.close()
+
+
+@pytest.mark.asyncio
+async def test_physical_delivery_retains_native_result_until_original_transport_settles(app_boundary, mcp_http_server):
+    peer = app_boundary
+    await allow(peer, "app_mutate")
+    reached, cancelled, settle = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    guards = []
+    cancellations = []
+
+    async def delivery():
+        # The real governed call and SQL finish before transport owns the data.
+        result = await peer.executor.invoke(peer.view, "app_mutate", {"text": "private-delivery"})
+        assert result.meta["private-result"] == {"view": "only"}
+        async with peer.view.borrow_delivery() as current:
+            guards.append(current)
+            current()
+            reached.set()
+            try:
+                await settle.wait()
+            except asyncio.CancelledError:
+                cancellations.append(True)
+                cancelled.set()
+                await settle.wait()
+            current()
+
+    sender = asyncio.create_task(delivery())
+    closer = None
+    try:
+        await asyncio.wait_for(reached.wait(), 5)
+        closer = asyncio.create_task(peer.view.close())
+        await asyncio.wait_for(cancelled.wait(), 5)
+        peer.view.cancel_delivery(sender)
+        peer.view.revoke()
+        await asyncio.sleep(0)
+        assert not sender.done() and not closer.done() and cancellations == [True]
+        rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+        assert [tuple(row) for row in rows] == [("success",)]
+        settle.set()
+        with pytest.raises(ResourceConflict):
+            await sender
+        with pytest.raises(BaseExceptionGroup):
+            await closer
+        with pytest.raises(ResourceConflict, match="ended"):
+            guards[0]()
+    finally:
+        settle.set()
+        await asyncio.gather(sender, *([closer] if closer else []), return_exceptions=True)
+    assert mcp_http_server.witness == ["private-delivery"]
+
+
+@pytest.mark.asyncio
+async def test_delivery_borrow_refuses_foreign_owner_and_expired_guard(app_boundary):
+    view = app_boundary.view
+    async with view.borrow_delivery() as current:
+        current()
+        async def foreign():
+            with pytest.raises(ResourceConflict, match="owner"):
+                current()
+            with pytest.raises(ResourceConflict, match="another View"):
+                view.cancel_delivery(asyncio.current_task())
+        await asyncio.create_task(foreign())
+    with pytest.raises(ResourceConflict, match="ended"):
+        current()
+    view.require_current()
+
+
+@pytest.mark.asyncio
+async def test_delivery_borrows_share_the_original_view_pending_limit(app_boundary):
+    view = app_boundary.view
+    assert view.executor.supports_owned_delivery is True and view.is_closed is False
+    first, second, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    async def hold(ready):
+        async with view.borrow_delivery():
+            ready.set()
+            await release.wait()
+    owners = [asyncio.create_task(hold(first)), asyncio.create_task(hold(second))]
+    try:
+        await asyncio.wait_for(asyncio.gather(first.wait(), second.wait()), 5)
+        with pytest.raises(ResourceConflict, match="cannot admit"):
+            async with view.borrow_delivery():
+                raise AssertionError("over-budget response entered")
+    finally:
+        release.set()
+        await asyncio.gather(*owners)
+    async with view.borrow_delivery() as current:
+        current()
+    await view.close()
+    assert view.is_closed is True

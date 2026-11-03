@@ -383,6 +383,13 @@ including control errors and cancellation; the drain never reports success.
 On unplanned connection loss, retire the owner and drain promptly so stale
 results and Views do not keep holding capacity. Retire or replace a fenced
 owner to release its retained wrapper and binding references.
+
+From 0.10.1, physical HTTP response children use
+`AppView.borrow_delivery()` through their actual transport send, checking the
+yielded guard before and after delivery. `cancel_delivery()` cancels an original
+child at most once; View retirement joins it alongside approvals and calls.
+`AppExecutor.supports_owned_delivery is True` identifies this host contract;
+`AppView.is_closed` is lifecycle state and grants no access.
 Each registration needs fresh tool wrappers, so a result staged before an audit
 await cannot be reassociated with a replacement registration of the same object.
 No Apps capability is advertised until those host integrations are present.
