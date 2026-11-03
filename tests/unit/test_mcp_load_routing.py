@@ -109,7 +109,8 @@ async def test_load_stdio_server_delegates_to_gateway(monkeypatch):
     started = {}
 
     class _FakeGatewayMgr:
-        def __init__(self):
+        def __init__(self, *, connection_factory):
+            assert connection_factory == feat._new_mcp_connection
             self.is_connected = False
             self.tools = {}
             self.gateway = SimpleNamespace(requested_servers={"time"})
