@@ -779,3 +779,13 @@ async def test_delivery_borrows_share_the_original_view_pending_limit(app_bounda
         current()
     await view.close()
     assert view.is_closed is True
+
+
+@pytest.mark.asyncio
+async def test_view_cannot_join_its_own_physical_delivery(app_boundary):
+    view = app_boundary.view
+    async with view.borrow_delivery():
+        with pytest.raises(ResourceConflict, match="external lifetime owner"):
+            await view.close()
+        assert not view.is_closed
+    await view.close()

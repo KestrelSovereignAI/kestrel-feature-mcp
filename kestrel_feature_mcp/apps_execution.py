@@ -215,6 +215,8 @@ class AppView:
 
     async def close(self) -> None:
         """Join pending approvals, effects and their required Core audit writes."""
+        if asyncio.current_task() in self._calls:
+            raise ResourceConflict("MCP App View must be closed by its external lifetime owner")
         self.revoke()
         calls = tuple(self._calls)
         pending = set(calls)
