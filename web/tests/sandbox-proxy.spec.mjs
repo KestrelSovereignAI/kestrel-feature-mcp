@@ -442,6 +442,7 @@ test('View tool requests before initialization never reach the host', async ({ p
     const html = `<script>parent.postMessage({ jsonrpc:'2.0', id: 'early-call',
         method: 'tools/call', params: { name: 'forbidden', arguments: {} } }, '*');<\/script>`;
     const proxy = await mount(page, { html });
+    await proxy.waitForFunction(() => Array.isArray(window.viewArrivals));
     await expect.poll(() => proxy.evaluate(() => window.viewArrivals.includes('early-call'))).toBe(true);
     expect(await proxy.evaluate(() => window.proxyErrors)).toEqual([
         'Sandbox View used the bridge before initialization',
