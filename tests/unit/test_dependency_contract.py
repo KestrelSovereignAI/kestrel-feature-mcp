@@ -24,10 +24,11 @@ def test_remote_mcp_requires_the_shared_sdk_trust_bundle_policy():
     assert sdk.specifier.contains("0.46.0")
 
 
-def test_frozen_mcp_install_uses_public_current_https_dependencies():
+def test_frozen_mcp_install_uses_public_patched_security_dependencies():
     packages = {item["name"]: item for item in tomllib.loads(
         (ROOT / "uv.lock").read_text())["package"]}
-    for name, floor in [("kestrel-sovereign-sdk", "0.46.0"), ("certifi", "2026.10.23")]:
+    for name, floor in [("kestrel-sovereign-sdk", "0.46.0"), ("certifi", "2026.10.23"),
+                        ("pyasn1", "0.6.5")]:
         assert Version(packages[name]["version"]) >= Version(floor)
         assert packages[name]["source"] == {"registry": "https://pypi.org/simple"}
 
