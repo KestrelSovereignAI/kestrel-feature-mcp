@@ -24,7 +24,7 @@
     "src/sandbox-cli.js": "fd5040123976a121a34a8e8349f8d8ddb8f33cb942992da81156488058f46050",
     "src/sandbox-config.js": "05cb572ecdd4675f089279a77dd6b8abd038c6bb5ec4143b03fa34bc8c03040d",
     "src/sandbox-entry.js": "644ef47a17025c0b71c9ef627d36a2b30d81995774783786757bb26abda58288",
-    "src/sandbox-proxy.js": "6349a9d2a3007d04f134ad45207eeec0aee8d9c7642f9cc2e3a7dd73217deb1d",
+    "src/sandbox-proxy.js": "b4d078e715c8b261ab730bfd9b96e5eb3bc7d8537e309d0ef50cddb70b116d3a",
     "src/sandbox-server-entry.js": "e3cb9be441c1eb03069c3951cf9dfab68c90a154d932e86d1dbac5350e9f792b",
     "src/sandbox-service.js": "3e106fca45ab84557471e3c7e7db0b0fb617895500333f1f1bb44a38dfbde9df",
     "vendor-notices.json": "937d0d016eefe6d25ce4016e42f6c342927ab8b1aa587762703013cd5d710b6d"
@@ -198,7 +198,7 @@
     "src/sandbox-cli.js": "fd5040123976a121a34a8e8349f8d8ddb8f33cb942992da81156488058f46050",
     "src/sandbox-config.js": "05cb572ecdd4675f089279a77dd6b8abd038c6bb5ec4143b03fa34bc8c03040d",
     "src/sandbox-entry.js": "644ef47a17025c0b71c9ef627d36a2b30d81995774783786757bb26abda58288",
-    "src/sandbox-proxy.js": "6349a9d2a3007d04f134ad45207eeec0aee8d9c7642f9cc2e3a7dd73217deb1d",
+    "src/sandbox-proxy.js": "b4d078e715c8b261ab730bfd9b96e5eb3bc7d8537e309d0ef50cddb70b116d3a",
     "src/sandbox-server-entry.js": "e3cb9be441c1eb03069c3951cf9dfab68c90a154d932e86d1dbac5350e9f792b",
     "src/sandbox-service.js": "3e106fca45ab84557471e3c7e7db0b0fb617895500333f1f1bb44a38dfbde9df"
   },
@@ -352,7 +352,7 @@
   ],
   "assets": {
     "parent-entry.js": "6ff93d0af01b7f7fdd0d09a6a040354dbbcad417dca916fb5ee5a72f8a94934c",
-    "sandbox-entry.js": "f6a8cc9ed1b7c0ec8818a0fabf18eb4d55af109f367f6ac4ac857da79a3e3c61",
+    "sandbox-entry.js": "9d10d2cc095a19b63e907f5e73871fb9d18e12809bc23e1742842778ec40fcf1",
     "sandbox-service.mjs": "a07224730c5275af85d034cea281d1e6cacc18b670eb8574c96d0429b5ea59b3",
     "THIRD_PARTY_NOTICES.txt": "5176f1d103deea45d829e91f31e0d683425bd7eee067c37c135130f20829863f"
   }

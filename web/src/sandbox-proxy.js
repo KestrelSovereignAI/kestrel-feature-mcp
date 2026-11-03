@@ -109,6 +109,9 @@ export function startSandboxProxy({ hostOrigin, maxMessageBytes, maxHtmlBytes, p
         view.setAttribute('sandbox', 'allow-scripts');
         view.setAttribute('allow', buildAllowAttribute(approved.permissions));
         view.referrerPolicy = 'no-referrer';
+        // The host sizes the proxy viewport. Keep the opaque View inside
+        // that viewport instead of the browser's default iframe rectangle.
+        view.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0;display:block';
         let loads = 0;
         view.addEventListener('load', () => {
             if (++loads > 1) {

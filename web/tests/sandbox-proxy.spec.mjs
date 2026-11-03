@@ -161,6 +161,24 @@ async function mount(page, { html = '<script type="module">' + appBundle + '</sc
     return page.frame({ url: proxyOrigin + '/proxy' });
 }
 
+test('opaque View fills the host-selected proxy viewport and follows resizing', async ({ page }) => {
+    const proxy = await mount(page, { proxyOrigin: productionSandboxOrigin });
+    const frame = page.locator('#proxy');
+    for (const [width, height] of [[640, 480], [800, 360]]) {
+        await frame.evaluate((element, size) => {
+            element.style.width = size.width + 'px';
+            element.style.height = size.height + 'px';
+            element.style.border = '0';
+        }, { width, height });
+        await expect.poll(() => proxy.locator('iframe').evaluate(element => {
+            const rect = element.getBoundingClientRect();
+            return { x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+                viewportWidth: window.innerWidth, viewportHeight: window.innerHeight };
+        })).toEqual({ x: 0, y: 0, width, height, viewportWidth: width, viewportHeight: height });
+    }
+    expect(await proxy.childFrames()[0].evaluate(() => self.origin)).toBe('null');
+});
+
 test('native App and AppBridge initialize through the mandatory proxy and opaque View', async ({ page }) => {
     const proxy = await mount(page);
     await expect.poll(() => proxy.childFrames().length).toBe(1);
