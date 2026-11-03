@@ -89,24 +89,56 @@ async def test_cancellation_during_apps_cleanup_still_settles_native_remotes(rem
             await connection.close()
 
 
+async def failed_maintenance_owner(b):
+    previous, worker = b.feature._apps_host, b.feature._apps_maintenance
+    batch = b.feature._apps_publications._batches["mcp:composition"]
+    failure = PermissionError("owned maintenance failure")
+    def fail_once():
+        batch.is_current = lambda: True
+        raise failure
+    batch.is_current = fail_once
+    with pytest.raises(PermissionError, match="owned maintenance failure"):
+        await asyncio.wait_for(asyncio.shield(worker), 5)
+    return previous, failure
+
+
+async def close_injected_failure(b, failure):
+    try:
+        await b.feature.shutdown()
+    except PermissionError as error:
+        # Own the deliberately injected worker failure even when a mutation
+        # makes the assertion fail before its expected reporting operation.
+        if error is not failure:
+            raise
+
+
 @pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True, "apps_execution_tools": True,
     "app_mutate_visibility": ["model", "app"]}], indirect=True)
 @pytest.mark.parametrize("recovery", ["shutdown", "initialize"])
 async def test_observed_maintenance_failure_does_not_poison_reenable(native_apps_host, recovery):
     b = native_apps_host
-    previous, worker = b.feature._apps_host, b.feature._apps_maintenance
-    batch = b.feature._apps_publications._batches["mcp:composition"]
-    def fail_once():
-        batch.is_current = lambda: True
-        raise PermissionError("owned maintenance failure")
-    batch.is_current = fail_once
-    with pytest.raises(PermissionError, match="owned maintenance failure"):
-        await asyncio.wait_for(asyncio.shield(worker), 5)
-    with pytest.raises(PermissionError, match="owned maintenance failure"):
-        await getattr(b.feature, recovery)()
-    assert b.feature._apps_host is None and previous.retired
-    await b.feature.initialize()
-    assert b.feature._apps_host is not previous and not b.feature._apps_maintenance.done()
+    previous, failure = await failed_maintenance_owner(b)
+    try:
+        with pytest.raises(PermissionError, match="owned maintenance failure") as reported:
+            await getattr(b.feature, recovery)()
+        assert reported.value is failure
+        assert b.feature._apps_host is None and previous.retired
+        await b.feature.initialize()
+        assert b.feature._apps_host is not previous and not b.feature._apps_maintenance.done()
+    finally:
+        await close_injected_failure(b, failure)
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True, "apps_execution_tools": True,
+    "app_mutate_visibility": ["model", "app"]}], indirect=True)
+async def test_unchanged_configuration_does_not_report_a_failed_host_as_ready(native_apps_host):
+    b = native_apps_host
+    _previous, failure = await failed_maintenance_owner(b)
+    try:
+        with pytest.raises(MCPFeatureClosingError, match="unavailable"):
+            await b.feature.set_config(await b.feature.get_config())
+    finally:
+        await close_injected_failure(b, failure)
 
 
 @pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True, "apps_execution_tools": True,

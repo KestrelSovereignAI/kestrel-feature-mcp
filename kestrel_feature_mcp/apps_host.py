@@ -71,6 +71,8 @@ class MCPAppsFeatureMixin:
         if settings == self._apps_settings:
             if settings.enabled and self._apps_host is None:
                 await self._start_apps()
+            elif settings.enabled:
+                self._require_apps_ready()
             return
         if (self._remote_connections or self.gateway_manager is not None
                 or self.manager is not None and self.manager.owned_containers):
@@ -119,23 +121,23 @@ class MCPAppsFeatureMixin:
         maintenance = asyncio.create_task(maintain(), name="mcp-apps-private-retention")
         self._apps_host, self._apps_publications, self._apps_maintenance = host, publications, maintenance
 
+    def _require_apps_ready(self):
+        if self._apps_host is None:
+            raise MCPFeatureClosingError("MCP Apps host is not initialized")
+        if (self._apps_host.retired or self._apps_maintenance is None
+                or self._apps_maintenance.done()):
+            raise MCPFeatureClosingError("MCP Apps retention owner is unavailable")
+
     def _new_mcp_connection(self, *args, **kwargs):
         self._require_open()
-        if self._apps_settings.enabled and self._apps_host is None:
-            raise MCPFeatureClosingError("MCP Apps host is not initialized")
-        if self._apps_host is not None:
-            if self._apps_maintenance is None or self._apps_maintenance.done():
-                raise MCPFeatureClosingError("MCP Apps retention owner is unavailable")
+        if self._apps_settings.enabled:
+            self._require_apps_ready()
             kwargs["extensions"] = [advertise(EXTENSION_ID)]
             kwargs["before_close"] = self._apps_publications.retire_connection
         return MCPConnection(*args, **kwargs)
 
     def _manager_connection_settings(self):
         return {"connection_factory": self._new_mcp_connection}
-
-    async def _drain_apps(self):
-        if self._apps_host is not None:
-            await self._apps_host.maintain()
 
     async def _close_apps(self):
         host, maintenance = self._apps_host, self._apps_maintenance
