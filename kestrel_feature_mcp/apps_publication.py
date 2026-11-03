@@ -186,6 +186,17 @@ class AppPublications:
         for view in publication.views:
             view.revoke()
 
+    def withdraw_publications(self) -> None:
+        """Erase private results and fence Views before a host policy change.
+
+        Original tool registrations remain registered. The host must join
+        ``drain_retired()`` before retiring their connections or feature owner.
+        """
+        for reference, publication in tuple(self._publications.items()):
+            self._discard(reference, publication)
+        for view in self._views:
+            view.revoke()
+
     def _prune(self) -> None:
         """Expiry is global; a source's predicate governs only its own records."""
         now = self._now()

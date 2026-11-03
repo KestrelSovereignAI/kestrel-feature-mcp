@@ -390,6 +390,10 @@ yielded guard before and after delivery. `cancel_delivery()` cancels an original
 child at most once; View retirement joins it alongside approvals and calls.
 `AppExecutor.supports_owned_delivery is True` identifies this host contract;
 `AppView.is_closed` is lifecycle state and grants no access.
+On a privacy or other host policy transition, `withdraw_publications()` erases
+private associations and fences every View synchronously; then drain retired
+work. This leaves the original tool registrations available for new policy-bound
+results and never reopens an old private result.
 Each registration needs fresh tool wrappers, so a result staged before an audit
 await cannot be reassociated with a replacement registration of the same object.
 No Apps capability is advertised until those host integrations are present.
