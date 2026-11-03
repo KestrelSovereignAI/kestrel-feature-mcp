@@ -26,6 +26,7 @@ from .remote import RemoteMCPServer, RemoteMCPError, connection_error_message, r
 from .dynamic_tools import build_wrappers
 from .apps_execution import RegisteredAppTool
 from .apps_host import MCPAppsFeatureMixin
+from ._lifecycle import MCPFeatureClosingError, run_cleanup_steps
 from .images import normalize_image_ref
 from .registry import (
     get_registry,
@@ -47,10 +48,6 @@ logger = logging.getLogger(__name__)
 # Gateway-mounted tools share one owner (the gateway aggregates many servers and
 # does not attribute tools per-server); each container is its own owner.
 _GATEWAY_OWNER = "mcp:gateway"
-
-
-class MCPFeatureClosingError(RuntimeError):
-    """A connection start belongs to a feature generation that is closing."""
 
 
 class MCPHostCapabilityError(RemoteMCPError):
@@ -177,6 +174,10 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
     async def initialize(self):
         owner_did = require_owner_did(self.agent.agent_id)
         async with self._lifecycle_transition:
+            if (not self._closing and self._apps_maintenance is not None
+                    and self._apps_maintenance.done()):
+                self._closing = True
+                self._lifecycle_generation += 1
             if self._closing:
                 # A soft disable retains this instance. Finish failed cleanup
                 # before reopening; live initialization retains its resources.
@@ -186,12 +187,14 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
             self._owner_did = owner_did
             self._closing = False
             if self._apps_settings.enabled and self._apps_host is None:
-                self._start_apps()
+                await self._start_apps()
         logger.info("MCPAgent initialized; Docker connects only for container operations.")
 
     def _require_open(self, generation: int | None = None) -> None:
-        if self._closing or (generation is not None and generation != self._lifecycle_generation):
+        if self._closing:
             raise MCPFeatureClosingError("MCP feature is shutting down")
+        if generation is not None and generation != self._lifecycle_generation:
+            raise MCPFeatureClosingError("MCP connection start belongs to an earlier configuration generation")
 
     def _connection_owner_did(self) -> str:
         return self._owner_did or require_owner_did(self.agent.agent_id)
@@ -503,6 +506,8 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
             raise RemoteMCPError("Host did not retain MCP enablement; initialize its durable store")
 
     async def _load_remote_connection(self, url: str, expected_name: str | None) -> ToolResult:
+        generation = self._lifecycle_generation
+        self._require_open(generation)
         invalid = _selector_failure(url)
         if invalid is not None:
             raise RemoteMCPError(invalid.error)
@@ -517,8 +522,8 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         name = remote_name_for_url(endpoint.url, owner_did)
         if expected_name is not None and name != expected_name:
             raise RemoteMCPError("Stored MCP endpoint is not canonical; reconnect it explicitly")
-        async with connection_lifecycle(self._remote_lifecycle, name):
-            self._require_open()
+        async with self._lifecycle_transition, connection_lifecycle(self._remote_lifecycle, name):
+            self._require_open(generation)
             owner = remote_owner(name)
             self._unmount_tools(owner)
             await self._retire_remote(name)
@@ -1446,7 +1451,6 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
             self._apps_host.withdraw_private_data()
         async with self._lifecycle_transition:
             self._closing = True
-            await self._close_apps()
             await self._shutdown_connections()
 
     async def _shutdown_connections(self):
@@ -1454,7 +1458,7 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         # initialization gate also joins direct manager acquisition, so no
         # client can appear after the cleanup snapshot and escape custody.
         async with self._docker_operations, self._docker_initialization:
-            await self._release_connections()
+            await run_cleanup_steps([(True, self._close_apps), (True, self._release_connections)])
 
     async def _release_connections(self):
         manager = self.manager

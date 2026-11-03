@@ -18,7 +18,7 @@
     "package-lock.json": "86ab8c6bb16dc9c4d445ef3e6e0bc32c38409053475381e0f3bb4b81b121f478",
     "package.json": "5e09ea1a34316cd25005db422ebb0b2e11ccec6029f37dc99f56658fd5ba664b",
     "src/origin-transport.js": "7df4d94e870edd9a73ba34f5ce0773e07709aa6809a4111c6534eccb7f459689",
-    "src/parent-entry.js": "1e4578778823dc86a0d7b614d9b7914cf5eca23523561ae9682396a77d3fd8da",
+    "src/parent-entry.js": "99baa8d1679c944d345915893db6993da9186265d6a4841c7cde73fa4a89bee6",
     "src/parent-view.js": "39929b1a5c4d68d3cc2c150a4c155c01486a6c5e006cd75b4b3c6b0d260f8887",
     "src/sandbox-assets.js": "c160ca5779aa5bc66fc080941cb0f42e9913123a711b3e2d9ff6a8b0461e101d",
     "src/sandbox-cli.js": "fd5040123976a121a34a8e8349f8d8ddb8f33cb942992da81156488058f46050",
@@ -192,7 +192,7 @@
     "node_modules/zod/v4/locales/zh-CN.js": "8fc02f2bd4d92f46b24b8d82da0ee95c962fc80c14dd7dd469500e14de08d320",
     "node_modules/zod/v4/locales/zh-TW.js": "01d9b119e318d8b9f1a8fa720d06424457429425a61d0730984b750e6a5edf7d",
     "src/origin-transport.js": "7df4d94e870edd9a73ba34f5ce0773e07709aa6809a4111c6534eccb7f459689",
-    "src/parent-entry.js": "1e4578778823dc86a0d7b614d9b7914cf5eca23523561ae9682396a77d3fd8da",
+    "src/parent-entry.js": "99baa8d1679c944d345915893db6993da9186265d6a4841c7cde73fa4a89bee6",
     "src/parent-view.js": "39929b1a5c4d68d3cc2c150a4c155c01486a6c5e006cd75b4b3c6b0d260f8887",
     "src/sandbox-assets.js": "c160ca5779aa5bc66fc080941cb0f42e9913123a711b3e2d9ff6a8b0461e101d",
     "src/sandbox-cli.js": "fd5040123976a121a34a8e8349f8d8ddb8f33cb942992da81156488058f46050",
@@ -351,7 +351,7 @@
     }
   ],
   "assets": {
-    "parent-entry.js": "3958f1a734ff82ae207d5a21d08e01bce48ab9ca0836bcc7276dbb15d4f80321",
+    "parent-entry.js": "6ff93d0af01b7f7fdd0d09a6a040354dbbcad417dca916fb5ee5a72f8a94934c",
     "sandbox-entry.js": "f6a8cc9ed1b7c0ec8818a0fabf18eb4d55af109f367f6ac4ac857da79a3e3c61",
     "sandbox-service.mjs": "a07224730c5275af85d034cea281d1e6cacc18b670eb8574c96d0429b5ea59b3",
     "THIRD_PARTY_NOTICES.txt": "5176f1d103deea45d829e91f31e0d683425bd7eee067c37c135130f20829863f"

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
 from copy import deepcopy
 from pathlib import Path
 
@@ -15,6 +14,7 @@ from kestrel_sdk.resources import ResourceConflict
 
 from .apps_publication import AppPublications
 from .connection import MCPConnection
+from ._lifecycle import MCPFeatureClosingError, run_cleanup_steps
 
 
 class AppsSettings(BaseModel):
@@ -55,6 +55,11 @@ class MCPAppsFeatureMixin:
         return {"apps": self._apps_settings.model_dump(mode="json")}
 
     async def set_config(self, config):
+        async with self._lifecycle_transition, self._docker_operations, self._docker_initialization:
+            self._require_open()
+            await self._set_apps_config(config)
+
+    async def _set_apps_config(self, config):
         if not isinstance(config, dict) or set(config) - {"apps"}:
             raise ValueError("MCP configuration accepts only Apps host settings")
         settings = AppsSettings.model_validate(deepcopy(config.get("apps", {})))
@@ -65,17 +70,19 @@ class MCPAppsFeatureMixin:
             settings = settings.model_copy(update={"host": validate(settings.host)})
         if settings == self._apps_settings:
             if settings.enabled and self._apps_host is None:
-                self._start_apps()
+                await self._start_apps()
             return
         if (self._remote_connections or self.gateway_manager is not None
                 or self.manager is not None and self.manager.owned_containers):
             raise ResourceConflict("Unload MCP connections before changing Apps host configuration")
+        self._lifecycle_generation += 1
         await self._close_apps()
+        self._require_open()
         self._apps_settings = settings
         if settings.enabled:
-            self._start_apps()
+            await self._start_apps()
 
-    def _start_apps(self):
+    async def _start_apps(self):
         if getattr(self.agent, "supports_mcp_apps_host", None) is not True:
             raise TypeError("MCP Apps require Core's authenticated physical View host")
         assets = Path(__file__).with_name("apps_sandbox")
@@ -91,13 +98,16 @@ class MCPAppsFeatureMixin:
         host = self.agent.create_mcp_apps_host(self, configuration=self._apps_settings.host,
                                                is_current=current)
         settings = self._apps_settings
-        publications = AppPublications(host=self.agent, agent_id=self._connection_owner_did(),
-            publication_owner=host.publication_owner, require_reader=host.require_reader,
-            **{name: getattr(settings, name) for name in (
-                "max_publications", "max_publications_per_owner", "max_views", "max_views_per_owner",
-                "max_payload_bytes", "max_pending_calls", "retention_seconds")})
-        host.attach(publications)
-        self._apps_host, self._apps_publications = host, publications
+        try:
+            publications = AppPublications(host=self.agent, agent_id=self._connection_owner_did(),
+                publication_owner=host.publication_owner, require_reader=host.require_reader,
+                **{name: getattr(settings, name) for name in (
+                    "max_publications", "max_publications_per_owner", "max_views", "max_views_per_owner",
+                    "max_payload_bytes", "max_pending_calls", "retention_seconds")})
+            host.attach(publications)
+        except BaseException as error:
+            await run_cleanup_steps([(True, host.close)], failure=error)
+            raise
 
         async def maintain():
             try:
@@ -106,19 +116,22 @@ class MCPAppsFeatureMixin:
                     await host.maintain()
             finally:
                 host.withdraw_private_data()
-        self._apps_maintenance = asyncio.create_task(maintain(), name="mcp-apps-private-retention")
+        maintenance = asyncio.create_task(maintain(), name="mcp-apps-private-retention")
+        self._apps_host, self._apps_publications, self._apps_maintenance = host, publications, maintenance
 
     def _new_mcp_connection(self, *args, **kwargs):
         self._require_open()
+        if self._apps_settings.enabled and self._apps_host is None:
+            raise MCPFeatureClosingError("MCP Apps host is not initialized")
         if self._apps_host is not None:
             if self._apps_maintenance is None or self._apps_maintenance.done():
-                raise ResourceConflict("MCP Apps retention owner is unavailable")
+                raise MCPFeatureClosingError("MCP Apps retention owner is unavailable")
             kwargs["extensions"] = [advertise(EXTENSION_ID)]
             kwargs["before_close"] = self._apps_publications.retire_connection
         return MCPConnection(*args, **kwargs)
 
     def _manager_connection_settings(self):
-        return {"connection_factory": self._new_mcp_connection} if self._apps_host is not None else {}
+        return {"connection_factory": self._new_mcp_connection}
 
     async def _drain_apps(self):
         if self._apps_host is not None:
@@ -147,10 +160,13 @@ class MCPAppsFeatureMixin:
                     raise failure
                 if cancellation is not None:
                     raise cancellation
-        async with AsyncExitStack() as cleanup:
-            cleanup.push_async_callback(join_maintenance)
-            await host.close()
-        self._apps_host = self._apps_publications = self._apps_maintenance = None
+        try:
+            await run_cleanup_steps([(True, host.close), (True, join_maintenance)])
+        finally:
+            # A settled owner may report its failure once without poisoning
+            # every later shutdown. A partial close keeps its original custody.
+            if host.retired and (maintenance is None or maintenance.done()):
+                self._apps_host = self._apps_publications = self._apps_maintenance = None
 
     def get_router(self):
         if getattr(self.agent, "supports_mcp_apps_host", None) is not True:

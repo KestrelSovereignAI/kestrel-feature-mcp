@@ -10,6 +10,7 @@ import json
 from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
+from functools import partial
 
 import httpx2
 from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
@@ -23,6 +24,7 @@ from kestrel_sdk.security.outbound import ValidatedOutboundURL, pinned_httpx2_as
 from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSION_CLOSE_TIMEOUT_DEFAULT, RESPONSE_MAX_BYTES_DEFAULT
 from .http_limits import MCPResponseBudget, MCPResponseLimitError
 from .tool_contract import MCPToolContractError, validate_tool_contract
+from ._lifecycle import run_cleanup_steps
 
 
 logger = logging.getLogger(__name__)
@@ -394,8 +396,13 @@ class MCPConnection:
             self._incarnation = None
 
     async def close(self) -> None:
+        steps = []
         if self._before_close is not None:
-            await self._before_close(self)
+            steps.append((True, partial(self._before_close, self)))
+        steps.append((True, self._close_transport))
+        await run_cleanup_steps(steps)
+
+    async def _close_transport(self) -> None:
         task = self._task
         if task is None:
             return

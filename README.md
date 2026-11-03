@@ -333,6 +333,15 @@ and gives them to the opaque App iframe. App calls use the original governed
 tool bindings and required audit. Leaving a chat, removing its rendered part,
 retiring a connection or shutting down the feature closes its physical Views.
 Reopening reads the retained result without replaying the initial tool.
+Choose **Open App** to allocate a View and **Close App** to release it. Replaying
+conversation history creates no Views or resource reads until an App is opened,
+so a long conversation does not automatically exhaust its View budget.
+
+Configuration and connection admission share the feature's lifecycle gates.
+A start from an earlier configuration generation is refused. Cleanup attempts
+every original resource and propagates failures and cancellation; settled
+maintenance failures are reported without poisoning later re-enable attempts.
+An unfinished close retains its original owner and is retried before re-enable.
 
 Version 0.8.0 introduced the native components described below; 0.9.0 added
 completed post-tool policy, 0.10.0 added private initial result associations,

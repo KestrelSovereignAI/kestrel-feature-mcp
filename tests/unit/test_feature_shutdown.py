@@ -129,7 +129,7 @@ async def test_shutdown_joins_gateway_start_before_releasing_custody(monkeypatch
 
     gateway.start = start
     monkeypatch.setattr(feature_module, "check_docker_mcp_available", lambda: True)
-    monkeypatch.setattr(manager_module, "MCPGatewayManager", lambda: gateway)
+    monkeypatch.setattr(manager_module, "MCPGatewayManager", lambda *, connection_factory: gateway)
     monkeypatch.setattr(feature, "_reject_unknown_servers", AsyncMock(return_value=None))
     loading = asyncio.create_task(feature.gateway_start("time"))
     stopping = None
@@ -194,7 +194,7 @@ async def test_same_instance_container_reenable_discards_only_the_successfully_c
     assert feature.manager is None
     assert await feature._ensure_container_manager()
     assert feature.manager is new
-    create.assert_awaited_once_with(owner_did=host.agent_id)
+    create.assert_awaited_once_with(owner_did=host.agent_id, connection_factory=feature._new_mcp_connection)
     await feature.shutdown()
 
 
@@ -217,7 +217,7 @@ async def test_route_lookup_from_before_disable_cannot_acquire_in_a_new_generati
         release.set()
         result = await loading
         assert result.status is ToolResultStatus.ERROR
-        assert "shutting down" in result.error
+        assert "configuration generation" in result.error
         acquire.assert_not_awaited()
     finally:
         release.set()
@@ -254,7 +254,7 @@ async def test_explicit_gateway_cleanup_joins_a_start_and_removes_its_saved_inte
         await release.wait()
         return []
     gateway.start = start
-    monkeypatch.setattr(manager_module, "MCPGatewayManager", lambda: gateway)
+    monkeypatch.setattr(manager_module, "MCPGatewayManager", lambda *, connection_factory: gateway)
     monkeypatch.setattr(feature_module, "check_docker_mcp_available", lambda: True)
     monkeypatch.setattr(feature, "_reject_unknown_servers", AsyncMock(return_value=None))
     monkeypatch.setattr(feature, "_resolve_load_route", AsyncMock(return_value=("gateway", "time")))
@@ -331,7 +331,7 @@ async def test_shutdown_rechecks_each_docker_producer_await_and_discloses_saved_
         return advertised
 
     gateway.start = gateway.enable_server = start_gateway
-    monkeypatch.setattr(manager_module, "MCPGatewayManager", lambda: gateway)
+    monkeypatch.setattr(manager_module, "MCPGatewayManager", lambda *, connection_factory: gateway)
     monkeypatch.setattr(feature_module, "check_docker_mcp_available", lambda: True)
     monkeypatch.setattr(feature, "_reject_unknown_servers", AsyncMock(return_value=None))
     if producer == "gateway-add":

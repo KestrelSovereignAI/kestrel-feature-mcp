@@ -257,3 +257,37 @@ async def test_normal_core_mounts_survive_apps_configuration_and_host_replacemen
         assert b.feature._apps_host is not original
         replaced = await client.get(route)
         assert replaced.status_code == 404 and replaced.json() == {"error": {"code": "mcp_app_unavailable"}}
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True, "apps_execution_tools": True,
+    "app_mutate_visibility": ["model", "app"]}], indirect=True)
+@pytest.mark.asyncio
+async def test_native_cookie_owner_and_csrf_cover_private_app_mutations(native_apps_host, mcp_http_server, monkeypatch):
+    b = native_apps_host
+    monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "1")
+    monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", "cookie@composition.test")
+    @b.app.get("/api/owned-cookie-login")
+    async def login(request: Request):
+        request.session["user_email"] = "cookie@composition.test"
+        return {"signed_in": True}
+    assert (await b.client.get("/api/owned-cookie-login")).status_code == 200
+    b.client.headers.pop("X-API-Key")
+    initial = await b.client.post("/api/owned-turn")
+    assert initial.status_code == 200
+    reference = next(part["data"]["reference"] for part in initial.json()["parts"] if part["type"] == "mcp_app")
+    path = f"/api/mcp/apps/publications/{reference}/views?session_id=original-chat"
+    assert (await b.client.post(path, json={})).status_code == 403
+    b.client.cookies.set("kestrel_csrf", "owned-cookie-csrf")
+    headers = {"X-CSRF-Token": "owned-cookie-csrf", "Origin": "https://composition.test"}
+    opened = await b.client.post(path, json={}, headers=headers)
+    assert opened.status_code == 200, opened.text
+    view = f'/api/mcp/apps/views/{opened.json()["view_id"]}'
+    call = view + "/tools/call?session_id=original-chat"
+    body = {"name": "app_mutate", "arguments": {"text": "cookie-app-once"}}
+    assert (await b.client.post(call, json=body,
+        headers={**headers, "Origin": "https://foreign.test"})).status_code == 403
+    assert mcp_http_server.witness == ["initial-once"]
+    assert (await b.client.post(call, json=body, headers=headers)).status_code == 200
+    assert (await b.client.delete(view + "?session_id=original-chat")).status_code == 403
+    assert (await b.client.delete(view + "?session_id=original-chat", headers=headers)).status_code == 200
+    assert mcp_http_server.witness == ["initial-once", "cookie-app-once"]

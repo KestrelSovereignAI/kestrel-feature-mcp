@@ -365,7 +365,7 @@ async def test_gateway_load_reports_tools_evicted_by_host_capacity(monkeypatch, 
     feature._mount_gateway_tools = lambda: 0
     feature._reject_unknown_servers = AsyncMock(return_value=None)
     monkeypatch.setattr("kestrel_feature_mcp.feature.check_docker_mcp_available", lambda: True)
-    monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", lambda: gateway)
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", lambda *, connection_factory: gateway)
     result = await feature.load_tool("time") if operation == "load" else await feature.gateway_start("time")
     assert result.status is ToolResultStatus.PARTIAL
     assert result.data["mounted"] == 0

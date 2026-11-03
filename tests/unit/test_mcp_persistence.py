@@ -233,7 +233,7 @@ async def test_gateway_reports_requests_and_observed_tools_without_invented_read
     gateway = MagicMock()
     gateway.start = AsyncMock(return_value=[SimpleNamespace(name="fetch")])
     gateway.gateway = SimpleNamespace(requested_servers={"fetch", "sqlite"})
-    monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", lambda: gateway)
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", lambda *, connection_factory: gateway)
     feature = _feature(manager=MagicMock())
     feature._reject_unknown_servers = AsyncMock(return_value=None)
     feature._mount_gateway_tools = MagicMock(return_value=1)

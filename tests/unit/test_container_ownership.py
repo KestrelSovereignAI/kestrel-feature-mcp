@@ -137,7 +137,7 @@ async def test_first_container_use_binds_the_initialized_hosts_identity(monkeypa
     assert feature.manager is None
     feature.agent.agent_id = "did:test:changed-after-initialization"
     assert await feature._ensure_container_manager()
-    create.assert_awaited_once_with(owner_did="did:test:host-agent")
+    create.assert_awaited_once_with(owner_did="did:test:host-agent", connection_factory=feature._new_mcp_connection)
     assert feature.manager is manager
 
 

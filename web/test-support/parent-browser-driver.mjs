@@ -7,6 +7,9 @@ try {
     await page.waitForFunction(() => window.nativeParentReady).catch(error => {
         throw new Error(`Core parent startup failed: ${JSON.stringify(errors)}`, { cause: error });
     });
+    await expect(page.locator('iframe')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Open App', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Open App', exact: true }).click();
     const frames = page.frameLocator('iframe[title="MCP App"]').frameLocator('iframe');
     await expect(frames.locator('#native-result')).toHaveText('{"view":"only"}');
     expect(await page.locator('body').innerText()).not.toContain('"view":"only"');
@@ -17,6 +20,10 @@ try {
     await expect(frames.locator('#native-result')).toHaveText('native-call:{"view":"only"}');
     await frames.getByRole('button', { name: 'Try model-only tool' }).click();
     await expect(frames.locator('#native-result')).toHaveText('model-only-refused');
+    await page.getByRole('button', { name: 'Close App', exact: true }).click();
+    await expect(page.locator('iframe')).toHaveCount(0);
+    await page.getByRole('button', { name: 'Open App', exact: true }).click();
+    await expect(frames.locator('#native-result')).toHaveText('{"view":"only"}');
     await page.evaluate(() => window.leaveChat());
     await expect(page.locator('iframe')).toHaveCount(0);
     await page.evaluate(() => window.returnToChat());
@@ -27,5 +34,5 @@ try {
     expect(errors).toEqual([]);
     process.stdout.write(JSON.stringify({ native_app_ready: true, governed_call: true,
         model_only_refused: true, catalog_filtered: true, opaque_view: true,
-        navigation_closed: true, reopened: true, dom_retired: true }) + '\n');
+        explicit_open_close: true, navigation_closed: true, reopened: true, dom_retired: true }) + '\n');
 } finally { await browser.close(); }
