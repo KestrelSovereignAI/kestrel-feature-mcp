@@ -2,14 +2,17 @@
 
 from contextlib import ExitStack
 import hashlib
-from http.client import RemoteDisconnected
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
 import json
 from pathlib import Path
 import shutil
+import socket
+import struct
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -32,7 +35,65 @@ def owned_container(cleanup, *arguments):
     return container
 
 
+def wait_until_ready(opener, origin, require_owner, timeout=30):
+    deadline = time.monotonic() + timeout
+    while True:
+        require_owner()
+        try:
+            with opener.open(origin + "/health", timeout=1) as response:
+                assert response.status == 200
+            return
+        except urllib.error.HTTPError as error:
+            error.close()
+            raise
+        except (urllib.error.URLError, TimeoutError, ConnectionResetError):
+            if time.monotonic() >= deadline:
+                raise AssertionError("Owned sandbox container did not become ready")
+            time.sleep(0.05)
+
+
+def verify_readiness_errors():
+    for status in (200, 503):
+        class Peer(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.server.attempts += 1
+                if status == 200 and self.server.attempts == 1:
+                    self.close_connection = True
+                    self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                    self.connection.close()
+                    return
+                self.send_response(status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Peer)
+        server.attempts = 0
+        worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        worker.start()
+
+        def require_owner():
+            assert worker.is_alive()
+
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            try:
+                wait_until_ready(opener, "http://127.0.0.1:" + str(server.server_port), require_owner, timeout=2)
+            except urllib.error.HTTPError as error:
+                assert status == 503 and error.code == 503
+            else:
+                assert status == 200
+            assert server.attempts == (2 if status == 200 else 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join()
+
+
 def main():
+    verify_readiness_errors()
     generated = set(json.loads((ASSETS / "manifest.json").read_text())["assets"])
     generated.add("manifest.json")
     assert generated == {"sandbox-entry.js", "sandbox-service.mjs", "parent-entry.js",
@@ -66,7 +127,7 @@ def main():
 
         image = "kestrel-mcp-sandbox-owned:" + suffix
         docker("build", "--quiet", "--tag", image, "--file",
-               "docker/Dockerfile.apps-sandbox", str(context))
+               str(context / "docker/Dockerfile.apps-sandbox"), str(context))
         cleanup.callback(docker, "image", "rm", image)
         image_info = json.loads(docker("image", "inspect", image))[0]
         assert image_info["Config"]["User"] == "node"
@@ -78,6 +139,9 @@ def main():
             license_path = "usr/share/licenses/kestrel-mcp-apps/LICENSE"
             assert license_path in archive.getnames(), "Sandbox image is missing its project license"
             assert archive.extractfile(license_path).read() == (ROOT / "LICENSE").read_bytes()
+            for item in archive.getmembers():
+                if item.name == "app" or item.name.startswith("app/"):
+                    assert item.uid == 0 and not item.mode & 0o022, item.name
             files = {item.name.removeprefix("app/"): archive.extractfile(item).read()
                      for item in archive if item.isfile() and item.name.startswith("app/")}
         assert set(files) == generated
@@ -98,20 +162,12 @@ def main():
         binding, = info["NetworkSettings"]["Ports"]["8080/tcp"]
         origin = "http://127.0.0.1:" + binding["HostPort"]
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        deadline = time.monotonic() + 30
-        while True:
+
+        def require_container():
             state = json.loads(docker("inspect", running))[0]["State"]
             assert state["Running"], docker("logs", running)
-            try:
-                with opener.open(origin + "/health", timeout=1) as response:
-                    assert response.status == 200
-                break
-            except urllib.error.HTTPError:
-                raise
-            except (urllib.error.URLError, TimeoutError, RemoteDisconnected):
-                if time.monotonic() >= deadline:
-                    raise AssertionError("Owned sandbox container did not become ready")
-                time.sleep(0.05)
+
+        wait_until_ready(opener, origin, require_container)
         for path in ("/proxy", "/sandbox-entry.js", "/config", "/health", "/THIRD_PARTY_NOTICES.txt"):
             with opener.open(origin + path, timeout=3) as response:
                 assert response.status == 200
@@ -148,7 +204,9 @@ def main():
         print(json.dumps({"image": image_info["Id"], "user": "node", "context_files": len(inventory),
                           "verified_assets": {n: hashlib.sha256(b).hexdigest() for n, b in files.items()},
                           "public_routes": 5, "credential_refusals": 15, "tamper_refused": True,
-                          "unstartable_container_owned": True, "project_license_preserved": True}))
+                          "unstartable_container_owned": True, "project_license_preserved": True,
+                          "startup_reset_retried": True, "http_failure_not_retried": True,
+                          "assets_root_owned": True}))
 
 
 if __name__ == "__main__":

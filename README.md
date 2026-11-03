@@ -487,7 +487,8 @@ docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges \
   --publish 127.0.0.1:8090:8090 kestrel-mcp-apps-sandbox
 ```
 
-Use the listener port from your explicit JSON configuration. The image follows
+Set `listen.host` to `0.0.0.0` in the container's JSON configuration and publish
+its configured listener port. The image follows
 maintained Node LTS, runs as a non-root user and includes the five verified
 sandbox assets and project license. Its build context excludes source, Git
 metadata and host configuration. Mount no host identity files or credentials,
