@@ -139,6 +139,11 @@ def main():
             license_path = "usr/share/licenses/kestrel-mcp-apps/LICENSE"
             assert license_path in archive.getnames(), "Sandbox image is missing its project license"
             assert archive.extractfile(license_path).read() == (ROOT / "LICENSE").read_bytes()
+            for path in (license_path, "usr/share/licenses/kestrel-mcp-apps"):
+                item = archive.getmember(path)
+                assert item.uid == 0 and not item.mode & 0o022, (
+                    f"Project license path must stay root-owned and not writable by the runtime user: {path}"
+                )
             for item in archive.getmembers():
                 if item.name == "app" or item.name.startswith("app/"):
                     assert item.uid == 0 and not item.mode & 0o022, item.name
