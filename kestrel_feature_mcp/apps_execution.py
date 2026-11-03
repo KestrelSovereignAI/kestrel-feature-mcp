@@ -7,6 +7,7 @@ identity and agent membership belong to the authenticated host controller.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from inspect import (
 )
 from types import MappingProxyType
 from typing import Callable, Mapping, TYPE_CHECKING
+from weakref import WeakSet
 
 from mcp import types
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
@@ -84,6 +86,17 @@ class AppView:
     _owner_is_current: Callable[[], bool] = field(repr=False)
     _closed: bool = field(default=False, init=False)
     _calls: set[asyncio.Task] = field(default_factory=set, init=False, repr=False)
+    _delivery_tasks: dict[asyncio.Task, asyncio.Future] = field(default_factory=dict, init=False, repr=False)
+    _cancelled_calls: WeakSet[asyncio.Task] = field(default_factory=WeakSet, init=False, repr=False)
+
+    @property
+    def is_closed(self) -> bool:
+        """Lifecycle state only; this observation confers no View authority."""
+        return self._closed
+
+    @property
+    def _pending_count(self) -> int:
+        return len(self._calls) + len(self._delivery_tasks)
 
     def require_current(self) -> None:
         if self._closed:
@@ -129,7 +142,7 @@ class AppView:
     async def _run_owned(self, operation, *, name: str,
                          revoked_outcome: Callable[[], BaseException] | None = None):
         self.require_current()
-        if len(self._calls) >= self.executor._max_pending_calls:
+        if self._pending_count >= self.executor._max_pending_calls:
             raise ResourceConflict("MCP App View reached its pending-call limit")
         call = asyncio.create_task(operation(), name=name)
         self._calls.add(call)
@@ -162,15 +175,67 @@ class AppView:
         if self._closed:
             return
         object.__setattr__(self, "_closed", True)
-        for call in tuple(self._calls):
-            if not call.done():
-                call.cancel()
+        for call in (*self._calls, *self._delivery_tasks):
+            self._cancel_call(call)
+
+    def _cancel_call(self, call: asyncio.Task) -> None:
+        if not call.done() and call not in self._cancelled_calls:
+            self._cancelled_calls.add(call)
+            call.cancel()
+
+    @asynccontextmanager
+    async def borrow_delivery(self):
+        """Retain the original physical response task in this View's custody.
+
+        The authenticated host enters this on its actual ASGI send child, never
+        on a buffering middleware's acknowledgement. It checks before and after
+        that send. A closed View cancels once and joins this same native owner.
+        """
+        self.require_current()
+        task = asyncio.current_task()
+        if (task is None or task.cancelling() or task in self._calls or task in self._delivery_tasks
+                or self._pending_count >= self.executor._max_pending_calls):
+            raise ResourceConflict("MCP App cannot admit this response delivery")
+        settled = asyncio.get_running_loop().create_future()
+        self._delivery_tasks[task] = settled
+        active = True
+        failure = None
+
+        def current():
+            if (not active or asyncio.current_task() is not task
+                    or self._delivery_tasks.get(task) is not settled):
+                raise ResourceConflict("MCP App response delivery ended or changed owner")
+            self.require_current()
+
+        try:
+            yield current
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            active = False
+            self._delivery_tasks.pop(task, None)
+            self._cancelled_calls.discard(task)
+            # Join the original transport borrow, never unrelated later work
+            # performed by the host's reusable task. Store the outcome as a
+            # value so an unobserved error cannot escape through Future GC.
+            settled.set_result(failure)
+
+    def cancel_delivery(self, task: asyncio.Task) -> None:
+        """Cancel only an original delivery child, at most once."""
+        if task not in self._delivery_tasks:
+            raise ResourceConflict("MCP App response belongs to another View")
+        self._cancel_call(task)
 
     async def close(self) -> None:
         """Join pending approvals, effects and their required Core audit writes."""
+        if (asyncio.current_task() in self._calls
+                or asyncio.current_task() in self._delivery_tasks):
+            raise ResourceConflict("MCP App View must be closed by its external lifetime owner")
         self.revoke()
         calls = tuple(self._calls)
-        pending = set(calls)
+        deliveries = tuple(self._delivery_tasks.values())
+        pending = {*calls, *deliveries}
         cancellation = None
         while pending:
             try:
@@ -181,6 +246,9 @@ class AppView:
                 cancellation = error
         failures = [call.exception() for call in calls if not call.cancelled()
                     and call.exception() is not None]
+        failures.extend(delivery.result() for delivery in deliveries
+                        if delivery.result() is not None
+                        and not isinstance(delivery.result(), asyncio.CancelledError))
         if cancellation is not None:
             if not failures:
                 raise cancellation
@@ -191,6 +259,8 @@ class AppView:
 
 class AppExecutor:
     """Per-feature admission context; source strings never confer authority."""
+
+    supports_owned_delivery = True
 
     def __init__(self, *, host: DeferredToolResultHost, max_pending_calls: int,
                  initial_publisher: InitialAppPublisher | None = None):

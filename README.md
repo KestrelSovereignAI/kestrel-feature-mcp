@@ -301,7 +301,7 @@ done
 Update the pinned harness and lock together, rerun the profile, and review
 new required scenarios as the remaining host capabilities land.
 
-## MCP Apps components (0.10.0)
+## MCP Apps components (0.10.x)
 
 The MCP Apps host is under development in #3679. Version 0.8.0 introduced the native
 tool contracts, bounded resources, governed App execution and standalone sandbox
@@ -383,6 +383,25 @@ including control errors and cancellation; the drain never reports success.
 On unplanned connection loss, retire the owner and drain promptly so stale
 results and Views do not keep holding capacity. Retire or replace a fenced
 owner to release its retained wrapper and binding references.
+
+From 0.10.1, physical HTTP response children use
+`AppView.borrow_delivery()` through their actual transport send, checking the
+yielded guard before and after delivery. `cancel_delivery()` cancels an original
+child at most once; View retirement joins it alongside approvals and calls.
+Cancellation authority ends with each borrow. Retirement joins the borrow's
+settlement, not unrelated later work on the host's task. A task cannot close its
+own borrowed View; its external lifetime owner must close it.
+`AppExecutor.supports_owned_delivery is True` identifies this host contract;
+`AppView.is_closed` is lifecycle state and grants no access.
+On a privacy or other host policy transition, `withdraw_publications()` erases
+private associations and fences every View synchronously; then drain retired
+work. This leaves the original tool registrations available for new policy-bound
+results and never reopens an old private result. Withdrawal does not cancel an
+initial chat tool that has already run: the host's `publication_owner` must
+compare the original turn's privacy-policy epoch with the current epoch after
+the required audit. It must refuse a staged result from a previous epoch, even
+if the host has since returned to the same privacy mode. A fresh caller or a
+current mode check alone cannot renew that original turn's publication rights.
 Each registration needs fresh tool wrappers, so a result staged before an audit
 await cannot be reassociated with a replacement registration of the same object.
 No Apps capability is advertised until those host integrations are present.

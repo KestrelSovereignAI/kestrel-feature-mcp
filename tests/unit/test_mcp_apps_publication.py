@@ -100,6 +100,23 @@ async def publish(peer, registry, *, text="once", chat="original-chat", caller=A
     return part["data"]["reference"], result
 
 
+@pytest.mark.asyncio
+async def test_host_policy_withdrawal_erases_private_results_without_retargeting_tools(app_boundary, publications, mcp_http_server):
+    registry, _, _ = publications
+    reference, _ = await publish(app_boundary, registry, text="old-policy")
+    with caller_context_scope(ALICE):
+        view = registry.open_view(reference)
+        registry.withdraw_publications()
+        assert view.is_closed and not registry._publications
+        with pytest.raises(ResourceConflict, match="unavailable"):
+            registry.open_view(reference)
+        await registry.drain_retired()
+        fresh, _ = await publish(app_boundary, registry, text="new-policy")
+        fresh_view = registry.open_view(fresh)
+        assert registry.initial_result(fresh, fresh_view)[0] == {"text": "new-policy"}
+    assert mcp_http_server.witness == ["old-policy", "new-policy"]
+
+
 def replace_core_registration(peer, *, reuse_wrappers=False):
     wrappers = [item.tool if reuse_wrappers else MCPToolWrapper(handle_name=item.binding.name,
         tool=item.tool.native_tool, caller=item.tool.bound_caller, app_executor=peer.executor)
