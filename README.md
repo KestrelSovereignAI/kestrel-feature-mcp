@@ -301,7 +301,7 @@ done
 Update the pinned harness and lock together, rerun the profile, and review
 new required scenarios as the remaining host capabilities land.
 
-## MCP Apps components (0.10.0)
+## MCP Apps components (0.10.x)
 
 The MCP Apps host is under development in #3679. Version 0.8.0 introduced the native
 tool contracts, bounded resources, governed App execution and standalone sandbox

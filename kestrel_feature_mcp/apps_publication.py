@@ -95,6 +95,8 @@ class AppPublications:
     must independently authenticate the current reader and check that original
     principal AND chat on every call; it returns None or raises. These functions
     are trusted host integrations, never supplied by a tool, part or request DTO.
+    The publisher must also reject a result staged under a previous turn's
+    policy epoch; withdrawing current associations cannot renew in-flight work.
     """
 
     def __init__(
@@ -191,6 +193,8 @@ class AppPublications:
 
         Original tool registrations remain registered. The host must join
         ``drain_retired()`` before retiring their connections or feature owner.
+        Its publication_owner must separately refuse staged initial results
+        whose original turn policy epoch changed, even after a mode round-trip.
         """
         for reference, publication in tuple(self._publications.items()):
             self._discard(reference, publication)
