@@ -57,6 +57,11 @@ class MCPAppsFeatureMixin:
         if not isinstance(config, dict) or set(config) - {"apps"}:
             raise ValueError("MCP configuration accepts only Apps host settings")
         settings = AppsSettings.model_validate(deepcopy(config.get("apps", {})))
+        if settings.enabled:
+            validate = getattr(self.agent, "validate_mcp_apps_host_configuration", None)
+            if getattr(self.agent, "supports_mcp_apps_host", None) is not True or not callable(validate):
+                raise TypeError("MCP Apps require Core's authenticated physical View host")
+            settings = settings.model_copy(update={"host": validate(settings.host)})
         if settings == self._apps_settings:
             if settings.enabled and self._apps_host is None:
                 self._start_apps()

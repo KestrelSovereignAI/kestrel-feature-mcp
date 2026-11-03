@@ -1,5 +1,4 @@
 import { AppBridge, buildAllowAttribute } from '@modelcontextprotocol/ext-apps/app-bridge';
-import { ListToolsRequestSchema } from '@modelcontextprotocol/core';
 import { OriginBoundTransport } from './origin-transport.js';
 import { approveSandboxPolicy } from './sandbox-proxy.js';
 
@@ -64,6 +63,9 @@ export function mountMCPApp({ root, reference, sessionId, request, isCurrentChat
         viewId = initial.view_id;
         if (retired) return;
         current();
+        if (initial.host_origin !== eventWindow.location.origin) {
+            throw new TypeError('The App host origin does not match this console');
+        }
         const sandboxUrl = new URL(initial.sandbox_url);
         if (sandboxUrl.username || sandboxUrl.password || sandboxUrl.search || sandboxUrl.hash
             || sandboxUrl.origin === eventWindow.location.origin
@@ -87,15 +89,15 @@ export function mountMCPApp({ root, reference, sessionId, request, isCurrentChat
             }
             const result = await request(viewPath() + '/tools/call' + query, {
                 method: 'POST', body: JSON.stringify({ name: params.name, arguments: params.arguments ?? {} }),
-                signal: AbortSignal.any([calls.signal, extra.signal]),
+                signal: AbortSignal.any([calls.signal, extra.mcpReq.signal]),
             });
             current();
             return result;
         };
-        bridge.setRequestHandler(ListToolsRequestSchema, async (_params, extra) => {
+        bridge.setRequestHandler('tools/list', async (_params, extra) => {
             current();
             const result = await request(viewPath() + '/tools' + query, {
-                signal: AbortSignal.any([calls.signal, extra.signal]),
+                signal: AbortSignal.any([calls.signal, extra.mcpReq.signal]),
             });
             current(); return result;
         });

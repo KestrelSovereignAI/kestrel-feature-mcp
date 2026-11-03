@@ -24,7 +24,7 @@ from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
 from kestrel_sovereign.security.request_auth import (
-    InteractiveAuthenticationLifetimeMiddleware, RequestAuthenticationService,
+    AuthenticatedSessionMiddleware, InteractiveAuthenticationLifetimeMiddleware, RequestAuthenticationService,
 )
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
@@ -36,6 +36,7 @@ from tests.unit.test_mcp_core_registry import CoreRegistryHost
 
 @dataclass
 class AppsBoundary:
+    app: object
     feature: MCPAgent
     agent: KestrelAgent
     connection: object
@@ -71,12 +72,14 @@ async def test_apps_are_explicitly_disabled_and_unsupported_host_fails_clearly()
     assert feature.get_router() is None and feature.get_ui_contributions() is None
     with pytest.raises(TypeError, match="authenticated physical View host"):
         await feature.set_config({"apps": {"enabled": True}})
+    assert (await feature.get_config())["apps"]["enabled"] is False
 
 
 @pytest_asyncio.fixture
-async def native_apps_host(mcp_http_server, tmp_path, monkeypatch):
+async def native_apps_host(mcp_http_server, tmp_path, monkeypatch, apps_sandbox_url, apps_host_origin):
     key = "owned-mcp-composition-api-key"
     monkeypatch.setenv("KESTREL_API_KEY", key)
+    monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     async with AsyncExitStack() as owned:
         agent = KestrelAgent(did="did:test:mcp-apps-composition", storage_path=str(tmp_path / "agent.db"),
@@ -101,7 +104,7 @@ async def native_apps_host(mcp_http_server, tmp_path, monkeypatch):
         await feature.initialize()
         owned.push_async_callback(feature.shutdown)
         await feature.set_config({"apps": {"enabled": True,
-            "host": {"sandbox_url": "https://sandbox.composition.test/"}}})
+            "host": {"sandbox_url": apps_sandbox_url, "host_origin": apps_host_origin}}})
         connection = feature._new_mcp_connection(mcp_http_server.url)
         tools = await connection.connect()
         owned.push_async_callback(connection.close)
@@ -117,6 +120,8 @@ async def native_apps_host(mcp_http_server, tmp_path, monkeypatch):
             api_key=lambda: server.get_api_key(generate_if_missing=False))
         app.add_middleware(InteractiveAuthenticationLifetimeMiddleware)
         app.middleware("http")(server.auth_middleware)
+        app.add_middleware(AuthenticatedSessionMiddleware, secret_key="owned-apps-session-signing-key",
+                           session_cookie="kestrel_session", max_age=600)
         app.add_middleware(PrivateDeliveryMiddleware)
         app.include_router(feature.get_router())
 
@@ -127,7 +132,7 @@ async def native_apps_host(mcp_http_server, tmp_path, monkeypatch):
 
         client = await owned.enter_async_context(httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app),
             base_url="https://composition.test", headers={"X-API-Key": key}))
-        yield AppsBoundary(feature, agent, connection, client, backend, permissions, queue, requests)
+        yield AppsBoundary(app, feature, agent, connection, client, backend, permissions, queue, requests)
 
 
 @pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True, "apps_execution_tools": True,
@@ -193,3 +198,20 @@ async def test_unmount_and_connection_close_cancel_pending_approval_without_nati
     finally:
         b.queue.cancel_all()
         await asyncio.gather(call, return_exceptions=True)
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True, "apps_execution_tools": True,
+    "app_mutate_visibility": ["model", "app"]}], indirect=True)
+@pytest.mark.asyncio
+async def test_invalid_reconfiguration_preserves_the_current_host_and_copied_settings(native_apps_host):
+    b = native_apps_host
+    await b.connection.close()
+    original = b.feature._apps_host
+    configuration = await b.feature.get_config()
+    changed = await b.feature.get_config()
+    changed["apps"]["host"]["sandbox_url"] = "javascript:invalid"
+    assert await b.feature.get_config() == configuration
+    with pytest.raises(ValueError):
+        await b.feature.set_config(changed)
+    assert b.feature._apps_host is original and not original.retired
+    assert await b.feature.get_config() == configuration

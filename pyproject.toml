@@ -48,6 +48,7 @@ packages = ["kestrel_feature_mcp"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
+    "apps_browser: native Core chat and MCP Apps browser integration",
     "docker: tests that require Docker",
     "docker_mcp: tests that require Docker MCP Toolkit",
 ]

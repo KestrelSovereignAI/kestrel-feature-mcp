@@ -10,10 +10,10 @@ registerRenderer({
             || !/^[A-Za-z0-9_-]{43}$/.test(data.reference)
             || typeof data.session_id !== 'string' || data.session_id !== context.sessionId
             || typeof context.isCurrentChat !== 'function') return '<p>App unavailable for this conversation.</p>';
-        return '<div data-mcp-app-reference="' + data.reference + '"><button type="button">Open App</button></div>';
+        return '<div class="mcp-app-view"><button type="button" value="' + data.reference + '">Open App</button></div>';
     },
     mount(root, context) {
-        const container = root.querySelector('[data-mcp-app-reference]');
+        const container = root.querySelector('.mcp-app-view');
         if (!container) return;
         const button = container.querySelector('button');
         let view, retired = false;
@@ -29,7 +29,7 @@ registerRenderer({
         function open() {
             if (retired || view || !context.isCurrentChat()) return;
             button.disabled = true;
-            view = mountMCPApp({ root: container, reference: container.dataset.mcpAppReference,
+            view = mountMCPApp({ root: container, reference: button.value,
                 sessionId: context.sessionId, isCurrentChat: context.isCurrentChat,
                 request: (path, options = {}) => API.requestForAgent(path,
                     { ...options, credentials: 'same-origin' }, context.ownerAgent, true),

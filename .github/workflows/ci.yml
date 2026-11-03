@@ -153,6 +153,11 @@ jobs:
       - name: Verify the installed public sandbox and credential boundary
         run: |
           "$RUNNER_TEMP/mcp-apps-install/bin/python" -I tests/packaging/sandbox_installed.py --node "$(command -v node)"
+      - name: Verify native Apps through the Core chat and governed HTTP host
+        run: |
+          uv sync --locked --extra test --python 3.14
+          uv run --no-sync python -m pytest tests/browser/test_parent_bridge.py -q --timeout=60
+        timeout-minutes: 5
 
   install-check:
     runs-on: ubuntu-latest
@@ -233,5 +238,5 @@ jobs:
           uv venv --python ${{ env.PYTHON_VERSION }} .venv
           . .venv/bin/activate
           uv pip install -e '.[test]'
-          uv run --no-sync pytest tests/ -v --tb=short -m "not docker and not docker_mcp"
+          uv run --no-sync pytest tests/ -v --tb=short -m "not docker and not docker_mcp and not apps_browser"
         timeout-minutes: 10
