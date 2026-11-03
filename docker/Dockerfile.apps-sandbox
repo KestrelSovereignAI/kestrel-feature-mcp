@@ -4,12 +4,12 @@ FROM node:lts-bookworm-slim
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /app
-COPY kestrel_feature_mcp/apps_sandbox/sandbox-entry.js \
+COPY --chmod=0444 kestrel_feature_mcp/apps_sandbox/sandbox-entry.js \
     kestrel_feature_mcp/apps_sandbox/sandbox-service.mjs \
     kestrel_feature_mcp/apps_sandbox/parent-entry.js \
     kestrel_feature_mcp/apps_sandbox/THIRD_PARTY_NOTICES.txt \
     kestrel_feature_mcp/apps_sandbox/manifest.json ./
-COPY LICENSE /usr/share/licenses/kestrel-mcp-apps/LICENSE
+COPY --chmod=0444 LICENSE /usr/share/licenses/kestrel-mcp-apps/LICENSE
 
 USER node
 ENTRYPOINT ["node", "/app/sandbox-service.mjs"]
