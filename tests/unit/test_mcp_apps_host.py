@@ -201,6 +201,8 @@ async def test_unmount_and_connection_close_cancel_pending_approval_without_nati
             await b.feature._apps_host.maintain()
         else:
             await b.connection.close()
+        assert "mcp:composition" not in b.feature._apps_publications._batches
+        assert not b.feature._apps_publications._views
         response = await asyncio.wait_for(call, 5)
         assert response.status_code == 404, response.text
         decision = await b.queue.submit_decision(approval.id, True, scope="once")
