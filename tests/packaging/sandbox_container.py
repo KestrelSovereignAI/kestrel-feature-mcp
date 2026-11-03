@@ -26,6 +26,12 @@ def docker(*arguments, **kwargs):
     return result.stdout
 
 
+def owned_container(cleanup, *arguments):
+    container = docker("create", *arguments).decode().strip()
+    cleanup.callback(docker, "container", "rm", "--force", container)
+    return container
+
+
 def main():
     generated = set(json.loads((ASSETS / "manifest.json").read_text())["assets"])
     generated.add("manifest.json")
@@ -50,13 +56,12 @@ def main():
         docker("build", "--quiet", "--tag", probe_image, "--file", "-", str(context),
                input=b"FROM scratch\nCOPY . /inventory/\n")
         cleanup.callback(docker, "image", "rm", probe_image)
-        probe = docker("create", probe_image, "/never-run").decode().strip()
-        cleanup.callback(docker, "container", "rm", "--force", probe)
+        probe = owned_container(cleanup, probe_image, "/never-run")
         with tarfile.open(fileobj=io.BytesIO(docker("export", probe))) as archive:
             inventory = {item.name.removeprefix("inventory/") for item in archive
                          if item.isfile() and item.name.startswith("inventory/")}
         expected = {"kestrel_feature_mcp/apps_sandbox/" + name for name in generated}
-        expected.add("docker/Dockerfile.apps-sandbox")
+        expected.update({"docker/Dockerfile.apps-sandbox", "LICENSE"})
         assert inventory == expected, inventory ^ expected
 
         image = "kestrel-mcp-sandbox-owned:" + suffix
@@ -65,11 +70,14 @@ def main():
         cleanup.callback(docker, "image", "rm", image)
         image_info = json.loads(docker("image", "inspect", image))[0]
         assert image_info["Config"]["User"] == "node"
+        assert image_info["Config"]["Labels"]["org.opencontainers.image.licenses"] == "Apache-2.0"
         assert not any(name.split("=", 1)[0].startswith(("KESTREL_", "GOOGLE_", "OPENAI_", "AWS_"))
                        for name in image_info["Config"]["Env"])
-        container = docker("create", image).decode().strip()
-        cleanup.callback(docker, "container", "rm", "--force", container)
+        container = owned_container(cleanup, image)
         with tarfile.open(fileobj=io.BytesIO(docker("export", container))) as archive:
+            license_path = "usr/share/licenses/kestrel-mcp-apps/LICENSE"
+            assert license_path in archive.getnames(), "Sandbox image is missing its project license"
+            assert archive.extractfile(license_path).read() == (ROOT / "LICENSE").read_bytes()
             files = {item.name.removeprefix("app/"): archive.extractfile(item).read()
                      for item in archive if item.isfile() and item.name.startswith("app/")}
         assert set(files) == generated
@@ -84,8 +92,8 @@ def main():
         runtime = ["--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                    "--pids-limit=64", "--memory=256m", "--cpus=1",
                    "--mount", f"type=bind,source={config},target=/etc/kestrel-mcp-apps/sandbox.json,readonly"]
-        running = docker("run", "--detach", *runtime, "--publish", "127.0.0.1::8080", image).decode().strip()
-        cleanup.callback(docker, "container", "rm", "--force", running)
+        running = owned_container(cleanup, *runtime, "--publish", "127.0.0.1::8080", image)
+        docker("start", running)
         info = json.loads(docker("inspect", running))[0]
         binding, = info["NetworkSettings"]["Ports"]["8080/tcp"]
         origin = "http://127.0.0.1:" + binding["HostPort"]
@@ -122,19 +130,25 @@ def main():
         with opener.open(origin + "/config", timeout=3) as response:
             assert json.load(response) == configuration["sandbox"]
 
+        unstartable = owned_container(cleanup, *runtime, "--entrypoint", "/missing-owned-sandbox-node", image)
+        failed_start = subprocess.run(["docker", "start", unstartable], capture_output=True, timeout=10)
+        assert failed_start.returncode != 0
+        assert b"/missing-owned-sandbox-node" in failed_start.stderr
+        assert not json.loads(docker("inspect", unstartable))[0]["State"]["Running"]
+
         tampered = folder / "sandbox-entry.js"
         tampered.write_bytes((ASSETS / "sandbox-entry.js").read_bytes() + b"\n// corrupted\n")
         tampered.chmod(0o644)
-        corrupted = docker("create", *runtime, "--mount",
-            f"type=bind,source={tampered},target=/app/sandbox-entry.js,readonly", image).decode().strip()
-        cleanup.callback(docker, "container", "rm", "--force", corrupted)
+        corrupted = owned_container(cleanup, *runtime, "--mount",
+            f"type=bind,source={tampered},target=/app/sandbox-entry.js,readonly", image)
         failure = subprocess.run(["docker", "start", "--attach", corrupted], capture_output=True, timeout=10)
         state = json.loads(docker("inspect", corrupted))[0]["State"]
         assert not state["Running"] and state["ExitCode"] != 0
         assert b"Sandbox packaged asset failed integrity verification: sandbox-entry.js" in failure.stderr + failure.stdout
         print(json.dumps({"image": image_info["Id"], "user": "node", "context_files": len(inventory),
                           "verified_assets": {n: hashlib.sha256(b).hexdigest() for n, b in files.items()},
-                          "public_routes": 5, "credential_refusals": 15, "tamper_refused": True}))
+                          "public_routes": 5, "credential_refusals": 15, "tamper_refused": True,
+                          "unstartable_container_owned": True, "project_license_preserved": True}))
 
 
 if __name__ == "__main__":

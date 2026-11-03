@@ -488,10 +488,11 @@ docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges \
 ```
 
 Use the listener port from your explicit JSON configuration. The image follows
-maintained Node LTS, runs as a non-root user and contains only the five verified
-sandbox assets. Its build context excludes source, Git metadata and host
-configuration. Mount no host identity files or credentials, and expose the
-service through a separate HTTPS origin. Startup refuses corrupted assets.
+maintained Node LTS, runs as a non-root user and includes the five verified
+sandbox assets and project license. Its build context excludes source, Git
+metadata and host configuration. Mount no host identity files or credentials,
+and expose the service through a separate HTTPS origin. Startup refuses
+corrupted assets.
 
 The source of the bundled assets is `web/`, its npm lock and the unchanged
 official SDK packages. Regenerate the checked-in bundles and original license

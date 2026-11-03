@@ -1,6 +1,7 @@
 # Public MCP Apps sandbox, independent of the authenticated agent host.
 # Follow the maintained Node LTS used by the browser/service CI lane.
 FROM node:lts-bookworm-slim
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /app
 COPY --chown=node:node kestrel_feature_mcp/apps_sandbox/sandbox-entry.js \
@@ -8,6 +9,7 @@ COPY --chown=node:node kestrel_feature_mcp/apps_sandbox/sandbox-entry.js \
     kestrel_feature_mcp/apps_sandbox/parent-entry.js \
     kestrel_feature_mcp/apps_sandbox/THIRD_PARTY_NOTICES.txt \
     kestrel_feature_mcp/apps_sandbox/manifest.json ./
+COPY --chown=node:node LICENSE /usr/share/licenses/kestrel-mcp-apps/LICENSE
 
 USER node
 ENTRYPOINT ["node", "/app/sandbox-service.mjs"]
