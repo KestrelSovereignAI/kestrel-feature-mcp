@@ -10,13 +10,16 @@ from kestrel_feature_mcp.manager import MCPGatewayManager, MCPToolManager
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mcp_http_server", [{"tool_delay": 0.25}], indirect=True)
+@pytest.mark.parametrize("mcp_http_server", [{"tool_delay": 0.25, "list_delay": 0.1}], indirect=True)
 @pytest.mark.parametrize("kind", ["container", "gateway"])
 async def test_call_timeout_uses_the_real_connection(kind, mcp_http_server):
     url = mcp_http_server.url
-    connection = MCPConnection(url, call_timeout=0.05)
+    connection = MCPConnection(url)
     try:
         tools = await connection.connect()
+        # The call budget also covers catalog discovery. Complete bootstrap
+        # before applying the short tool deadline this test exercises.
+        connection._call_timeout = 0.05
         if kind == "container":
             manager = MCPToolManager(owner_did="did:test:manager", docker_client=MagicMock())
             manager.owned_containers["test"] = {"connection": connection, "tools": tools}
