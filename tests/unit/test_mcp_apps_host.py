@@ -55,6 +55,21 @@ class AppsBoundary:
         return reference, opened.json()
 
 
+def apps_application(agent):
+    app = FastAPI()
+    app.state.agent = agent
+    app.state.request_authentication = RequestAuthenticationService(
+        api_key=lambda: server.get_api_key(generate_if_missing=False))
+    app.add_middleware(InteractiveAuthenticationLifetimeMiddleware)
+    app.middleware("http")(server.auth_middleware)
+    app.add_middleware(AuthenticatedSessionMiddleware, secret_key="owned-apps-session-signing-key",
+                       session_cookie="kestrel_session", max_age=600)
+    app.add_middleware(PrivateDeliveryMiddleware)
+    server._mount_feature_ui_assets(app)
+    server._mount_feature_routers(app)
+    return app
+
+
 @pytest.mark.parametrize("settings", [
     {"enabled": "true"}, {"max_views": True}, {"retention_seconds": float("inf")},
     {"maintenance_seconds": 0}, {"max_views": 2, "max_views_per_owner": 3},
@@ -114,16 +129,7 @@ async def native_apps_host(mcp_http_server, tmp_path, monkeypatch, apps_sandbox_
         registered = feature._apps_publications._batches["mcp:composition"].tools
         source = next(item for item in registered if item.tool.native_tool.name == "app_mutate")
         await permissions.set_permission("mcp:composition", source.binding.name, PermissionLevel.ALLOW)
-        app = FastAPI()
-        app.state.agent = agent
-        app.state.request_authentication = RequestAuthenticationService(
-            api_key=lambda: server.get_api_key(generate_if_missing=False))
-        app.add_middleware(InteractiveAuthenticationLifetimeMiddleware)
-        app.middleware("http")(server.auth_middleware)
-        app.add_middleware(AuthenticatedSessionMiddleware, secret_key="owned-apps-session-signing-key",
-                           session_cookie="kestrel_session", max_age=600)
-        app.add_middleware(PrivateDeliveryMiddleware)
-        app.include_router(feature.get_router())
+        app = apps_application(agent)
 
         @app.post("/api/owned-turn")
         async def initial(request: Request):
@@ -175,8 +181,11 @@ async def test_soft_reenable_recreates_the_original_declared_apps_host(native_ap
 
 @pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True, "apps_execution_tools": True,
     "app_mutate_visibility": ["model", "app"]}], indirect=True)
+@pytest.mark.parametrize("retirement", ["registration", "connection"])
 @pytest.mark.asyncio
-async def test_unmount_and_connection_close_cancel_pending_approval_without_native_effect(native_apps_host, mcp_http_server):
+async def test_unmount_and_connection_close_cancel_pending_approval_without_native_effect(
+    native_apps_host, mcp_http_server, retirement,
+):
     b = native_apps_host
     _reference, opened = await b.initial_view()
     source = next(item for item in b.feature._apps_publications._batches["mcp:composition"].tools
@@ -187,8 +196,11 @@ async def test_unmount_and_connection_close_cancel_pending_approval_without_nati
     try:
         approval = await asyncio.wait_for(b.requests.get(), 5)
         assert not call.done()
-        b.feature._unmount_tools("mcp:composition")
-        await b.connection.close()
+        if retirement == "registration":
+            b.feature._unmount_tools("mcp:composition")
+            await b.feature._apps_host.maintain()
+        else:
+            await b.connection.close()
         response = await asyncio.wait_for(call, 5)
         assert response.status_code == 404, response.text
         decision = await b.queue.submit_decision(approval.id, True, scope="once")
@@ -215,3 +227,31 @@ async def test_invalid_reconfiguration_preserves_the_current_host_and_copied_set
         await b.feature.set_config(changed)
     assert b.feature._apps_host is original and not original.retired
     assert await b.feature.get_config() == configuration
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True, "apps_execution_tools": True,
+    "app_mutate_visibility": ["model", "app"]}], indirect=True)
+@pytest.mark.asyncio
+async def test_normal_core_mounts_survive_apps_configuration_and_host_replacement(native_apps_host, monkeypatch):
+    b = native_apps_host
+    await b.connection.close()
+    configuration = await b.feature.get_config()
+    await b.feature.set_config({"apps": {"enabled": False}})
+    app = apps_application(b.agent)
+    monkeypatch.setattr(server, "SERVE_UI", True)
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app),
+        base_url="https://composition.test", headers={"X-API-Key": "owned-mcp-composition-api-key"}) as client:
+        asset = "/features/mcpagent/static/parent-entry.js"
+        route = "/api/mcp/apps/views/" + "a" * 43 + "/tools?session_id=original-chat"
+        assert (await client.get(asset)).status_code == 200
+        assert (await client.get(route)).status_code == 404
+        await b.feature.set_config(configuration)
+        enabled = await client.get(route)
+        assert enabled.status_code == 404 and enabled.json() == {"error": {"code": "mcp_app_unavailable"}}
+        original = b.feature._apps_host
+        await b.feature.shutdown()
+        assert (await client.get(route)).status_code == 404
+        await b.feature.initialize()
+        assert b.feature._apps_host is not original
+        replaced = await client.get(route)
+        assert replaced.status_code == 404 and replaced.json() == {"error": {"code": "mcp_app_unavailable"}}

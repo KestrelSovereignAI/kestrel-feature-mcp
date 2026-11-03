@@ -16,7 +16,7 @@ const chat = await import('/js/chat.js');
 const ui = await import('/js/ui.js');
 const { default: api } = await import('/js/api.js');
 const { bus } = await import('/js/ui-ext/bus.js');
-await import('/js/mcp-apps-parent.js');
+await import('/features/mcpagent/static/parent-entry.js');
 const pane = ui.getOrCreateChatPane(null); pane.sessionId = 'original-chat';
 document.body.append(pane.element);
 chat.setChatDeps({ markdown: window.SharedMarkdown });

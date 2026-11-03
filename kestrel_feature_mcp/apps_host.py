@@ -44,6 +44,7 @@ class MCPAppsFeatureMixin:
     def _init_apps(self):
         self._apps_settings = AppsSettings()
         self._apps_host = self._apps_publications = self._apps_maintenance = None
+        self._apps_router = None
 
     @property
     def config_schema(self):
@@ -152,10 +153,14 @@ class MCPAppsFeatureMixin:
         self._apps_host = self._apps_publications = self._apps_maintenance = None
 
     def get_router(self):
-        return self._apps_host.router if self._apps_host is not None else None
+        if getattr(self.agent, "supports_mcp_apps_host", None) is not True:
+            return None
+        if self._apps_router is None:
+            self._apps_router = self.agent.create_mcp_apps_router(self, resolve_host=lambda: self._apps_host)
+        return self._apps_router
 
     def get_ui_contributions(self):
-        if self._apps_host is None:
+        if getattr(self.agent, "supports_mcp_apps_host", None) is not True:
             return None
         return UIContributions(static_dir=str(Path(__file__).with_name("apps_sandbox")),
                                modules=["parent-entry.js"])

@@ -30,7 +30,6 @@ async def test_core_chat_renders_native_apps_and_retires_their_original_views(
         cwd=REPOSITORY, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     host_entry, build_errors = await asyncio.wait_for(build.communicate(), 10)
     assert build.returncode == 0, build_errors.decode()
-    parent_entry = (REPOSITORY / "kestrel_feature_mcp/apps_sandbox/parent-entry.js").read_bytes()
 
     @b.app.get("/")
     async def page():
@@ -39,10 +38,6 @@ async def test_core_chat_renders_native_apps_and_retires_their_original_views(
     @b.app.get("/js/parent-test.js")
     async def host_script():
         return Response(host_entry, media_type="text/javascript")
-
-    @b.app.get("/js/mcp-apps-parent.js")
-    async def feature_script():
-        return Response(parent_entry, media_type="text/javascript")
 
     static = Path(kestrel_sovereign.__file__).parent / "static"
     b.app.mount("/js", StaticFiles(directory=static / "js"))
