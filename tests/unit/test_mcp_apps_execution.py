@@ -789,3 +789,82 @@ async def test_view_cannot_join_its_own_physical_delivery(app_boundary):
             await view.close()
         assert not view.is_closed
     await view.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_borrow_cannot_cancel_task_now_delivering_for_another_view(app_boundary):
+    peer = app_boundary
+    other = peer.executor.open_view(peer.view.source, peer.registered,
+        session_id="another-physical-view", owner_is_current=lambda: True)
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def sender():
+        async with peer.view.borrow_delivery():
+            pass
+        async with other.borrow_delivery():
+            entered.set()
+            await release.wait()
+    child = asyncio.create_task(sender())
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        with pytest.raises(ResourceConflict, match="another View"):
+            peer.view.cancel_delivery(child)
+        assert not child.cancelling()
+    finally:
+        release.set()
+        await asyncio.gather(child, return_exceptions=True)
+        await other.close()
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_borrow_has_its_own_single_cancellation(app_boundary):
+    view = app_boundary.view
+    entered = [asyncio.Event(), asyncio.Event()]
+    cancelled = []
+    async def sender():
+        for index in range(2):
+            async with view.borrow_delivery():
+                entered[index].set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.append(index)
+                    asyncio.current_task().uncancel()
+    child = asyncio.create_task(sender())
+    try:
+        await asyncio.wait_for(entered[0].wait(), 5)
+        view.cancel_delivery(child)
+        await asyncio.wait_for(entered[1].wait(), 5)
+        view.cancel_delivery(child)
+        await asyncio.wait_for(asyncio.shield(child), 1)
+        assert cancelled == [0, 1]
+    finally:
+        if not child.done():
+            child.cancel()
+        await asyncio.gather(child, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_close_joins_only_the_original_borrow_not_later_host_work(app_boundary):
+    view = app_boundary.view
+    entered, left, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    async def sender():
+        async with view.borrow_delivery():
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                asyncio.current_task().uncancel()
+        left.set()
+        await release.wait()
+        raise ValueError("unrelated later host work")
+    child = asyncio.create_task(sender())
+    closer = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        closer = asyncio.create_task(view.close())
+        await asyncio.wait_for(left.wait(), 5)
+        await asyncio.wait_for(asyncio.shield(closer), 1)
+        assert not child.done()
+    finally:
+        release.set()
+        await asyncio.gather(child, *([closer] if closer else []), return_exceptions=True)
