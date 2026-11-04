@@ -7,17 +7,28 @@ Task admission, polling and operator authority belong to the owning host.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from math import isfinite
 from typing import Annotated, Literal
 
 from mcp import types
 from mcp.client.extension import ClaimContext, ClientExtension, ResultClaim
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import BeforeValidator, ConfigDict, Field, field_validator
 from pydantic.json_schema import SkipJsonSchema
 
 EXTENSION_ID = "io.modelcontextprotocol/tasks"
 PROTOCOL_VERSIONS = frozenset({"2026-07-28"})
 TaskStatus = Literal["working", "input_required", "completed", "cancelled", "failed"]
-_ProtocolInteger = Annotated[int, Field(ge=-(2**53 - 1), le=2**53 - 1)]
+
+
+def _parse_protocol_integer(value):
+    """JSON Schema integers include finite integral JSON numbers."""
+    if isinstance(value, float) and isfinite(value) and value.is_integer():
+        return int(value)
+    return value
+
+
+_ProtocolInteger = Annotated[int, Field(ge=-(2**53 - 1), le=2**53 - 1),
+    BeforeValidator(_parse_protocol_integer)]
 
 
 class TaskFields(types.Result):

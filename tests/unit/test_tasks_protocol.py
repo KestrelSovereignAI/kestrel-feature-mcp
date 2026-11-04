@@ -1,7 +1,4 @@
 """Current native Task contracts checked against the immutable official schema."""
-import hashlib
-import json
-from pathlib import Path
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -16,19 +13,6 @@ from kestrel_feature_mcp.tasks_protocol import (
 )
 
 
-@pytest.fixture
-def official_schema():
-    root = Path(__file__).parents[1] / "spec/tasks-2026-07-28"
-    provenance = json.loads((root / "provenance.json").read_text())
-    for name, original in [("schema.json", "schema/2026-07-28/schema.json"), ("LICENSE", "LICENSE")]:
-        assert hashlib.sha256((root / name).read_bytes()).hexdigest() == provenance["files"][original]["sha256"]
-    schema = json.loads((root / "schema.json").read_text())
-    assert schema["$id"] == "https://modelcontextprotocol.io/ext-tasks/2026-07-28/schema.json"
-    def validate(definition, value):
-        Draft202012Validator({**schema, "$ref": "#/$defs/" + definition}).validate(value)
-    return validate
-
-
 def task(status="working", result_type="complete"):
     return {"resultType": result_type, "taskId": "opaque/task:1", "status": status,
         "createdAt": "2026-11-04T01:00:00Z", "lastUpdatedAt": "2026-11-04T01:01:00Z",
@@ -37,12 +21,12 @@ def task(status="working", result_type="complete"):
 
 @pytest.mark.parametrize("status", ["working", "input_required", "completed", "failed", "cancelled"])
 @pytest.mark.parametrize("ttl_ms", [60000, None])
-def test_native_claim_is_flat_and_matches_official_schema(official_schema, status, ttl_ms):
+def test_native_claim_is_flat_and_matches_official_schema(official_tasks_schema, status, ttl_ms):
     wire = {**task(status, "task"), "ttlMs": ttl_ms}
     parsed = CreateTaskResult.model_validate(wire)
     assert parsed.task_id == "opaque/task:1"
     assert parsed.model_dump(mode="json", by_alias=True, exclude_unset=True) == wire
-    official_schema("CreateTaskResult", wire)
+    official_tasks_schema("CreateTaskResult", wire)
     assert issubclass(CreateTaskResult, types.Result)
 
 
@@ -53,11 +37,11 @@ def test_native_claim_is_flat_and_matches_official_schema(official_schema, statu
     ("cancelled", {}),
 ])
 @pytest.mark.parametrize("ttl_ms", [60000, None])
-def test_native_get_is_status_specific_and_preserves_final_payload(official_schema, status, payload, ttl_ms):
+def test_native_get_is_status_specific_and_preserves_final_payload(official_tasks_schema, status, payload, ttl_ms):
     wire = {**task(status), **payload, "ttlMs": ttl_ms}
     parsed = TypeAdapter(DetailedTaskResult).validate_python(wire)
     assert parsed.model_dump(mode="json", by_alias=True, exclude_unset=True) == wire
-    official_schema("GetTaskResult", wire)
+    official_tasks_schema("GetTaskResult", wire)
 
 
 @pytest.mark.parametrize("status", ["completed", "input_required", "failed"])
@@ -83,19 +67,19 @@ def test_no_old_wire_or_coerced_claim(bad):
     (UpdateTaskRequest(params=UpdateTaskParams(task_id="opaque/task:1", input_responses={})), "UpdateTaskRequest", "tasks/update"),
     (CancelTaskRequest(params=TaskIdParams(task_id="opaque/task:1")), "CancelTaskRequest", "tasks/cancel"),
 ])
-def test_native_requests_and_name_header_contract(official_schema, native_request, definition, method):
+def test_native_requests_and_name_header_contract(official_tasks_schema, native_request, definition, method):
     wire = native_request.model_dump(mode="json", by_alias=True, exclude_none=True)
     assert wire["method"] == method
     assert wire["params"]["taskId"] == "opaque/task:1"
     assert native_request.name_param == "taskId"
-    official_schema(definition, {"jsonrpc": "2.0", "id": 1, **wire})
+    official_tasks_schema(definition, {"jsonrpc": "2.0", "id": 1, **wire})
 
 
 @pytest.mark.parametrize("definition", ["UpdateTaskResult", "CancelTaskResult"])
-def test_mutation_acknowledgement_is_complete_not_a_task_state(official_schema, definition):
+def test_mutation_acknowledgement_is_complete_not_a_task_state(official_tasks_schema, definition):
     wire = {"resultType": "complete"}
     assert TaskAcknowledgement.model_validate(wire).model_dump(by_alias=True, exclude_none=True) == wire
-    official_schema(definition, wire)
+    official_tasks_schema(definition, wire)
 
 
 def test_claim_uses_the_native_sdk_extension_registry_without_legacy_protocols():
@@ -117,13 +101,14 @@ def test_claim_uses_the_native_sdk_extension_registry_without_legacy_protocols()
     ("statusMessage", None), ("pollIntervalMs", None),
     ("ttlMs", 2**53), ("ttlMs", -(2**53)),
     ("pollIntervalMs", 2**53), ("pollIntervalMs", -(2**53)),
+    ("ttlMs", 1.5), ("pollIntervalMs", -1.5),
 ])
-def test_task_fields_reject_values_refused_by_the_official_schema(official_schema, field, value):
+def test_task_fields_reject_values_refused_by_the_official_schema(official_tasks_schema, field, value):
     from jsonschema.exceptions import ValidationError as SchemaValidationError
 
     wire = {**task(result_type="task"), field: value}
     with pytest.raises(SchemaValidationError):
-        official_schema("CreateTaskResult", wire)
+        official_tasks_schema("CreateTaskResult", wire)
     with pytest.raises(SchemaValidationError):
         Draft202012Validator(CreateTaskResult.model_json_schema()).validate(wire)
     with pytest.raises(ValidationError):
@@ -132,21 +117,30 @@ def test_task_fields_reject_values_refused_by_the_official_schema(official_schem
 
 @pytest.mark.parametrize("field", ["ttlMs", "pollIntervalMs"])
 @pytest.mark.parametrize("value", [-(2**53 - 1), 2**53 - 1])
-def test_task_integer_boundaries_match_the_official_schema(official_schema, field, value):
+def test_task_integer_boundaries_match_the_official_schema(official_tasks_schema, field, value):
     wire = {**task(result_type="task"), field: value}
     parsed = CreateTaskResult.model_validate(wire)
     assert parsed.model_dump(mode="json", by_alias=True, exclude_unset=True) == wire
-    official_schema("CreateTaskResult", wire)
+    official_tasks_schema("CreateTaskResult", wire)
 
 
 @pytest.mark.parametrize("status", ["paused", "queued", "input-required", "canceled"])
-def test_unknown_and_legacy_task_states_are_refused(official_schema, status):
+def test_unknown_and_legacy_task_states_are_refused(official_tasks_schema, status):
     from jsonschema.exceptions import ValidationError as SchemaValidationError
 
     wire = task(status, "task")
     with pytest.raises(SchemaValidationError):
-        official_schema("CreateTaskResult", wire)
+        official_tasks_schema("CreateTaskResult", wire)
     with pytest.raises(ValidationError):
         CreateTaskResult.model_validate(wire)
     with pytest.raises(ValidationError):
         TypeAdapter(DetailedTaskResult).validate_python({**wire, "resultType": "complete"})
+
+
+@pytest.mark.parametrize("field", ["ttlMs", "pollIntervalMs"])
+@pytest.mark.parametrize("value", [60000.0, 0.0, -1.0])
+def test_integral_json_numbers_are_native_integers(official_tasks_schema, field, value):
+    wire = {**task(result_type="task"), field: value}
+    official_tasks_schema("CreateTaskResult", wire)
+    parsed = CreateTaskResult.model_validate(wire)
+    assert parsed.model_dump(mode="json", by_alias=True, exclude_unset=True) == wire

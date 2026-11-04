@@ -341,3 +341,22 @@ async def mcp_http_server(request, tmp_path, app_resource_html):
             settings["certificate_file"] = peer.certificate_file
         yield HTTPMCPServer(peer.url + "/mcp", requests, peer.server, peer.task,
                             settings, mcp, peer.server_names, witness)
+
+
+@pytest.fixture
+def official_tasks_schema():
+    import hashlib
+    import json
+    from pathlib import Path
+    from jsonschema import Draft202012Validator
+
+    root = Path(__file__).parents[1] / "spec/tasks-2026-07-28"
+    provenance = json.loads((root / "provenance.json").read_text())
+    for name, original in [("schema.json", "schema/2026-07-28/schema.json"), ("LICENSE", "LICENSE")]:
+        assert hashlib.sha256((root / name).read_bytes()).hexdigest() == provenance["files"][original]["sha256"]
+    schema = json.loads((root / "schema.json").read_text())
+    assert schema["$id"] == "https://modelcontextprotocol.io/ext-tasks/2026-07-28/schema.json"
+    def validate(definition, value):
+        Draft202012Validator({**schema, "$ref": "#/$defs/" + definition}).validate(value)
+    return validate
+

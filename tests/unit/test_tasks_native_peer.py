@@ -96,7 +96,7 @@ async def no_implicit_resolution(result, context):
 ])
 @pytest.mark.parametrize("ttl_ms", [60000, None])
 async def test_sdk_claim_and_current_task_verbs_cross_real_http_without_tool_replay(
-    mcp_http_server, scenario, task_id, expected_header, ttl_ms,
+    mcp_http_server, scenario, task_id, expected_header, ttl_ms, official_tasks_schema,
 ):
     peer = mcp_http_server.settings["extensions"][0]
     peer.task_id = task_id
@@ -132,14 +132,18 @@ async def test_sdk_claim_and_current_task_verbs_cross_real_http_without_tool_rep
             state = await session.send_request(GetTaskRequest(
                 params=TaskIdParams(task_id=created.task_id)), TypeAdapter(DetailedTaskResult))
             assert state.input_requests["form"].method == "elicitation/create"
-            ack = await session.send_request(UpdateTaskRequest(params=UpdateTaskParams(
+            update = UpdateTaskRequest(params=UpdateTaskParams(
                 task_id=created.task_id, input_responses={"form": types.ElicitResult(
-                    action="accept", content={"label": "native input"})})), TaskAcknowledgement)
+                    action="accept", content={"label": "native input"})}))
+            official_tasks_schema("UpdateTaskRequest", {"jsonrpc": "2.0", "id": 1,
+                **update.model_dump(mode="json", by_alias=True, exclude_none=True)})
+            ack = await session.send_request(update, TaskAcknowledgement)
             assert ack.result_type == "complete"
             state = await session.send_request(GetTaskRequest(
                 params=TaskIdParams(task_id=created.task_id)), TypeAdapter(DetailedTaskResult))
             assert state.status == "completed"
-            result = types.CallToolResult.model_validate(state.result)
+            assert state.result.get("resultType") == "complete"
+            result = types.CallToolResult.model_validate(state.result, by_alias=True, by_name=False)
             assert result.content[0].text == "actual deferred result"
         elif scenario == "cooperative-cancel":
             ack = await session.send_request(CancelTaskRequest(
@@ -190,7 +194,8 @@ async def test_high_level_native_client_resolves_one_claim_without_replaying_the
         current = await context.session.send_request(GetTaskRequest(
             params=TaskIdParams(task_id=created.task_id)), TypeAdapter(DetailedTaskResult))
         assert current.status == "completed"
-        return types.CallToolResult.model_validate(current.result)
+        assert current.result.get("resultType") == "complete"
+        return types.CallToolResult.model_validate(current.result, by_alias=True, by_name=False)
 
     async with httpx2.AsyncClient(trust_env=False, follow_redirects=False) as http_client, Client(
         streamable_http_client(mcp_http_server.url, http_client=http_client),
