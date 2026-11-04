@@ -178,13 +178,19 @@ async def test_original_cimd_transport_is_retained_after_failed_close(acquisitio
             raise TimeoutError('original CIMD close observer failed')
         await original(transport)
     monkeypatch.setattr(BudgetedTransport, 'aclose', unacknowledged)
-    with pytest.raises(TimeoutError):
-        await a.operation.start()
-    assert failed == [a.operation._identity_transport]
-    assert a.operation._identity_transport.transport._transports
-    await a.operation.retire()
-    assert a.operation._identity_transport.transport._transports == {}
-    assert await slot(a) is None
+    try:
+        with pytest.raises(TimeoutError):
+            await a.operation.start()
+        assert failed == [a.operation._identity_transport]
+        assert a.operation._identity_transport.transport._transports
+        await a.operation.retire()
+        assert a.operation._identity_transport.transport._transports == {}
+        assert await slot(a) is None
+    finally:
+        # Even a deliberately broken retirement must release this fixture's
+        # original TLS socket before its independent server shuts down.
+        if a.operation._identity_transport is not None:
+            await original(a.operation._identity_transport)
 
 
 @pytest.mark.parametrize('oauth_peers', [{'web_identity': True, 'token_error_status': 400},
