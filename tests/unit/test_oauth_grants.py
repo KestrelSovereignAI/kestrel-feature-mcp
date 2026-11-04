@@ -198,6 +198,37 @@ async def test_only_one_independent_refresh_claim_can_commit(owners, binding, to
 
 
 @pytest.mark.asyncio
+async def test_revision_cas_rejects_refresh_completed_between_read_and_update(
+        owners, binding, tokens, monkeypatch):
+    databases, (first, second) = owners
+    installed = await first.install(binding, tokens)
+    entered, release = asyncio.Event(), asyncio.Event()
+    execute = databases[0].execute
+
+    async def pause_before_real_update(query, parameters=None):
+        if query.lstrip().startswith('UPDATE mcp_oauth_grants'):
+            entered.set()
+            await release.wait()
+        return await execute(query, parameters)
+
+    monkeypatch.setattr(databases[0], 'execute', pause_before_real_update)
+    pending = asyncio.create_task(first.begin_refresh(installed))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        current_claim = await second.begin_refresh(installed)
+        rotated = replace(tokens, access_token='race-next-access',
+                          refresh_token='race-rotated-refresh')
+        completed = await second.finish_refresh(current_claim, rotated)
+        release.set()
+        with pytest.raises(OAuthGrantChanged, match='changed before durable custody'):
+            await pending
+        assert await second.read(binding) == completed
+    finally:
+        release.set()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_local_revocation_cannot_be_undone_by_stale_refresh_or_insert(owners, binding, tokens):
     _, (first, second) = owners
     installed = await first.install(binding, tokens)
