@@ -125,6 +125,12 @@ async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_ke
                     b.credential, b.connection, b.caller, b.handle = credential, connection, caller, handle
                     return {'connected': True}
 
+        @app.post('/api/owned-credential-refresh')
+        async def refresh(request: Request):
+            with service.bind(request) as authentication, caller_context_scope(authentication.caller):
+                await b.credential.admit(force_refresh=True)
+                return {'refreshed': True}
+
         @app.post('/api/owned-credential-call')
         async def call(request: Request):
             with service.bind(request) as authentication, caller_context_scope(authentication.caller):
@@ -208,3 +214,28 @@ async def test_native_permission_deny_prevents_resource_dispatch_and_refresh(cre
     assert b.withdrawals == []
     audit = await b.permissions.get_audit_log()
     assert any(row['decision'] == 'auto_denied' for row in audit)
+
+
+async def test_background_message_waits_for_the_original_foreground_refresh_revision(credential_boundary):
+    import asyncio
+    b = credential_boundary
+    assert (await b.client.post('/api/owned-credential-connect')).status_code == 200
+    b.peer.options['stall_token'] = True
+    refresh = asyncio.create_task(b.client.post('/api/owned-credential-refresh'))
+    background = None
+    try:
+        async with asyncio.timeout(2):
+            while ('POST', '/token') not in b.peer.requests:
+                await asyncio.sleep(0.001)
+        assert (await b.store.read(b.credential.snapshot.binding)).state == 'refreshing'
+        background = asyncio.create_task(b.credential.dispatch_token('background'))
+        await asyncio.sleep(0)
+        assert not background.done()
+        b.peer.release_body.set()
+        result = await refresh
+        assert result.status_code == 200, result.text
+        assert await background == 'native-fixture-access'
+        assert not b.withdrawals and b.peer.requests.count(('POST', '/token')) == 1
+    finally:
+        b.peer.release_body.set()
+        await asyncio.gather(refresh, *([background] if background else []), return_exceptions=True)

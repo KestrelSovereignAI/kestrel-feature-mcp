@@ -25,6 +25,8 @@ class OAuthConnectionCredential:
         self.budgets, self.close_seconds = dict(budgets), positive_seconds(close_seconds)
         self._withdraw = withdraw
         self._withdrawn = False
+        self.withdrawal_reason = None
+        self.retired = False
         self._refresh = None
         self._admission = asyncio.Lock()
 
@@ -39,6 +41,7 @@ class OAuthConnectionCredential:
     def withdraw(self, reason):
         if not self._withdrawn:
             self._withdrawn = True
+            self.withdrawal_reason = reason
             self.lease.revoke()
             self._withdraw(reason)
 
@@ -54,7 +57,7 @@ class OAuthConnectionCredential:
         self._open()
         return payload.tokens
 
-    async def admit(self):
+    async def admit(self, *, force_refresh=False):
         # A foreign principal must not withdraw another principal's connection.
         self.lease.require_principal()
         async with self._admission:
@@ -62,7 +65,7 @@ class OAuthConnectionCredential:
             admitted = False
             try:
                 payload = await self._payload(self.lease.require_principal)
-                if payload.is_expired(time.time()):
+                if force_refresh or payload.is_expired(time.time()):
                     async with self.lease.credential_operation() as check:
                         self._refresh = OAuthRefresher(self.store, self.budgets, close_seconds=self.close_seconds)
                         snapshot = await self._refresh.run(self.snapshot, check)
@@ -81,16 +84,21 @@ class OAuthConnectionCredential:
         # Admission happens before entering the SDK. Wire checks never refresh,
         # and hold no lock across an authentication yield or resource response.
         check()
-        admitted = False
-        try:
-            payload = await self._payload(check)
-            if payload.is_expired(time.time()):
-                raise GrantRejected('OAuth credentials expired before dispatch; request not sent')
-            admitted = True
-            return payload.access_token
-        finally:
-            if not admitted:
-                self.withdraw('reauthorization_required')
+        # Wait for an already owned foreground refresh before reading its new
+        # revision. The lock is released before the auth flow yields any MCP
+        # request, so a native ping reply cannot deadlock a resource request.
+        async with self._admission:
+            check()
+            admitted = False
+            try:
+                payload = await self._payload(check)
+                if payload.is_expired(time.time()):
+                    raise GrantRejected('OAuth credentials expired before dispatch; request not sent')
+                admitted = True
+                return payload.access_token
+            finally:
+                if not admitted:
+                    self.withdraw('reauthorization_required')
 
     def bearer_auth(self):
         return GrantBearerAuth(self)
@@ -100,6 +108,7 @@ class OAuthConnectionCredential:
         if self._refresh is not None:
             await self._refresh.retire()
             self._refresh = None
+        self.retired = True
 
 
 class GrantBearerAuth(httpx2.Auth):
