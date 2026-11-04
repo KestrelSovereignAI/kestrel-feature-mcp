@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 import math
 import logging
 import hashlib
@@ -94,6 +95,7 @@ class BoundMCPCaller:
     incarnation: object
     _owner_is_current: Callable[[], bool] = field(repr=False)
     tool_names: frozenset[str] | None = None
+    _admit: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
 
     @property
     def is_current(self) -> bool:
@@ -103,20 +105,26 @@ class BoundMCPCaller:
         if not self.is_current:
             raise ValueError(f"MCP connection {self.name} changed; rediscover its tools before calling")
 
-    async def __call__(self, tool_name: str, arguments: dict | None = None):
+    async def _admitted(self):
         self.require_current()
+        if self._admit is not None:
+            await self._admit()
+            self.require_current()
+
+    async def __call__(self, tool_name: str, arguments: dict | None = None):
+        await self._admitted()
         if self.tool_names is not None and tool_name not in self.tool_names:
             raise ValueError(f"Unknown tool: {tool_name}. Available: {sorted(self.tool_names)}")
         return await self.connection.call_tool(tool_name, arguments or {})
 
     async def read_resource(self, uri: str) -> types.ReadResourceResult:
-        self.require_current()
+        await self._admitted()
         result = await self.connection.read_resource(uri, incarnation=self.incarnation)
         self.require_current()
         return result
 
 
-def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, tool_names=None):
+def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, tool_names=None, admit=None):
     """Bind the advertised connection, never a later replacement's transport."""
     incarnation = connection.incarnation
     if incarnation is None:
@@ -125,6 +133,7 @@ def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, t
         connection=connection, name=name, incarnation=incarnation,
         _owner_is_current=is_current,
         tool_names=frozenset(tool_names) if tool_names is not None else None,
+        _admit=admit,
     )
 
 

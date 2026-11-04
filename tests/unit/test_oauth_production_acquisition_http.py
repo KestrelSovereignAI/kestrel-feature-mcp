@@ -230,3 +230,178 @@ async def test_native_acquisition_task_has_no_ambient_caller_context(acquisition
     assert (True, 'original-request') in observations
     assert (False, None) in observations
     assert (False, 'original-request') not in observations
+
+
+@pytest.mark.parametrize('oauth_peers', [{'web_identity': True, 'stall_metadata': True},
+    {'web_identity': True, 'stall_token': True}], indirect=True)
+async def test_withdrawn_worker_does_not_cancel_the_original_http_observer(acquisition, oauth_peers):
+    import asyncio
+    a, peer = acquisition, oauth_peers
+    if peer.options.get('stall_metadata'):
+        observer = asyncio.create_task(a.operation.start())
+        expected = ('GET', '/.well-known/oauth-authorization-server')
+    else:
+        started = await a.operation.start()
+        callback = await approve(peer, started)
+        observer = asyncio.create_task(a.operation.complete(callback, lambda: None))
+        expected = ('POST', '/token')
+    try:
+        async with asyncio.timeout(2):
+            while expected not in peer.requests:
+                await asyncio.sleep(0.001)
+        a.operation.withdraw()
+        with pytest.raises(GrantRejected, match='withdrawn'):
+            await observer
+        assert observer.cancelling() == 0 and not observer.cancelled()
+        assert a.operation._task.cancelled()
+        snapshot = await slot(a)
+        if peer.options.get('stall_token'):
+            assert snapshot.state == 'exchanging'
+        else:
+            assert snapshot is None
+    finally:
+        peer.release_body.set()
+        a.operation.withdraw()
+        await asyncio.gather(observer, return_exceptions=True)
+
+
+@pytest.mark.parametrize('oauth_peers', [{'web_identity': True}], indirect=True)
+async def test_explicit_cancel_abandons_its_original_unexchanged_slot(acquisition):
+    a = acquisition
+    await a.operation.start()
+    await a.operation.cancel(lambda: None)
+    await a.operation.cancel(lambda: None)
+    snapshot = await slot(a)
+    assert snapshot.state == 'revoked' and snapshot.reason == 'abandoned'
+
+
+@pytest.mark.parametrize('oauth_peers', [{'web_identity': True, 'denied_authenticated_get': 403}], indirect=True)
+async def test_post_commit_resource_refusal_preserves_metadata_and_names_its_disposition(acquisition, oauth_peers):
+    a = acquisition
+    started = await a.operation.start()
+    with pytest.raises(GrantRejected) as caught:
+        await a.operation.complete(await approve(oauth_peers, started), lambda: None)
+    assert type(caught.value).__name__ == 'ResourceGrantRejected'
+    assert a.operation.storage.snapshot.state == 'active'
+    assert a.operation.storage.snapshot.tokens is None
+    assert (await slot(a)).state == 'active'
+    assert oauth_peers.requests.count(('POST', '/token')) == 1
+
+
+@pytest.mark.parametrize('oauth_peers', [{'web_identity': True}], indirect=True)
+async def test_post_commit_phase_refusal_keeps_committed_grant_metadata(acquisition, oauth_peers, monkeypatch):
+    a = acquisition
+    active = []
+    original = a.store.complete_authorization
+    async def commit(claim, receipt):
+        snapshot = await original(claim, receipt)
+        active.append(snapshot)
+        return snapshot
+    def check():
+        if active:
+            raise GrantRejected('Original request authority expired after commit')
+    monkeypatch.setattr(a.store, 'complete_authorization', commit)
+    started = await a.operation.start()
+    with pytest.raises(GrantRejected, match='after commit'):
+        await a.operation.complete(await approve(oauth_peers, started), check)
+    assert a.operation.storage.snapshot is not None
+    assert a.operation.storage.snapshot.revision == active[0].revision
+    assert a.operation.storage.snapshot.tokens is None
+    assert not a.operation.policy.grant_ready
+    assert (await slot(a)).state == 'active'
+
+
+@pytest.mark.parametrize('oauth_peers', [{'web_identity': True}], indirect=True)
+async def test_failed_identity_retirement_does_not_skip_original_acquisition_transport(acquisition, monkeypatch):
+    a = acquisition
+    await a.operation.start()
+    await a.operation.retire()
+    identity, resource = a.operation._identity_transport, a.operation._transport
+    original = BudgetedTransport.aclose
+    attempted = []
+    async def close(transport):
+        attempted.append(transport)
+        if transport is identity:
+            raise TimeoutError('original identity close not acknowledged')
+        await original(transport)
+    monkeypatch.setattr(BudgetedTransport, 'aclose', close)
+    try:
+        with pytest.raises(TimeoutError):
+            await a.operation.retire()
+        assert attempted == [identity, resource]
+    finally:
+        monkeypatch.setattr(BudgetedTransport, 'aclose', original)
+
+
+@pytest.mark.parametrize('oauth_peers', [{'web_identity': True, 'stall_metadata': True}], indirect=True)
+async def test_real_http_observer_cancellation_is_not_converted_into_worker_withdrawal(acquisition, oauth_peers):
+    import asyncio
+    a = acquisition
+    observer = asyncio.create_task(a.operation.start())
+    try:
+        async with asyncio.timeout(2):
+            while ('GET', '/.well-known/oauth-authorization-server') not in oauth_peers.requests:
+                await asyncio.sleep(0.001)
+        observer.cancel('owned request cancellation')
+        a.operation.withdraw()
+        with pytest.raises(asyncio.CancelledError):
+            await observer
+        assert observer.cancelled() and observer.cancelling() == 1
+    finally:
+        oauth_peers.release_body.set()
+        await asyncio.gather(observer, return_exceptions=True)
+
+
+@pytest.mark.parametrize('oauth_peers', [{'web_identity': True}], indirect=True)
+async def test_denied_callback_abandons_before_returning_a_safe_failure(acquisition):
+    a = acquisition
+    started = await a.operation.start()
+    with pytest.raises(GrantRejected, match='denied'):
+        await a.operation.complete({'state': started['state'], 'error': 'access_denied'}, lambda: None)
+    assert (await slot(a)).reason == 'abandoned'
+    assert a.operation._withdrawn
+
+
+@pytest.mark.parametrize('oauth_peers', [{'web_identity': True}], indirect=True)
+async def test_retiring_an_old_authorization_does_not_abandon_a_replacement_slot(acquisition):
+    a = acquisition
+    await a.operation.start()
+    original = await slot(a)
+    replacement = await a.store.begin_authorization(original.binding, expected=original)
+    await a.operation.retire()
+    current = await slot(a)
+    assert current.state == 'authorizing' and current.revision == replacement.revision
+
+
+@pytest.mark.parametrize('oauth_peers', [{'web_identity': True}], indirect=True)
+async def test_failed_abandon_ack_attempts_every_original_close_and_is_retryable(acquisition, monkeypatch):
+    a = acquisition
+    await a.operation.start()
+    original = a.store.abandon_authorization
+    calls = []
+    async def lost_ack(claim):
+        calls.append(claim)
+        await original(claim)
+        raise TimeoutError('original abandon commit acknowledgement lost')
+    monkeypatch.setattr(a.store, 'abandon_authorization', lost_ack)
+    with pytest.raises(TimeoutError):
+        await a.operation.cancel(lambda: None)
+    assert not a.operation.storage._abandoned
+    assert not a.operation._identity_transport.transport._transports
+    assert not a.operation._transport.transport._transports
+    assert (await slot(a)).reason == 'abandoned'
+    await a.operation.cancel(lambda: None)
+    assert a.operation.storage._abandoned and len(calls) == 1
+
+
+@pytest.mark.parametrize('oauth_peers', [{'web_identity': True}], indirect=True)
+async def test_background_retirement_preserves_the_original_custody_revision(acquisition, monkeypatch):
+    a = acquisition
+    await a.operation.start()
+    before = await slot(a)
+    def forbidden_write(*args, **kwargs):
+        raise AssertionError('Background retirement must not write durable custody')
+    monkeypatch.setattr(a.store, '_replace', forbidden_write)
+    await a.operation.retire()
+    after = await slot(a)
+    assert after == before

@@ -372,7 +372,7 @@ completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
 Base MCP connections and governed tools require Core 0.55.2 or newer. Initial
 publication and result associations require Core 0.59.0 or newer, as detailed
-below. The test profile uses Core 0.61.1 for the complete Apps host suite.
+below. The test profile uses Core 0.61.3 for the complete Apps host suite.
 An unsupported host is refused before connecting or saving enablement.
 When a server rejects a call with `HeaderMismatch`, Kestrel retires the original
 catalog. Reload the connection to discover and admit the new contract before

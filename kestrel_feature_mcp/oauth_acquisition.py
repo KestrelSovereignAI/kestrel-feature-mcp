@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import partial
 import time
 
 from mcp.client.auth.utils import create_client_info_from_metadata_url
 
 from .oauth_grants import OAuthGrantBinding, OAuthGrantTokens
-from .oauth_policy import GrantRejected, positive_seconds
+from .oauth_policy import GrantRejected, ResourceGrantRejected, positive_seconds
+from ._lifecycle import run_cleanup_steps
 
 
 class IntentTokenStorage:
@@ -25,6 +27,7 @@ class IntentTokenStorage:
         self.check = check
         self.claim = None
         self.snapshot = None
+        self._abandoned = False
 
     async def get_client_info(self):
         identity = self.policy.identity
@@ -80,11 +83,25 @@ class IntentTokenStorage:
         receipt = OAuthGrantTokens(tokens.access_token, tokens.refresh_token, expires_at, granted)
         self.check()
         snapshot = await self.store.complete_authorization(self.claim, receipt)
-        self.check()
-        # Status/operation ownership retains metadata only. Credential use later
-        # requires a fresh Core lease and a revalidated store payload read.
+        # Retain the acknowledged disposition even when the request loses
+        # authority immediately after commit. Metadata cannot authorize use.
         self.snapshot = replace(snapshot, tokens=None)
+        self.check()
         self.policy.grant_ready = True
+
+    async def abandon(self, check):
+        if self.claim is None or self.claim.state != 'authorizing' or self._abandoned:
+            return
+        check()
+        current = await self.store.read(self.claim.binding)
+        check()
+        if (current is not None and current.state == 'authorizing'
+                and current.revision == self.claim.revision):
+            await self.store.abandon_authorization(self.claim)
+            check()
+        # A replacement revision no longer belongs to this original worker.
+        # A failed commit acknowledgement leaves this cleanup retryable.
+        self._abandoned = True
 
 
 class AuthorizationOperation:
@@ -168,7 +185,7 @@ class AuthorizationOperation:
                 # Acquisition ends at headers, never waiting on a resource SSE
                 # stream and never using this provider for an MCP operation.
                 if response.status_code in {401, 403}:
-                    raise GrantRejected('The resource rejected the completed OAuth authorization')
+                    raise ResourceGrantRejected('The resource rejected the completed OAuth authorization')
         self._check()
         if self.storage.snapshot is None:
             raise GrantRejected('The native OAuth exchange did not commit a grant')
@@ -184,6 +201,7 @@ class AuthorizationOperation:
         self._task = asyncio.create_task(self._run(), context=contextvars.Context())
         done, _ = await asyncio.wait({self._ready, self._task}, return_when=asyncio.FIRST_COMPLETED)
         if self._task in done:
+            self._check_worker_withdrawal()
             self._task.result()
             raise GrantRejected('OAuth acquisition ended without a consent request')
         self._check()
@@ -197,13 +215,32 @@ class AuthorizationOperation:
         if self._task is None or self._callback.done() or self._withdrawn:
             raise GrantRejected('The original OAuth operation cannot accept another callback')
         if callback.get('error') is not None:
+            await self.cancel(check)
             raise GrantRejected('The authorization server denied this OAuth request')
         self._phase_check = check
         self._callback.set_result(AuthorizationCodeResult(code=callback.get('code'),
             state=callback.get('state'), iss=callback.get('iss')))
-        result = await asyncio.shield(self._task)
+        try:
+            result = await asyncio.shield(self._task)
+        except asyncio.CancelledError:
+            self._check_worker_withdrawal()
+            raise
         self._check()
         return result
+
+    async def cancel(self, check):
+        """Abandon only inside the original live request, then join all owners."""
+        check()
+        self.withdraw()
+        await run_cleanup_steps([(True, partial(self.storage.abandon, check)), (True, self.retire)])
+        check()
+
+    def _check_worker_withdrawal(self):
+        import asyncio
+
+        task = asyncio.current_task()
+        if self._task.cancelled() and task is not None and task.cancelling() == 0:
+            raise GrantRejected('The original OAuth authorization was withdrawn')
 
     def withdraw(self):
         self._withdrawn = True
@@ -221,9 +258,12 @@ class AuthorizationOperation:
                 raise TimeoutError('The original OAuth acquisition worker has not physically closed')
             if not self._task.cancelled():
                 self._task.exception()  # Observe failure; closure is acknowledged below.
+        # Every independent original owner is attempted even if another close
+        # fails. Failed acknowledgements retain their owners for reentry.
+        # Physical retirement (including timer/shutdown) never writes custody.
+        steps = []
         if self._identity_transport is not None:
-            await self._identity_transport.aclose()
+            steps.append((True, self._identity_transport.aclose))
         if self._transport is not None:
-            # Reenter the original transport after a failed close observation;
-            # never replace a retained physical owner with a new cleanup task.
-            await self._transport.aclose()
+            steps.append((True, self._transport.aclose))
+        await run_cleanup_steps(steps)

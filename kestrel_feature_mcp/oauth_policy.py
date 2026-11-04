@@ -27,6 +27,10 @@ class GrantRejected(ValueError):
     """Safe diagnostic; never interpolate a token, callback or response body."""
 
 
+class ResourceGrantRejected(GrantRejected):
+    """The resource refused a grant already committed by its authorization server."""
+
+
 def response_budget(value: int) -> int:
     if type(value) is not int or value < 1:
         raise GrantRejected("OAuth response budget must be a positive integer")
