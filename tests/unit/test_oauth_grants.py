@@ -2,11 +2,13 @@
 
 import asyncio
 import base64
+from contextlib import asynccontextmanager
 from dataclasses import replace
 
 import pytest
 
 from kestrel_sdk.security.exceptions import DecryptionError
+from kestrel_sdk.storage.database import TransactionError
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from kestrel_feature_mcp.oauth_grants import (
     OAuthGrantBinding, OAuthGrantChanged, OAuthGrantRejected,
@@ -108,6 +110,12 @@ async def test_only_one_independent_refresh_claim_can_commit(owners, binding, to
     assert complete.state == 'active' and complete.tokens == rotated
     with pytest.raises(OAuthGrantChanged):
         await second.finish_refresh(claim, rotated)
+    next_claim = await second.begin_refresh(complete)
+    with pytest.raises(OAuthGrantChanged):
+        await first.begin_refresh(installed)
+    with pytest.raises(OAuthGrantChanged):
+        await first.finish_refresh(claim, rotated)
+    assert (await first.read(binding)) == next_claim
 
 
 @pytest.mark.asyncio
@@ -129,13 +137,56 @@ async def test_local_revocation_cannot_be_undone_by_stale_refresh_or_insert(owne
 
 @pytest.mark.asyncio
 async def test_scope_expansion_refused_before_initial_or_rotated_storage(owners, binding, tokens):
-    _, (store, _) = owners
+    databases, (store, _) = owners
     with pytest.raises(OAuthGrantRejected, match='approved scopes'):
         await store.install(binding, replace(tokens, scopes=frozenset({'admin'})))
+    assert await databases[0].fetch_val('SELECT COUNT(*) FROM mcp_oauth_grants') == 0
     claim = await store.begin_refresh(await store.install(binding, tokens))
     with pytest.raises(OAuthGrantRejected, match='original token scopes'):
         await store.finish_refresh(claim, replace(tokens, scopes=frozenset({'read', 'write'})))
     assert (await store.read(binding)) == claim
+
+
+@pytest.mark.asyncio
+async def test_lost_commit_ack_retains_real_refresh_claim_without_retry(owners, binding, tokens, monkeypatch):
+    databases, (first, second) = owners
+    installed = await first.install(binding, tokens)
+    transaction = databases[0].transaction
+
+    @asynccontextmanager
+    async def lose_ack():
+        async with transaction():
+            yield
+        raise TransactionError('Synthetic loss of the real committed ACK')
+
+    monkeypatch.setattr(databases[0], 'transaction', lose_ack)
+    with pytest.raises(TransactionError, match='committed ACK'):
+        await first.begin_refresh(installed)
+    retained = await second.read(binding)
+    assert retained.state == 'refreshing' and retained.revision != installed.revision
+    with pytest.raises(OAuthGrantRejected, match='another refresh'):
+        await second.begin_refresh(retained)
+
+
+@pytest.mark.asyncio
+async def test_revocation_between_commit_and_readback_refuses_publication(owners, binding, tokens, monkeypatch):
+    databases, (first, second) = owners
+    installed = await first.install(binding, tokens)
+    transaction = databases[0].transaction
+
+    @asynccontextmanager
+    async def revoke_after_commit():
+        async with transaction():
+            yield
+        committed = await second.read(binding)
+        assert committed.state == 'refreshing'
+        await second.revoke_local(committed)
+
+    monkeypatch.setattr(databases[0], 'transaction', revoke_after_commit)
+    with pytest.raises(OAuthGrantChanged, match='acknowledged'):
+        await first.begin_refresh(installed)
+    retained = await second.read(binding)
+    assert retained.state == 'revoked' and retained.tokens is None
 
 
 @pytest.mark.asyncio
