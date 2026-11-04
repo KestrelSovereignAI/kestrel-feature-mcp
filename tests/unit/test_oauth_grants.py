@@ -370,3 +370,53 @@ def test_expiry_is_absolute_finite_and_never_coerced(tokens, expiry):
 def test_malformed_frozen_urls_are_refused(binding, field, value):
     with pytest.raises(OAuthGrantRejected):
         replace(binding, **{field: value})
+
+
+@pytest.mark.asyncio
+async def test_explicit_replacement_fences_the_original_inflight_refresh(owners, binding, tokens):
+    _, (first, second) = owners
+    claim = await first.begin_refresh(await first.install(binding, tokens))
+    current = await second.read(binding)
+    replacement = replace(tokens, access_token='newly-approved-access',
+                          refresh_token='newly-approved-refresh')
+    installed = await second.install(binding, replacement, expected=current)
+    with pytest.raises(OAuthGrantChanged):
+        await first.finish_refresh(claim, tokens)
+    assert await first.read(binding) == installed
+
+
+class UnvalidatedTokens(OAuthGrantTokens):
+    def __post_init__(self):
+        pass
+
+
+class UnvalidatedBinding(OAuthGrantBinding):
+    def __post_init__(self):
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('operation', ['install_tokens', 'finish_tokens', 'binding', 'expected'])
+async def test_invalid_grant_record_is_refused_without_sql_change(owners, binding, tokens, operation):
+    databases, (store, _) = owners
+    invalid = UnvalidatedTokens(tokens.access_token, tokens.refresh_token, -1, tokens.scopes)
+    claim = None
+    if operation == 'finish_tokens':
+        claim = await store.begin_refresh(await store.install(binding, tokens))
+    before = await databases[1].fetch_all('SELECT revision, state, ciphertext FROM mcp_oauth_grants')
+    with pytest.raises(OAuthGrantRejected, match='record type'):
+        if operation == 'install_tokens':
+            await store.install(binding, invalid)
+        elif operation == 'finish_tokens':
+            await store.finish_refresh(claim, invalid)
+        elif operation == 'binding':
+            fields = {name: getattr(binding, name) for name in binding.__dataclass_fields__}
+            await store.install(UnvalidatedBinding(**fields), tokens)
+        else:
+            await store.install(binding, tokens, expected=object())
+    assert await databases[1].fetch_all('SELECT revision, state, ciphertext FROM mcp_oauth_grants') == before
+
+
+def test_grant_store_requires_the_native_database_contract(binding, owned_oauth_key):
+    with pytest.raises(OAuthGrantRejected, match='native database'):
+        OAuthGrantStore(object(), binding.agent_did, max_token_bytes=4096)

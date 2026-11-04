@@ -79,3 +79,20 @@ async def test_public_authlib_refresh_survives_two_fresh_processes(oauth_peers, 
     assert [m['method'] for m in messages].count('server/discover') == 2
     assert [m['method'] for m in messages].count('tools/list') == 2
     assert not any(m.get('method') == 'tools/call' for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_refresh_child_import_does_not_read_stdin_or_start_a_grant():
+    script = Path(__file__).resolve().parents[1] / 'oauth_acceptance/refresh_child.py'
+    child = await asyncio.create_subprocess_exec(sys.executable, '-I', '-B', '-c',
+        "import runpy,sys;runpy.run_path(sys.argv[1],run_name='owned_import_probe')", str(script),
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE)
+    try:
+        stdout, stderr = await asyncio.wait_for(child.communicate(b''), 15)
+    except TimeoutError:
+        child.kill()
+        await child.wait()
+        raise
+    assert child.returncode == 0, stderr.decode()
+    assert stdout == b''

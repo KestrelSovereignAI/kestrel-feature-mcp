@@ -117,5 +117,6 @@ async def main(config):
         await database.close()
 
 
-logging.disable(logging.CRITICAL)
-print(json.dumps(asyncio.run(main(json.loads(sys.stdin.read())))))
+if __name__ == '__main__':
+    logging.disable(logging.CRITICAL)
+    print(json.dumps(asyncio.run(main(json.loads(sys.stdin.read())))))

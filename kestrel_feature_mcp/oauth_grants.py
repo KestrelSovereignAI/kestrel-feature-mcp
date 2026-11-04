@@ -33,6 +33,11 @@ class OAuthGrantChanged(RuntimeError):
     """The exact grant revision is no longer current; do not replay HTTP."""
 
 
+def _record(value, expected):
+    if type(value) is not expected:
+        raise OAuthGrantRejected("OAuth grant record type is invalid")
+
+
 def _text(value):
     if not isinstance(value, str) or not value or any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise OAuthGrantRejected("OAuth grant fields require nonempty control-free strings")
@@ -143,6 +148,8 @@ class OAuthGrantStore:
         self.agent_did = require_owner_did(agent_did)
         if type(max_token_bytes) is not int or max_token_bytes < 1:
             raise OAuthGrantRejected("OAuth token budget must be a positive integer")
+        if not isinstance(database, DatabaseBackend):
+            raise OAuthGrantRejected("OAuth custody requires a native database backend")
         self._db = database
         self._cipher = AEADCipher(get_agent_key(agent_did, 'service-keys'))
         self._max_token_bytes = max_token_bytes
@@ -167,6 +174,7 @@ class OAuthGrantStore:
             raise OAuthGrantRejected("OAuth custody requires a known top-level transaction boundary")
 
     def _binding(self, binding):
+        _record(binding, OAuthGrantBinding)
         if binding.agent_did != self.agent_did:
             raise OAuthGrantRejected("OAuth grant belongs to another agent")
         return binding.identifier
@@ -175,6 +183,7 @@ class OAuthGrantStore:
         return _json(['kestrel-mcp-oauth-grant-v1', self._binding(binding), revision, state, claim_hash])
 
     def _encode(self, binding, revision, state, tokens, claim_hash):
+        _record(tokens, OAuthGrantTokens)
         if not tokens.scopes <= binding.scopes:
             raise OAuthGrantRejected("OAuth token exceeded approved scopes")
         payload = asdict(tokens)
@@ -246,6 +255,8 @@ class OAuthGrantStore:
 
     async def install(self, binding, tokens, *, expected: OAuthGrantSnapshot | None = None):
         """Store a separately authorized initial/replacement grant, never an upsert."""
+        if expected is not None:
+            _record(expected, OAuthGrantSnapshot)
         if expected is not None and expected.binding != binding:
             raise OAuthGrantRejected("OAuth replacement changed its frozen binding")
         return await self._replace(binding, tokens, 'active', expected)
@@ -267,6 +278,7 @@ class OAuthGrantStore:
             raise OAuthGrantRejected("OAuth refresh requires its original durable claim")
         if type(claim.secret) is not str or len(claim.secret) != 43:
             raise OAuthGrantRejected("OAuth refresh requires its original claim secret")
+        _record(tokens, OAuthGrantTokens)
         original = await self._read(claim.binding, secret=claim.secret)
         if original is None or original.state != 'refreshing' or original.revision != claim.revision:
             raise OAuthGrantChanged("OAuth refresh claim is no longer current")
