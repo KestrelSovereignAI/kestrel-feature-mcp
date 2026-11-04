@@ -1,5 +1,6 @@
 """Actual independent AS/resource TLS with two fresh clients per grant."""
 import asyncio
+import base64
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,8 @@ import time
 import pytest
 
 from tests.unit.test_oauth_acceptance_http import oauth_peers  # noqa: F401
+from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+from kestrel_feature_mcp.oauth_grants import OAuthGrantBinding, OAuthGrantStore, OAuthGrantTokens
 
 
 @pytest.mark.asyncio
@@ -17,18 +20,31 @@ from tests.unit.test_oauth_acceptance_http import oauth_peers  # noqa: F401
     {'refresh': True, 'refresh_rotate': True},
     {'refresh': True, 'refresh_rotate': False},
 ], indirect=True)
-async def test_public_authlib_refresh_survives_two_fresh_processes(oauth_peers, tmp_path):
+async def test_public_authlib_refresh_survives_two_fresh_processes(oauth_peers, tmp_path, monkeypatch):
     peers = oauth_peers
     selection = peers.selection
-    path = tmp_path / 'synthetic-grant.json'
+    monkeypatch.setenv('KESTREL_DATA_KEY', base64.urlsafe_b64encode(b'r' * 32).decode())
+    path = tmp_path / 'synthetic-grant.db'
     expired = {'access_token': 'fixture-expired-access', 'refresh_token': 'native-fixture-refresh',
         'token_type': 'Bearer', 'expires_in': 3600, 'expires_at': int(time.time()) - 300,
         'scope': 'read'}
-    path.write_text(json.dumps(expired))
+    binding = OAuthGrantBinding('did:test:refresh-owner', 'fixture-operator', 'fixture-connection',
+        selection.server_url, selection.resource, selection.issuer, selection.client_id,
+        selection.redirect_uri, selection.scopes)
+    db = SQLiteBackend(str(path))
+    await db.connect()
+    try:
+        store = OAuthGrantStore(db, binding.agent_did, max_token_bytes=4096)
+        await store.initialize()
+        await store.install(binding, OAuthGrantTokens(expired['access_token'], expired['refresh_token'],
+            expired['expires_at'], frozenset({'read'})))
+    finally:
+        await db.close()
     config = dict(server_url=selection.server_url, resource=selection.resource, issuer=selection.issuer,
         protected_metadata=selection.protected_metadata,
         authorization_metadata=selection.authorization_metadata,
         client_id=selection.client_id,
+        redirect_uri=selection.redirect_uri,
         certificate=os.environ['SSL_CERT_FILE'], grant_file=str(path), owned_root=str(tmp_path),
         expected_refresh_token='native-fixture-rotated' if peers.options['refresh_rotate'] else 'native-fixture-refresh')
     results = []
@@ -49,6 +65,9 @@ async def test_public_authlib_refresh_survives_two_fresh_processes(oauth_peers, 
     assert [r['expired_on_restore'] for r in results] == [True, False]
     assert [r['refresh_performed'] for r in results] == [True, False]
     assert all(r['absolute_expiry_preserved'] for r in results)
+    assert all(r['encrypted_grant_restored'] for r in results)
+    assert b'fixture-expired-access' not in path.read_bytes()
+    assert b'native-fixture-refresh' not in path.read_bytes()
     assert peers.requests.count(('POST', '/token')) == 1
     assert ('GET', '/authorize') not in peers.requests and not peers.browser_requests
     assert peers.resource.witness == []
