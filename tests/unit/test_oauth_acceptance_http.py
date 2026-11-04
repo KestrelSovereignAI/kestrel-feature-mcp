@@ -8,6 +8,7 @@ import base64
 import asyncio
 from dataclasses import dataclass
 import hashlib
+import gzip
 import json
 from pathlib import Path
 import secrets
@@ -19,7 +20,7 @@ import httpcore2
 import httpx2
 import pytest
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, RedirectResponse, StreamingResponse
+from starlette.responses import JSONResponse, RedirectResponse, StreamingResponse, Response
 from starlette.routing import Route
 from mcp.client.auth import OAuthTokenError
 from mcp.shared.exceptions import MCPError
@@ -81,18 +82,22 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
     async def identity(_request):
         state.requests.append(("GET", "/client.json"))
         if options.get("oversized") == "identity":
-            return StreamingResponse(held_body(b"X" * 65537), media_type="application/json")
-        return JSONResponse({
+            return StreamingResponse(held_body(b"X" * 65537), media_type=options.get('oversize_media_type', 'application/json'))
+        document = {
             "client_id": state.client_id, "client_name": "Kestrel OAuth wire fixture",
             "application_type": "native", "redirect_uris": [callback],
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"], "token_endpoint_auth_method": "none",
-        })
+        }
+        if options.get('compressed') == 'identity':
+            return Response(gzip.compress(json.dumps(document).encode()),
+                media_type='application/json', headers={'Content-Encoding': 'gzip'})
+        return JSONResponse(document)
 
     async def metadata(_request):
         state.requests.append(("GET", "/.well-known/oauth-authorization-server"))
         if options.get("oversized") == "authorization":
-            return StreamingResponse(held_body(b"X" * 65537), media_type="application/json")
+            return StreamingResponse(held_body(b"X" * 65537), media_type=options.get('oversize_media_type', 'application/json'))
         document = {
             "issuer": (state.issuer.replace("issuer.example", "ISSUER.example")
                        if options.get("wrong_issuer_spelling") else state.issuer),
@@ -109,6 +114,9 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         if options.get("stall_metadata"):
             return StreamingResponse(held_body(json.dumps(document).encode()),
                                      media_type="application/json")
+        if options.get('compressed') == 'authorization':
+            return Response(gzip.compress(json.dumps(document).encode()),
+                media_type='application/json', headers={'Content-Encoding': 'gzip'})
         return JSONResponse(document)
 
     async def authorize(request):
@@ -165,6 +173,9 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         ).rstrip(b"=").decode("ascii")
         assert original["code_challenge"] == [challenge]
         result["refresh_token"] = "native-fixture-refresh"
+        if options.get('compressed') == 'token':
+            return Response(gzip.compress(json.dumps(result).encode()),
+                media_type='application/json', headers={'Content-Encoding': 'gzip'})
         return JSONResponse(result)
 
     app = Starlette(routes=[Route("/client.json", identity),
@@ -302,7 +313,9 @@ async def test_bootstrap_hands_off_without_waiting_for_event_stream_eof(oauth_pe
 
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
 @pytest.mark.parametrize("oauth_peers", [{"oversized": "identity"},
-                                         {"oversized": "authorization"}], indirect=True)
+                                         {"oversized": "authorization"},
+                                         {'oversized': 'identity', 'oversize_media_type': 'text/event-stream'},
+                                         {'oversized': 'authorization', 'oversize_media_type': 'text/event-stream'}], indirect=True)
 async def test_oversized_stream_is_refused_before_waiting_for_its_end(oauth_peers):
     async def attempt():
         with pytest.raises(GrantRejected, match="response budget"):
@@ -553,4 +566,14 @@ async def test_native_token_cannot_expand_consent_within_the_configured_ceiling(
     assert oauth_peers.requests.count(("POST", "/token")) == 1
     assert all(b"authorization" not in dict(scope["headers"])
                for scope, _ in oauth_peers.resource.requests)
+    assert oauth_peers.resource.witness == []
+
+
+@pytest.mark.parametrize('mcp_http_server', [{'tls': True, 'oauth': {}}], indirect=True)
+@pytest.mark.parametrize('oauth_peers', [{'compressed': 'identity'}, {'compressed': 'authorization'}, {'compressed': 'token'}], indirect=True)
+async def test_oauth_uses_canonical_decompression_refusal_on_real_https(oauth_peers):
+    with pytest.raises(GrantRejected, match='content encoding'):
+        await drive(oauth_peers)
+    expected = 1 if oauth_peers.options['compressed'] == 'token' else 0
+    assert oauth_peers.requests.count(('POST', '/token')) == expected
     assert oauth_peers.resource.witness == []

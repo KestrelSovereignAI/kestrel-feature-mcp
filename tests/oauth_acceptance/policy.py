@@ -14,17 +14,8 @@ from mcp.shared.auth_utils import check_resource_allowed, resource_url_from_serv
 from mcp_types import JSONRPCError, JSONRPCResponse, jsonrpc_message_adapter
 from pydantic import ValidationError
 
-DEFAULT_RESPONSE_MAX_BYTES = 65536
-
-
-class GrantRejected(ValueError):
-    """Safe diagnostic; never interpolate a token, callback or response body."""
-
-
-def response_budget(value: int) -> int:
-    if type(value) is not int or value < 1:
-        raise GrantRejected("Acceptance response budget must be a positive integer")
-    return value
+from kestrel_feature_mcp.oauth_policy import DEFAULT_RESPONSE_MAX_BYTES, GrantRejected, response_budget
+from kestrel_feature_mcp.oauth_http import GuardedAuth
 
 
 def _origin(url: str) -> str:
@@ -249,33 +240,3 @@ class MemoryGrant:
         self._tokens = tokens.model_copy(update={"scope": " ".join(sorted(granted))}, deep=True)
 
 
-class GuardedAuth(httpx2.Auth):
-    """Apply role policy around the SDK's public HTTP authentication generator.
-
-    The original requests and responses pass through unchanged. The SDK owns
-    discovery, PKCE, callback validation, token exchange and authentication.
-    The resource phase retains this policy with its obtained bearer grant;
-    interactive grant acquisition is separate from concurrent MCP traffic.
-    """
-
-    def __init__(self, provider: httpx2.Auth, policy: GrantPolicy):
-        self.provider = provider
-        self.policy = policy
-
-    async def async_auth_flow(self, request: httpx2.Request):
-        flow = self.provider.async_auth_flow(request)
-        try:
-            try:
-                outgoing = await anext(flow)
-            except StopAsyncIteration:
-                return
-            while True:
-                await self.policy.request(outgoing)
-                incoming = yield outgoing
-                await self.policy.response(incoming)
-                try:
-                    outgoing = await flow.asend(incoming)
-                except StopAsyncIteration:
-                    return
-        finally:
-            await flow.aclose()

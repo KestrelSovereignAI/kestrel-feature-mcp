@@ -22,7 +22,7 @@ from mcp.client.streamable_http import streamable_http_client
 from kestrel_sdk.security.outbound import ValidatedOutboundURL, pinned_httpx2_async_transport
 
 from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSION_CLOSE_TIMEOUT_DEFAULT, RESPONSE_MAX_BYTES_DEFAULT
-from .http_limits import MCPResponseBudget, MCPResponseLimitError
+from .http_limits import MCPResponseBudget, MCPResponseLimitError, identity_accept_encoding
 from .tool_contract import MCPToolContractError, validate_tool_contract
 from ._lifecycle import run_cleanup_steps
 
@@ -193,10 +193,7 @@ class MCPConnection:
         self.url = url.url if self._outbound is not None else url
         self._response_budget = MCPResponseBudget(response_max_bytes)
         request_headers = httpx2.Headers(headers)
-        encoding = request_headers.get("accept-encoding", "identity").strip().lower()
-        if encoding not in {"identity", "identity;q=1, *;q=0"}:
-            raise ValueError("MCP response limits require identity Accept-Encoding")
-        request_headers["Accept-Encoding"] = "identity;q=1, *;q=0"
+        request_headers["Accept-Encoding"] = identity_accept_encoding(request_headers.get("accept-encoding"))
         self._headers = dict(request_headers)
         self._auth = auth
         self._extensions = tuple(extensions or ())

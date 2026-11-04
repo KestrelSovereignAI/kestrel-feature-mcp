@@ -3,17 +3,28 @@
 import httpx2
 
 
+IDENTITY_ACCEPT_ENCODING = "identity;q=1, *;q=0"
+
+
+def identity_accept_encoding(value=None):
+    """One compression policy before native HTTPX decoding can allocate bytes."""
+    encoding = "identity" if value is None else value.strip().lower()
+    if encoding not in {"identity", IDENTITY_ACCEPT_ENCODING}:
+        raise ValueError("MCP response limits require identity Accept-Encoding")
+    return IDENTITY_ACCEPT_ENCODING
+
+
 class MCPResponseLimitError(httpx2.StreamError):
     """An untrusted response exceeded the configured transport contract."""
 
 
 class _ResponseStream(httpx2.AsyncByteStream):
-    def __init__(self, response, max_bytes):
+    def __init__(self, response, max_bytes, allow_sse):
         self._stream = response.stream
         self._max_bytes = max_bytes
         self._encoding = response.headers.get("content-encoding", "identity").strip().lower()
         self._length = response.headers.get("content-length")
-        self._is_sse = response.headers.get("content-type", "").partition(";")[0].strip().lower() == "text/event-stream"
+        self._is_sse = allow_sse and response.headers.get("content-type", "").partition(";")[0].strip().lower() == "text/event-stream"
         self._closed = False
 
     async def __aiter__(self):
@@ -48,10 +59,13 @@ class _ResponseStream(httpx2.AsyncByteStream):
 class MCPResponseBudget:
     """Public HTTPX response hook; SSE events use the native SDK's event cap."""
 
-    def __init__(self, max_bytes):
+    def __init__(self, max_bytes, *, allow_sse=True):
         if type(max_bytes) is not int or max_bytes <= 0:
             raise ValueError("MCP response byte limit must be a positive integer")
         self.max_bytes = max_bytes
+        if type(allow_sse) is not bool:
+            raise ValueError("MCP response SSE policy must be explicit")
+        self.allow_sse = allow_sse
 
     async def __call__(self, response):
-        response.stream = _ResponseStream(response, self.max_bytes)
+        response.stream = _ResponseStream(response, self.max_bytes, self.allow_sse)

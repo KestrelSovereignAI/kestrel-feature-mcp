@@ -25,6 +25,8 @@ from mcp.shared.auth import OAuthClientMetadata
 from mcp_types.version import LATEST_PROTOCOL_VERSION
 
 from kestrel_feature_mcp.connection import MCPConnection
+from kestrel_feature_mcp.http_limits import IDENTITY_ACCEPT_ENCODING
+from kestrel_feature_mcp.oauth_http import BudgetedTransport
 from .callback import CallbackRejected, LoopbackCallback
 from .policy import (DEFAULT_RESPONSE_MAX_BYTES, GrantPolicy, GrantRejected, GrantSelection,
                      GuardedAuth, MemoryGrant, response_budget)
@@ -37,48 +39,6 @@ class AuthorizationReady(Exception):
 class RefuseUnselectedOrigin(httpx2.AsyncBaseTransport):
     async def handle_async_request(self, request):
         raise GrantRejected("No transport is available for an unselected origin")
-
-
-class _BudgetedStream(httpx2.AsyncByteStream):
-    def __init__(self, stream, limit, deadline):
-        self.stream, self.limit, self.deadline = stream, limit, deadline
-
-    async def __aiter__(self):
-        total = 0
-        try:
-            async with asyncio.timeout_at(self.deadline):
-                async for chunk in self.stream:
-                    total += len(chunk)
-                    if total > self.limit:
-                        raise GrantRejected("OAuth HTTP response budget exceeded")
-                    yield chunk
-        finally:
-            await self.stream.aclose()
-
-    async def aclose(self):
-        await self.stream.aclose()
-
-
-class _BudgetedTransport(httpx2.AsyncBaseTransport):
-    """Keep native pinning; bound every bootstrap HTTP exchange before buffering.
-
-    SDK auth-generated requests need their own deadline: they do not inherit
-    the HTTP client's request extensions. Browser consent has a separate clock.
-    No request, response object, header or content is replaced.
-    """
-
-    def __init__(self, transport, limit, timeout):
-        self.transport, self.limit, self.timeout = transport, limit, timeout
-
-    async def handle_async_request(self, request):
-        deadline = asyncio.get_running_loop().time() + self.timeout
-        async with asyncio.timeout_at(deadline):
-            response = await self.transport.handle_async_request(request)
-        response.stream = _BudgetedStream(response.stream, self.limit, deadline)
-        return response
-
-    async def aclose(self):
-        await self.transport.aclose()
 
 
 async def open_authorization(url: str):
@@ -112,7 +72,8 @@ async def open_authorization(url: str):
 async def client_metadata(selection: GrantSelection, *, timeout: float, response_max_bytes: int):
     endpoint = await assert_safe_url(selection.client_id, allowed_schemes=("https",))
     async with httpx2.AsyncClient(
-        transport=_BudgetedTransport(pinned_httpx2_async_transport(endpoint), response_max_bytes, timeout),
+        transport=BudgetedTransport(pinned_httpx2_async_transport(endpoint), response_max_bytes, timeout),
+        headers={"Accept-Encoding": IDENTITY_ACCEPT_ENCODING},
         trust_env=False,
         follow_redirects=False, timeout=timeout,
     ) as client:
@@ -190,7 +151,7 @@ async def run(selection: GrantSelection, *, mode: str, browser_timeout: float,
             origin = parsed.scheme + "://" + parsed.netloc
             if origin not in mounts:
                 approved = await assert_safe_url(url, allowed_schemes=("https",))
-                mounts[origin] = _BudgetedTransport(
+                mounts[origin] = BudgetedTransport(
                     pinned_httpx2_async_transport(approved), response_max_bytes, network_timeout)
                 if url == selection.server_url:
                     server = approved
@@ -199,6 +160,7 @@ async def run(selection: GrantSelection, *, mode: str, browser_timeout: float,
         # request through the role guard and origin-pinned native transports.
         async with httpx2.AsyncClient(
             transport=RefuseUnselectedOrigin(), mounts=mounts, auth=auth,
+            headers={"Accept-Encoding": IDENTITY_ACCEPT_ENCODING},
             follow_redirects=False, trust_env=False, timeout=network_timeout,
         ) as client:
             try:
