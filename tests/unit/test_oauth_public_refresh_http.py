@@ -17,8 +17,8 @@ from tests.unit.test_oauth_grants import install_grant
 @pytest.mark.asyncio
 @pytest.mark.parametrize('mcp_http_server', [{'tls': True, 'oauth': {}}], indirect=True)
 @pytest.mark.parametrize('oauth_peers', [
-    {'refresh': True, 'refresh_rotate': True},
-    {'refresh': True, 'refresh_rotate': False},
+    {'refresh': True, 'refresh_rotate': True, 'web_identity': True},
+    {'refresh': True, 'refresh_rotate': False, 'web_identity': True},
 ], indirect=True)
 async def test_public_authlib_refresh_survives_two_fresh_processes(oauth_peers, tmp_path, owned_oauth_key):
     peers = oauth_peers

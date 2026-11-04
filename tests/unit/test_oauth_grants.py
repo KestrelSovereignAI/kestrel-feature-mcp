@@ -648,3 +648,10 @@ async def test_sqlite_schema_creation_refuses_missing_native_writer_capability(o
     with pytest.raises(OAuthGrantRejected, match='native SQLite immediate'):
         await store.initialize()
     assert await databases[0].fetch_val('SELECT COUNT(*) FROM mcp_oauth_credential_slots') == 0
+
+
+@pytest.mark.parametrize('expiry,now,expected', [(None, 1000, False),
+    (1000.5, 1000.49, False), (1000.5, 1000.5, True), (1000.5, 1001, True)])
+def test_token_expiry_uses_the_persisted_absolute_timestamp(expiry, now, expected):
+    token = OAuthGrantTokens('owned-access', None, expiry, frozenset({'read'}))
+    assert token.is_expired(now) is expected

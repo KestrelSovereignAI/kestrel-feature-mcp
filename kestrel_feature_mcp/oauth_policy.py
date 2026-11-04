@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+import math
+import sys
 import re
 from urllib.parse import parse_qs, urlsplit
 
@@ -13,7 +15,7 @@ from mcp.client.auth.utils import (
     build_protected_resource_metadata_discovery_urls,
     extract_resource_metadata_from_www_auth,
 )
-from mcp.shared.auth import OAuthMetadata, ProtectedResourceMetadata
+from mcp.shared.auth import OAuthMetadata, OAuthToken, ProtectedResourceMetadata
 from mcp_types import JSONRPCNotification, JSONRPCRequest, client_notification_adapter, jsonrpc_message_adapter
 from mcp.shared.auth_utils import check_resource_allowed, resource_url_from_server_url
 from pydantic import ValidationError
@@ -28,6 +30,13 @@ class GrantRejected(ValueError):
 def response_budget(value: int) -> int:
     if type(value) is not int or value < 1:
         raise GrantRejected("OAuth response budget must be a positive integer")
+    return value
+
+
+def positive_seconds(value):
+    if (type(value) not in (int, float) or value <= 0
+            or value > sys.float_info.max or not math.isfinite(value)):
+        raise GrantRejected("OAuth timeout must be finite and positive")
     return value
 
 
@@ -364,9 +373,9 @@ async def resource_lane(request: httpx2.Request, server_url: str) -> str:
 class RefreshPolicy(VerifiedGrantPolicy):
     """Reverify the recorded metadata and allow one explicit Authlib refresh."""
 
-    def __init__(self, selection, *, on_exchange, response_max_bytes=DEFAULT_RESPONSE_MAX_BYTES):
+    def __init__(self, selection, *, on_exchange, on_rejection=None, response_max_bytes=DEFAULT_RESPONSE_MAX_BYTES):
         super().__init__(selection, response_max_bytes=response_max_bytes)
-        self.on_exchange = on_exchange
+        self.on_exchange, self.on_rejection = on_exchange, on_rejection
         self.exchange_started = False
 
     async def request(self, request):
@@ -383,10 +392,19 @@ class RefreshPolicy(VerifiedGrantPolicy):
             return
         raise GrantRejected('An unexpected OAuth refresh request was refused before network I/O')
 
+    async def response(self, response):
+        await super().response(response)
+        if str(response.request.url) == self.token_endpoint:
+            await reject_token_response(response, self.on_rejection)
+
 
 async def reject_token_response(response, on_rejection):
     """Never pass an AS error body into native SDK/Authlib exception text."""
     if response.status_code in {200, 201}:
+        document = metadata_document(await response.aread())
+        validate_metadata(OAuthToken, document)
+        if 'error' in document:
+            raise GrantRejected('OAuth token receipt contains an authorization error')
         return
     if response.status_code in {400, 401}:
         document = metadata_document(await response.aread())

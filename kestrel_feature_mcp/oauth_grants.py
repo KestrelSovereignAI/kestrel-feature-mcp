@@ -121,6 +121,10 @@ class OAuthGrantTokens:
             raise OAuthGrantRejected("OAuth expiry must be an absolute finite timestamp")
         _scopes(self.scopes)
 
+    def is_expired(self, now: float) -> bool:
+        """Compare the persisted absolute receipt expiry, without rebasing it."""
+        return self.expires_at is not None and self.expires_at <= now
+
 
 @dataclass(frozen=True)
 class OAuthGrantSnapshot:

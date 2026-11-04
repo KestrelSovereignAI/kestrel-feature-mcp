@@ -6,6 +6,7 @@ import pytest
 from kestrel_feature_mcp.http_limits import MCPResponseBudget, MCPResponseLimitError
 from kestrel_feature_mcp.oauth_http import BudgetedTransport
 from kestrel_feature_mcp.oauth_policy import GrantRejected
+from kestrel_feature_mcp.oauth_refresh import OAuthRefresher
 from tests.unit.test_mcp_response_limits import CountedBody
 
 
@@ -49,3 +50,9 @@ async def test_unapproved_oauth_origin_is_refused_before_any_dns(monkeypatch):
         await transport.aclose()
     with pytest.raises(GrantRejected, match='currently approved'):
         await transport.handle_async_request(httpx2.Request('GET', 'https://resource.example/mcp'))
+
+
+@pytest.mark.parametrize('seconds', [None, True, 0, float('inf'), 10**400])
+def test_refresh_close_budget_must_be_finite_before_any_io(seconds):
+    with pytest.raises(GrantRejected, match='finite and positive'):
+        OAuthRefresher(None, {}, close_seconds=seconds)

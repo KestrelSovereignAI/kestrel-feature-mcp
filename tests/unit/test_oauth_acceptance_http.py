@@ -144,6 +144,17 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             parameters.update(session_state="opaque-session", scope="read")
         return RedirectResponse(callback + "?" + urlencode(parameters), status_code=302)
 
+    def token_response(result):
+        if options.get('token_error_status'):
+            return JSONResponse({'error': 'invalid_grant',
+                'error_description': 'owned-sensitive-AS-error-marker'}, status_code=options['token_error_status'])
+        if options.get('stall_token'):
+            return StreamingResponse(held_body(json.dumps(result).encode()), media_type='application/json')
+        if options.get('compressed') == 'token':
+            return Response(gzip.compress(json.dumps(result).encode()),
+                media_type='application/json', headers={'Content-Encoding': 'gzip'})
+        return JSONResponse(result)
+
     async def token(request):
         if options.get("before_token") is not None:
             await options["before_token"]()
@@ -163,7 +174,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             assert "authorization" not in request.headers
             if options.get("refresh_rotate"):
                 result["refresh_token"] = "native-fixture-rotated"
-            return JSONResponse(result)
+            return token_response(result)
         assert fields["grant_type"] == ["authorization_code"]
         assert fields["client_id"] == [state.client_id]
         assert fields["redirect_uri"] == [callback]
@@ -174,14 +185,8 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             hashlib.sha256(fields["code_verifier"][0].encode("ascii")).digest(),
         ).rstrip(b"=").decode("ascii")
         assert original["code_challenge"] == [challenge]
-        if options.get('token_error_status'):
-            return JSONResponse({'error': 'invalid_grant',
-                'error_description': 'owned-sensitive-AS-error-marker'}, status_code=options['token_error_status'])
         result["refresh_token"] = "native-fixture-refresh"
-        if options.get('compressed') == 'token':
-            return Response(gzip.compress(json.dumps(result).encode()),
-                media_type='application/json', headers={'Content-Encoding': 'gzip'})
-        return JSONResponse(result)
+        return token_response(result)
 
     app = Starlette(routes=[Route("/client.json", identity),
                            Route("/.well-known/oauth-authorization-server", metadata),

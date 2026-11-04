@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import math
-import sys
 from typing import Protocol
 
 import httpx2
 
 from .http_limits import MCPResponseBudget, MCPResponseLimitError, identity_accept_encoding
-from .oauth_policy import GrantRejected, response_budget
+from .oauth_policy import GrantRejected, positive_seconds, response_budget
 
 
 class AuthFlowPolicy(Protocol):
@@ -50,10 +48,7 @@ class BudgetedTransport(httpx2.AsyncBaseTransport):
 
     def __init__(self, transport, limit, timeout):
         self.transport, self.limit = transport, response_budget(limit)
-        if (type(timeout) not in (int, float) or timeout <= 0
-                or timeout > sys.float_info.max or not math.isfinite(timeout)):
-            raise GrantRejected("OAuth network timeout must be finite and positive")
-        self.timeout = timeout
+        self.timeout = positive_seconds(timeout)
 
     async def handle_async_request(self, request):
         try:

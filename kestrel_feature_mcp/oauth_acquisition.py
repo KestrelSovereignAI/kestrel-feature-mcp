@@ -8,7 +8,7 @@ import time
 from mcp.client.auth.utils import create_client_info_from_metadata_url
 
 from .oauth_grants import OAuthGrantBinding, OAuthGrantTokens
-from .oauth_policy import GrantRejected
+from .oauth_policy import GrantRejected, positive_seconds
 
 
 class IntentTokenStorage:
@@ -99,7 +99,7 @@ class AuthorizationOperation:
         self.handle, self.identity, self.budgets = handle, identity, dict(budgets)
         self.server_url = server_url
         self.expected, self.acknowledge_unknown = expected, acknowledge_unknown
-        self.close_seconds = close_seconds
+        self.close_seconds = positive_seconds(close_seconds)
         self._phase_check = check
         self._withdrawn = False
         self._cancel_requested = False
