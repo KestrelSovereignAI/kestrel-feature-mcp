@@ -947,7 +947,7 @@ async def test_native_core_restores_apps_connection_only_after_soft_activation_c
         assert not original_batch.is_live()
         phases = []
         before_commit = feature.post_all_features_loaded
-        ready = feature.on_agent_ready
+        ready = getattr(feature, "on_agent_ready", None)
 
         async def observe_before_commit(host):
             phases.append("before-commit")
@@ -964,9 +964,10 @@ async def test_native_core_restores_apps_connection_only_after_soft_activation_c
 
         # Observe the real hooks without replacing their implementation.
         monkeypatch.setattr(feature, "post_all_features_loaded", observe_before_commit)
-        monkeypatch.setattr(feature, "on_agent_ready", observe_ready)
+        if ready is not None:
+            monkeypatch.setattr(feature, "on_agent_ready", observe_ready)
         await agent._activate_feature_runtime(feature)
-        assert phases == ["before-commit", "ready"]
+        assert phases == ["before-commit", "ready"], "Native ready hook was not invoked after activation committed"
         assert feature.enabled is True
         assert name in feature._remote_connections, "Saved Apps connection was not restored after activation committed"
         restored = feature._remote_connections[name].connection
