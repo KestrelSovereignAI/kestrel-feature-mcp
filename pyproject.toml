@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-mcp"
-version = "0.10.1"
+version = "0.11.0"
 description = "Model Context Protocol (MCP) server management for Kestrel Sovereign agents"
 readme = "README.md"
 license = "Apache-2.0"
@@ -17,7 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "kestrel-sovereign>=0.59.0,<1",
+    "kestrel-sovereign>=0.60.0,<1",
     "packaging",
     "pytest>=8.0.0",
     "pytest-asyncio>=1.1.0",
@@ -48,6 +48,7 @@ packages = ["kestrel_feature_mcp"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
+    "apps_browser: native Core chat and MCP Apps browser integration",
     "docker: tests that require Docker",
     "docker_mcp: tests that require Docker MCP Toolkit",
 ]

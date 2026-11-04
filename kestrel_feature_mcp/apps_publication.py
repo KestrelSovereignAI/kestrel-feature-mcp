@@ -9,7 +9,6 @@ locator nor its chat metadata grants access to a native result or resource.
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import AsyncExitStack
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial
@@ -28,33 +27,9 @@ from .apps_execution import (
     AppExecutor, AppView, MCPAppResultWithheld, RegisteredAppTool,
     call_synchronous_callback, require_synchronous_callback,
 )
+from ._lifecycle import run_cleanup_steps
 if TYPE_CHECKING:
     from .dynamic_tools import MCPToolWrapper
-
-
-async def _run_retirement_steps(steps: list[tuple[bool, Callable]]) -> None:
-    """Attempt every cleanup and propagate all original failures explicitly."""
-    failures: list[BaseException] = []
-
-    def retain_failure(_kind, error, _traceback):
-        if error is None:
-            return False
-        if not any(error is previous for previous in failures):
-            failures.append(error)
-        # The failure is re-raised below, after every owned join is attempted.
-        return True
-
-    async with AsyncExitStack() as cleanup:
-        for asynchronous, operation in reversed(steps):
-            cleanup.push(retain_failure)
-            if asynchronous:
-                cleanup.push_async_callback(operation)
-            else:
-                cleanup.callback(operation)
-    if len(failures) == 1:
-        raise failures[0]
-    if failures:
-        raise BaseExceptionGroup("MCP App retirement did not complete normally", failures)
 
 
 @dataclass(eq=False)
@@ -182,6 +157,13 @@ class AppPublications:
         for reference, publication in tuple(self._publications.items()):
             if publication.batch is batch:
                 self._discard(reference, publication)
+
+    async def retire_connection(self, connection) -> None:
+        """Fence and join original batches before their native transport closes."""
+        for owner, batch in tuple(self._batches.items()):
+            if batch.tools[0].tool.bound_caller.connection is connection:
+                self.retire(owner)
+        await self.drain_retired()
 
     def _discard(self, reference: str, publication: _Publication) -> None:
         self._publications.pop(reference, None)
@@ -320,10 +302,10 @@ class AppPublications:
         steps = [(False, partial(self._prune_source, batch))
                  for batch in tuple(self._batches.values())]
         steps.extend([(False, self._prune), (True, self._join_retired_views)])
-        await _run_retirement_steps(steps)
+        await run_cleanup_steps(steps)
 
     async def _join_retired_views(self) -> None:
-        await _run_retirement_steps([(True, partial(self._close_owned_view, view))
+        await run_cleanup_steps([(True, partial(self._close_owned_view, view))
                                      for view in tuple(self._views) if view._closed])
 
     async def close(self) -> None:

@@ -115,7 +115,7 @@ async def test_bad_native_catalog_never_reaches_gateway_enablement_storage(
     manager = MCPGatewayManager()
     manager.gateway = OwnedHTTPGateway()
     monkeypatch.setattr("kestrel_feature_mcp.feature.check_docker_mcp_available", lambda: True)
-    monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", lambda: manager)
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", lambda *, connection_factory: manager)
     if already_connected:
         await manager.start(["known-good"])
         feature.gateway_manager = manager

@@ -56,10 +56,12 @@ export async function buildSandboxAssets(outputDirectory) {
     for (const [entry, filename, platform, target] of [
         ['src/sandbox-entry.js', 'sandbox-entry.js', 'browser', 'es2022'],
         ['src/sandbox-server-entry.js', 'sandbox-service.mjs', 'node', 'node22'],
+        ['src/parent-entry.js', 'parent-entry.js', 'browser', 'es2022'],
     ]) {
         const result = await build({ absWorkingDir: webRoot, entryPoints: [entry],
             outfile: path.join(destination, filename), bundle: true, format: 'esm',
             platform, target, minify: true, legalComments: 'inline', metafile: true, write: false,
+            external: ['/js/*'],
             charset: 'utf8', logLevel: 'silent' });
         for (const output of result.outputFiles) {
             const name = path.basename(output.path);

@@ -24,6 +24,9 @@ from .connection import MCPConnection, MCP_CONNECTION_ERRORS, bind_tool_caller, 
 from .constants import SESSION_CONNECT_TIMEOUT_DEFAULT
 from .remote import RemoteMCPServer, RemoteMCPError, connection_error_message, remote_name_for_url, remote_owner
 from .dynamic_tools import build_wrappers
+from .apps_execution import RegisteredAppTool
+from .apps_host import MCPAppsFeatureMixin
+from ._lifecycle import MCPFeatureClosingError, run_cleanup_steps
 from .images import normalize_image_ref
 from .registry import (
     get_registry,
@@ -45,10 +48,6 @@ logger = logging.getLogger(__name__)
 # Gateway-mounted tools share one owner (the gateway aggregates many servers and
 # does not attribute tools per-server); each container is its own owner.
 _GATEWAY_OWNER = "mcp:gateway"
-
-
-class MCPFeatureClosingError(RuntimeError):
-    """A connection start belongs to a feature generation that is closing."""
 
 
 class MCPHostCapabilityError(RemoteMCPError):
@@ -142,7 +141,7 @@ def _official_record_blocks(records: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-class MCPAgent(Feature):
+class MCPAgent(MCPAppsFeatureMixin, Feature):
     """
     A Feature Agent that manages Model Context Protocol (MCP) tools.
     It encapsulates the complexity of Docker container management and tool discovery,
@@ -162,6 +161,7 @@ class MCPAgent(Feature):
         self._lifecycle_generation = 0
         self._owner_did: str | None = None
         self._closing = False
+        self._init_apps()
 
     @property
     def tool_description(self) -> str:
@@ -174,6 +174,10 @@ class MCPAgent(Feature):
     async def initialize(self):
         owner_did = require_owner_did(self.agent.agent_id)
         async with self._lifecycle_transition:
+            if (not self._closing and self._apps_maintenance is not None
+                    and self._apps_maintenance.done()):
+                self._closing = True
+                self._lifecycle_generation += 1
             if self._closing:
                 # A soft disable retains this instance. Finish failed cleanup
                 # before reopening; live initialization retains its resources.
@@ -182,11 +186,15 @@ class MCPAgent(Feature):
                     self.manager = None
             self._owner_did = owner_did
             self._closing = False
+            if self._apps_settings.enabled and self._apps_host is None:
+                await self._start_apps()
         logger.info("MCPAgent initialized; Docker connects only for container operations.")
 
     def _require_open(self, generation: int | None = None) -> None:
-        if self._closing or (generation is not None and generation != self._lifecycle_generation):
+        if self._closing:
             raise MCPFeatureClosingError("MCP feature is shutting down")
+        if generation is not None and generation != self._lifecycle_generation:
+            raise MCPFeatureClosingError("MCP connection start belongs to an earlier configuration generation")
 
     def _connection_owner_did(self) -> str:
         return self._owner_did or require_owner_did(self.agent.agent_id)
@@ -198,7 +206,8 @@ class MCPAgent(Feature):
                 from .manager import MCPToolManager, DockerDaemonUnavailableError
 
                 try:
-                    self.manager = await MCPToolManager.create(owner_did=self._connection_owner_did())
+                    self.manager = await MCPToolManager.create(owner_did=self._connection_owner_did(),
+                                                              **self._manager_connection_settings())
                 except DockerDaemonUnavailableError as error:
                     logger.warning("Local Docker daemon unavailable; Docker MCP tools are disabled: %s", error)
                     return False
@@ -237,12 +246,26 @@ class MCPAgent(Feature):
         of tools mounted. A host without a dynamic registry is unsupported.
         """
         self._require_governed_host()
-        wrappers = build_wrappers(handle_prefix, tool_dicts, caller)
-        self.agent.unregister_dynamic_tools(owner)
-        return self.agent.register_dynamic_tools(owner, wrappers)
+        publications = self._apps_publications
+        wrappers = build_wrappers(handle_prefix, tool_dicts, caller,
+            app_executor=publications.executor if publications is not None else None)
+        self._unmount_tools(owner)
+        if publications is None:
+            return self.agent.register_dynamic_tools(owner, wrappers)
+        registered = []
+        count = self.agent.register_dynamic_tools(owner, wrappers,
+            on_registered=lambda tool, binding: registered.append(RegisteredAppTool(tool, binding)))
+        generation = self._lifecycle_generation
+        publications.register(owner, registered, is_current=lambda: (
+            self._apps_publications is publications and not self._closing
+            and self._lifecycle_generation == generation
+            and self.agent.features.get(self.name) is self and self.enabled is True))
+        return count
 
     def _unmount_tools(self, owner: str) -> int:
         """Remove all tools mounted under ``owner`` (inverse of _mount_tools)."""
+        if self._apps_publications is not None:
+            self._apps_publications.retire(owner)
         if not self._host_supports_dynamic_tools():
             return 0
         return self.agent.unregister_dynamic_tools(owner)
@@ -483,6 +506,8 @@ class MCPAgent(Feature):
             raise RemoteMCPError("Host did not retain MCP enablement; initialize its durable store")
 
     async def _load_remote_connection(self, url: str, expected_name: str | None) -> ToolResult:
+        generation = self._lifecycle_generation
+        self._require_open(generation)
         invalid = _selector_failure(url)
         if invalid is not None:
             raise RemoteMCPError(invalid.error)
@@ -497,12 +522,12 @@ class MCPAgent(Feature):
         name = remote_name_for_url(endpoint.url, owner_did)
         if expected_name is not None and name != expected_name:
             raise RemoteMCPError("Stored MCP endpoint is not canonical; reconnect it explicitly")
-        async with connection_lifecycle(self._remote_lifecycle, name):
-            self._require_open()
+        async with self._lifecycle_transition, connection_lifecycle(self._remote_lifecycle, name):
+            self._require_open(generation)
             owner = remote_owner(name)
             self._unmount_tools(owner)
             await self._retire_remote(name)
-            record = RemoteMCPServer(name, endpoint, MCPConnection(endpoint))
+            record = RemoteMCPServer(name, endpoint, self._new_mcp_connection(endpoint))
             self._remote_connections[name] = record
             published = False
             persistent = False
@@ -703,7 +728,7 @@ class MCPAgent(Feature):
             else:
                 await self._retire_gateway()
                 self._require_open()
-                self.gateway_manager = MCPGatewayManager()
+                self.gateway_manager = MCPGatewayManager(**self._manager_connection_settings())
                 before = set()
                 tools = await self.gateway_manager.start([server_name])
 
@@ -1163,7 +1188,7 @@ class MCPAgent(Feature):
             changed = True
             await self._retire_gateway()
             self._require_open()
-            self.gateway_manager = MCPGatewayManager()
+            self.gateway_manager = MCPGatewayManager(**self._manager_connection_settings())
             tools = await self.gateway_manager.start(server_list)
 
             self._require_open()
@@ -1422,6 +1447,8 @@ class MCPAgent(Feature):
         """Attempt every owned cleanup, then propagate any cleanup failure."""
         self._closing = True
         self._lifecycle_generation += 1
+        if self._apps_host is not None:
+            self._apps_host.withdraw_private_data()
         async with self._lifecycle_transition:
             self._closing = True
             await self._shutdown_connections()
@@ -1431,7 +1458,7 @@ class MCPAgent(Feature):
         # initialization gate also joins direct manager acquisition, so no
         # client can appear after the cleanup snapshot and escape custody.
         async with self._docker_operations, self._docker_initialization:
-            await self._release_connections()
+            await run_cleanup_steps([(True, self._close_apps), (True, self._release_connections)])
 
     async def _release_connections(self):
         manager = self.manager

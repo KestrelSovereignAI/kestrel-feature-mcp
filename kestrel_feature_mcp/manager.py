@@ -104,18 +104,19 @@ class MCPToolManager:
     Handles container lifecycle and MCP connections.
     """
 
-    def __init__(self, *, owner_did: str, docker_client):
+    def __init__(self, *, owner_did: str, docker_client, connection_factory=None):
         self._owner_did = _require_owner_did(owner_did)
         self.owned_containers: Dict[str, Dict[str, Any]] = {}
         self.docker_client = docker_client
         self._lifecycle_gates: dict[str, ConnectionLifecycleGate] = {}
+        self._connection_factory = MCPConnection if connection_factory is None else connection_factory
 
     @property
     def owner_did(self) -> str:
         return self._owner_did
 
     @classmethod
-    async def create(cls, *, owner_did: str) -> "MCPToolManager":
+    async def create(cls, *, owner_did: str, connection_factory=None) -> "MCPToolManager":
         """Build the manager with its Docker client connected OFF the loop.
 
         ``docker.from_env()`` and ``ping()`` block on the Docker daemon socket;
@@ -138,7 +139,7 @@ class MCPToolManager:
             logger.warning(f"Docker connection failed: {e}")
             raise DockerDaemonUnavailableError(f"Docker not available for MCP tools: {e}") from e
         logger.info("MCPToolManager initialized with Docker connection")
-        return cls(owner_did=owner_did, docker_client=client)
+        return cls(owner_did=owner_did, docker_client=client, connection_factory=connection_factory)
 
     def _container_lifecycle(self, name: str):
         return connection_lifecycle(self._lifecycle_gates, name)
@@ -244,7 +245,7 @@ class MCPToolManager:
 
     async def _check_mcp_ready(self, host: str, port: int, timeout: float = 2.0) -> bool:
         """Check readiness through the same native client used for tool calls."""
-        connection = MCPConnection(
+        connection = self._connection_factory(
             f"http://{host}:{port}/mcp", connect_timeout=timeout,
             call_timeout=timeout, close_timeout=timeout
         )
@@ -388,7 +389,7 @@ class MCPToolManager:
             raise ValueError(f"Container {container_name} does not expose port 8000")
         host_port = ports["8000/tcp"][0]["HostPort"]
         record = self._retain_container(container_name, container)
-        connection = MCPConnection(
+        connection = self._connection_factory(
             f"http://{MCP_CONTAINER_BIND_HOST}:{host_port}/mcp",
             connect_timeout=SESSION_CONNECT_TIMEOUT_SHORT,
             call_timeout=CALL_TOOL_TIMEOUT,
@@ -507,10 +508,11 @@ class MCPGatewayManager:
     """
 
     def __init__(self, port: int = 0, transport: str = DockerMCPGateway.DEFAULT_TRANSPORT,
-                 long_lived: bool = True):
+                 long_lived: bool = True, *, connection_factory=None):
         self.gateway = DockerMCPGateway(port=port, transport=transport, long_lived=long_lived)
         self.connection: MCPConnection | None = None
         self.tools: Dict[str, Any] = {}
+        self._connection_factory = MCPConnection if connection_factory is None else connection_factory
 
     async def start(self, servers: List[str] = None):
         """Start and publish only a gateway with a working native connection."""
@@ -536,7 +538,7 @@ class MCPGatewayManager:
     async def _connect(self, auth_token: str):
         await self._disconnect()
         headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-        connection = MCPConnection(
+        connection = self._connection_factory(
             self.gateway.endpoint_url, headers=headers,
             connect_timeout=SESSION_CONNECT_TIMEOUT_DEFAULT,
             call_timeout=CALL_TOOL_TIMEOUT,

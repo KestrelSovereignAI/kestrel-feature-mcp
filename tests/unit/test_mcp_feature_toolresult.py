@@ -90,7 +90,7 @@ class TestDockerUnavailableFails:
         feature = _make_feature(manager=None)
         feature.agent.did = feature.agent.agent_id = "did:test:unavailable"
         result = await feature.load_tool("some/image")
-        create.assert_awaited_once_with(owner_did="did:test:unavailable")
+        create.assert_awaited_once_with(owner_did="did:test:unavailable", connection_factory=feature._new_mcp_connection)
         assert result.status is ToolResultStatus.ERROR
         assert "not available" in (result.error or "")
 

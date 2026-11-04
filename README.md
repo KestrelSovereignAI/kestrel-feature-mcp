@@ -104,9 +104,8 @@ target. A host without the dynamic registry cannot mount MCP tools.
 Tool listings retain the official SDK's standard Tool fields, including
 `_meta.ui`, annotations, icons and output schemas, across remote, gateway and
 container discovery. Server metadata is untrusted data and does not grant
-permissions. Retaining Apps metadata does not advertise an Apps renderer;
-sandboxed rendering and governed app calls remain in
-[Kestrel #3679](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3679).
+permissions. Apps negotiation is enabled only when the optional authenticated
+host and separate sandbox described below are configured.
 
 Each handle is bound to the connection that advertised its schema. Reloading or
 withdrawing that connection invalidates its old handles, including a call still
@@ -301,20 +300,56 @@ done
 Update the pinned harness and lock together, rerun the profile, and review
 new required scenarios as the remaining host capabilities land.
 
-## MCP Apps components (0.10.x)
+## Optional MCP Apps host (0.11)
 
-The MCP Apps host is under development in #3679. Version 0.8.0 introduced the native
-tool contracts, bounded resources, governed App execution and standalone sandbox
-service described below. Version 0.9.0 added completed post-tool policy as a
-mandatory boundary for private native delivery. These components do not yet
-advertise Apps support. Version 0.10.0 also stages the initial native result
-through Core's completed policy and required SQL audit, then retains bounded
-private result associations for their original registration. Authenticated view
-routes and the chat renderer still need to be composed and accepted together.
+The optional host composes native AppBridge rendering, Core-authenticated View
+routes, governed App tool calls and bounded private result retention. It requires
+Core 0.60.0 or newer and a separate credential-free sandbox origin. Apps are
+disabled by default. Configure the feature before loading MCP connections:
+
+```json
+{
+  "apps": {
+    "enabled": true,
+    "host": {
+      "host_origin": "https://console.example.com",
+      "sandbox_url": "https://apps-sandbox.example.net/proxy",
+      "connection_policies": {}
+    }
+  }
+}
+```
+
+The public `host_origin` is explicit, including behind a TLS proxy. Run the
+sandbox service with the same `hostOrigin`; its policy and the feature's
+per-connection policy must both allow any requested network or device grants.
+Empty policies deny those grants. Invalid configuration is rejected before
+replacing the current host. Unload connections before changing configuration.
+
+Only the enabled complete host advertises the official Apps extension, across
+remote, container and gateway connections. The parent renderer receives the
+original chat's locator, fetches its native resource and result through Core,
+and gives them to the opaque App iframe. App calls use the original governed
+tool bindings and required audit. Leaving a chat, removing its rendered part,
+retiring a connection or shutting down the feature closes its physical Views.
+Reopening reads the retained result without replaying the initial tool.
+Choose **Open App** to allocate a View and **Close App** to release it. Replaying
+conversation history creates no Views or resource reads until an App is opened,
+so a long conversation does not automatically exhaust its View budget.
+
+Configuration and connection admission share the feature's lifecycle gates.
+A start from an earlier configuration generation is refused. Cleanup attempts
+every original resource and propagates failures and cancellation; settled
+maintenance failures are reported without poisoning later re-enable attempts.
+An unfinished close retains its original owner and is retried before re-enable.
+
+Version 0.8.0 introduced the native components described below; 0.9.0 added
+completed post-tool policy, 0.10.0 added private initial result associations,
+and 0.10.1 added ownership through physical HTTP delivery.
 Base MCP connections and governed tools require Core 0.55.2 or newer. Initial
 publication and result associations require Core 0.59.0 or newer, as detailed
-below; the test profile uses that floor for the complete suite. An unsupported
-host is refused before connecting or saving enablement.
+below. The test profile uses Core 0.60.0 for the complete Apps host suite.
+An unsupported host is refused before connecting or saving enablement.
 When a server rejects a call with `HeaderMismatch`, Kestrel retires the original
 catalog. Reload the connection to discover and admit the new contract before
 calling again. The [transport specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#client-behavior)
@@ -443,6 +478,23 @@ Only exact configured origins can be granted. HTTP limits are configurable
 through the deployment's `httpLimits` object: `maxHeaderBytes`,
 `requestTimeoutMs`, `headersTimeoutMs` and `keepAliveTimeoutMs`.
 
+For a standalone container, build from the repository root with Docker BuildKit:
+
+```bash
+docker build -f docker/Dockerfile.apps-sandbox -t kestrel-mcp-apps-sandbox .
+docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  --mount type=bind,source=/absolute/path/to/sandbox.json,target=/etc/kestrel-mcp-apps/sandbox.json,readonly \
+  --publish 127.0.0.1:8090:8090 kestrel-mcp-apps-sandbox
+```
+
+Set `listen.host` to `0.0.0.0` in the container's JSON configuration and publish
+its configured listener port. The image follows
+maintained Node LTS, runs as a non-root user and includes four hash-verified
+sandbox assets, their manifest and the project license. Its build context excludes source, Git
+metadata and host configuration. Mount no host identity files or credentials,
+and expose the service through a separate HTTPS origin. Startup refuses
+corrupted assets.
+
 The source of the bundled assets is `web/`, its npm lock and the unchanged
 official SDK packages. Regenerate the checked-in bundles and original license
 notices together.
@@ -465,6 +517,8 @@ npm test --prefix web
 ```
 
 The browser checks use the actual built standalone service, the official App
-and AppBridge, and an opaque View inside the separate-origin proxy. They cover
-native initialization, teardown, source/origin checks and effective browser
-policies. They do not establish complete host acceptance or vendor OAuth consent.
+and AppBridge, and an opaque View inside the separate-origin proxy. The Python
+browser lane also drives the actual Core chat renderer and authenticated HTTP
+controller, a native MCP peer and SQLite audit, including one governed effect,
+model-only tool refusal, navigation, reopening and DOM retirement. These checks
+do not establish deployed-host acceptance or vendor OAuth consent.

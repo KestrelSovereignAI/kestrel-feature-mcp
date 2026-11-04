@@ -25,6 +25,21 @@ def app_executor_factory():
     return AppExecutor
 
 
+@pytest.fixture
+def app_resource_html():
+    return None
+
+
+@pytest.fixture
+def apps_sandbox_url():
+    return "https://sandbox.composition.test/"
+
+
+@pytest.fixture
+def apps_host_origin():
+    return "https://composition.test"
+
+
 @dataclass
 class HTTPMCPServer:
     url: str
@@ -42,7 +57,7 @@ class HTTPMCPServer:
 
 
 @pytest_asyncio.fixture
-async def mcp_http_server(request, tmp_path):
+async def mcp_http_server(request, tmp_path, app_resource_html):
     settings = deepcopy(getattr(request, "param", {}))
     settings["discover_started"] = asyncio.Event()
     settings["standalone_ready"] = asyncio.Event()
@@ -110,7 +125,8 @@ async def mcp_http_server(request, tmp_path):
                     _meta={"private-result": {"view": "only"}},
                 )
 
-        html = settings.get("apps_html", "<!doctype html><p>Status</p>")
+        html = (app_resource_html if app_resource_html is not None
+                else settings.get("apps_html", "<!doctype html><p>Status</p>"))
         if settings.get("apps_blob"):
             apps.add_resource(BinaryResource(
                 uri="ui://status/view.html", name="Status", mime_type=APP_MIME_TYPE,
