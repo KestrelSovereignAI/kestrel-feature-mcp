@@ -11,23 +11,36 @@ from typing import Annotated, Literal
 
 from mcp import types
 from mcp.client.extension import ClaimContext, ClientExtension, ResultClaim
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, field_validator
+from pydantic.json_schema import SkipJsonSchema
 
 EXTENSION_ID = "io.modelcontextprotocol/tasks"
 PROTOCOL_VERSIONS = frozenset({"2026-07-28"})
 TaskStatus = Literal["working", "input_required", "completed", "cancelled", "failed"]
+_ProtocolInteger = Annotated[int, Field(ge=-(2**53 - 1), le=2**53 - 1)]
 
 
 class TaskFields(types.Result):
-    """Shared flat task fields; no wrapped ``task`` or legacy TTL aliases."""
+    """Flat native fields; use exclude_unset to retain a required null TTL.
+
+    Strictness applies to these fields. Nested native SDK models retain their
+    SDK validation; operator input still needs its original requested schema.
+    """
     model_config = ConfigDict(strict=True)
     task_id: str
     status: TaskStatus
-    status_message: str | None = None
+    status_message: str | SkipJsonSchema[None] = Field(default=None, validate_default=False)
     created_at: str
     last_updated_at: str
-    ttl_ms: int | None
-    poll_interval_ms: int | None = None
+    ttl_ms: _ProtocolInteger | None
+    poll_interval_ms: _ProtocolInteger | SkipJsonSchema[None] = Field(default=None, validate_default=False)
+
+    @field_validator("status_message", "poll_interval_ms", mode="before")
+    @classmethod
+    def _optional_fields_are_not_null(cls, value):
+        if value is None:
+            raise ValueError("optional task fields must be omitted rather than null")
+        return value
 
 
 class CreateTaskResult(TaskFields):

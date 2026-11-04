@@ -32,11 +32,12 @@ class NativeTasksPeer(Extension):
         self.calls = []
         self.status = "working"
         self.task_id = "opaque/task:1"
+        self.ttl_ms = 60000
 
     def state(self):
         return {"resultType": "complete", "taskId": self.task_id,
             "status": self.status, "createdAt": "2026-11-04T00:00:00Z",
-            "lastUpdatedAt": "2026-11-04T00:00:01Z", "ttlMs": 60000,
+            "lastUpdatedAt": "2026-11-04T00:00:01Z", "ttlMs": self.ttl_ms,
             "pollIntervalMs": 100}
 
     async def intercept_tool_call(self, params, ctx, call_next):
@@ -56,7 +57,8 @@ class NativeTasksPeer(Extension):
                     "required": ["label"]}}}}
         if self.status == "completed":
             state["result"] = {"resultType": "complete", "content": [
-                {"type": "text", "text": "actual deferred result"}]}
+                {"type": "text", "text": "actual deferred result"}],
+                "structuredContent": {"result": "actual deferred result"}}
         return state
 
     async def update(self, ctx, params):
@@ -92,11 +94,13 @@ async def no_implicit_resolution(result, context):
     ("opaque/Δ:1", b"=?base64?b3BhcXVlL86UOjE=?="),
     ("opaque\r\nInjected:1", b"=?base64?b3BhcXVlDQpJbmplY3RlZDox?="),
 ])
+@pytest.mark.parametrize("ttl_ms", [60000, None])
 async def test_sdk_claim_and_current_task_verbs_cross_real_http_without_tool_replay(
-    mcp_http_server, scenario, task_id, expected_header,
+    mcp_http_server, scenario, task_id, expected_header, ttl_ms,
 ):
     peer = mcp_http_server.settings["extensions"][0]
     peer.task_id = task_id
+    peer.ttl_ms = ttl_ms
     input_callbacks = []
 
     async def elicitation(context, params):
@@ -118,6 +122,7 @@ async def test_sdk_claim_and_current_task_verbs_cross_real_http_without_tool_rep
                 allow_claimed=True)
         assert isinstance(created, CreateTaskResult)
         assert created.task_id == peer.task_id and created.status == "working"
+        assert created.ttl_ms == ttl_ms
         assert peer.calls == ["started"]
         state = await session.send_request(GetTaskRequest(
             params=TaskIdParams(task_id=created.task_id)), TypeAdapter(DetailedTaskResult))
@@ -160,3 +165,80 @@ async def test_sdk_claim_and_current_task_verbs_cross_real_http_without_tool_rep
                 assert b"\r" not in header and b"\n" not in header
                 assert header == expected_header
         assert input_callbacks == []  # the host owns explicit input admission
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"extensions": [NativeTasksPeer()]}], indirect=True)
+@pytest.mark.parametrize("ttl_ms", [60000, None])
+async def test_high_level_native_client_resolves_one_claim_without_replaying_the_tool(
+    mcp_http_server, ttl_ms,
+):
+    peer = mcp_http_server.settings["extensions"][0]
+    peer.ttl_ms = ttl_ms
+    resolved = []
+
+    async def resolve(created, context):
+        assert isinstance(created, CreateTaskResult)
+        assert created.ttl_ms == ttl_ms and created.task_id == peer.task_id
+        assert context.session is client.session and context.tool_name == "echo"
+        assert context.read_timeout_seconds == 3
+        resolved.append(created.task_id)
+        current = await context.session.send_request(GetTaskRequest(
+            params=TaskIdParams(task_id=created.task_id)), TypeAdapter(DetailedTaskResult))
+        assert current.status == "working"
+        peer.status = "completed"
+        current = await context.session.send_request(GetTaskRequest(
+            params=TaskIdParams(task_id=created.task_id)), TypeAdapter(DetailedTaskResult))
+        assert current.status == "completed"
+        return types.CallToolResult.model_validate(current.result)
+
+    async with httpx2.AsyncClient(trust_env=False, follow_redirects=False) as http_client, Client(
+        streamable_http_client(mcp_http_server.url, http_client=http_client),
+        extensions=[TasksExtension(resolve)], input_required_max_rounds=0,
+    ) as client:
+        await client.list_tools()
+        result = await client.call_tool("echo", {"text": "accepted once"}, read_timeout_seconds=3)
+        assert resolved == [peer.task_id], "owning Task resolver was not called"
+        assert result.content[0].text == "actual deferred result" and not result.is_error
+        assert result.structured_content == {"result": "actual deferred result"}
+    assert resolved == [peer.task_id]
+    assert peer.calls == ["started", "get", "get"]
+    messages = [json.loads(body) for _, body in mcp_http_server.requests if body]
+    assert sum(message["method"] == "tools/call" for message in messages) == 1
+    assert not mcp_http_server.witness
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"extensions": [NativeTasksPeer()]}], indirect=True)
+async def test_native_sdk_wire_claim_rejects_python_field_names(mcp_http_server, monkeypatch):
+    from pydantic import ValidationError
+
+    peer = mcp_http_server.settings["extensions"][0]
+    original = peer.state
+
+    def invalid_wire():
+        wire = original()
+        wire["task_id"] = wire.pop("taskId")
+        return wire
+
+    monkeypatch.setattr(peer, "state", invalid_wire)
+    rejected = False
+    try:
+        async with httpx2.AsyncClient(trust_env=False, follow_redirects=False) as http_client, Client(
+            streamable_http_client(mcp_http_server.url, http_client=http_client),
+            extensions=[TasksExtension(no_implicit_resolution)], input_required_max_rounds=0,
+        ) as client:
+            await client.session.call_tool("echo", {"text": "accepted once"}, allow_claimed=True)
+    except* ValidationError as errors:
+        pending = list(errors.exceptions)
+        while pending:
+            error = pending.pop()
+            if isinstance(error, BaseExceptionGroup):
+                pending.extend(error.exceptions)
+            else:
+                assert isinstance(error, ValidationError)
+                assert any(item["loc"][-1:] == ("taskId",) and item["type"] == "missing"
+                    for item in error.errors())
+        rejected = True
+    assert rejected, "Native wire accepted a Python-only task_id alias"
+    assert peer.calls == ["started"] and not mcp_http_server.witness
