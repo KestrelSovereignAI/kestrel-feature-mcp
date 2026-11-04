@@ -85,7 +85,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             return StreamingResponse(held_body(b"X" * 65537), media_type=options.get('oversize_media_type', 'application/json'))
         document = {
             "client_id": state.client_id, "client_name": "Kestrel OAuth wire fixture",
-            "application_type": "native", "redirect_uris": [callback],
+            "application_type": "web" if options.get("web_identity") else "native", "redirect_uris": [callback],
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"], "token_endpoint_auth_method": "none",
         }
@@ -145,6 +145,8 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         return RedirectResponse(callback + "?" + urlencode(parameters), status_code=302)
 
     async def token(request):
+        if options.get("before_token") is not None:
+            await options["before_token"]()
         state.requests.append(("POST", "/token"))
         fields = parse_qs((await request.body()).decode("ascii"), strict_parsing=True)
         result = {"access_token": state.access_token, "token_type": "Bearer",
@@ -172,6 +174,9 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             hashlib.sha256(fields["code_verifier"][0].encode("ascii")).digest(),
         ).rstrip(b"=").decode("ascii")
         assert original["code_challenge"] == [challenge]
+        if options.get('token_error_status'):
+            return JSONResponse({'error': 'invalid_grant',
+                'error_description': 'owned-sensitive-AS-error-marker'}, status_code=options['token_error_status'])
         result["refresh_token"] = "native-fixture-refresh"
         if options.get('compressed') == 'token':
             return Response(gzip.compress(json.dumps(result).encode()),
@@ -185,6 +190,8 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         issuer_port = urlsplit(issuer_peer.url).port
         state.issuer = f"https://issuer.example:{issuer_port}"
         state.client_id = state.issuer + "/client.json"
+        if options.get("web_identity"):
+            callback = state.issuer + "/oauth/callback"
         resource_peer.settings["oauth"].update(
             resource=resource_id, issuer=state.issuer, access_token=state.access_token,
             metadata=resource_url.replace("/mcp", "/.well-known/oauth-protected-resource/mcp"),

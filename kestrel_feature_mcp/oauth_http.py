@@ -101,3 +101,61 @@ class GuardedAuth(httpx2.Auth):
                     return
         finally:
             await flow.aclose()
+
+
+class OriginPinnedTransport(httpx2.AsyncBaseTransport):
+    """Resolve only policy-approved origins, retaining one native pinned owner."""
+
+    def __init__(self, approved_origins):
+        self._approved_origins = approved_origins
+        self._transports = {}
+        self._lock = asyncio.Lock()
+        self._closed = False
+
+    async def handle_async_request(self, request):
+        from kestrel_sdk.security.outbound import assert_safe_url, pinned_httpx2_async_transport
+        from .oauth_policy import _origin
+
+        url = str(request.url)
+        origin = _origin(url)
+        async with self._lock:
+            if self._closed or origin not in self._approved_origins():
+                raise GrantRejected('OAuth origin is not currently approved for network I/O')
+            if origin not in self._transports:
+                endpoint = await assert_safe_url(url, allowed_schemes=('https',))
+                if self._closed or origin not in self._approved_origins():
+                    raise GrantRejected('OAuth origin approval ended before transport creation')
+                self._transports[origin] = pinned_httpx2_async_transport(endpoint)
+            transport = self._transports[origin]
+        return await transport.handle_async_request(request)
+
+    async def aclose(self):
+        async with self._lock:
+            self._closed = True
+            for origin, transport in tuple(self._transports.items()):
+                await transport.aclose()
+                del self._transports[origin]
+
+
+async def fetch_client_document(identity, expected, *, transport, timeout):
+    """Verify the public web CIMD matches Core's single rendering exactly."""
+    from .http_limits import IDENTITY_ACCEPT_ENCODING
+    from .oauth_policy import metadata_document
+
+    async with httpx2.AsyncClient(transport=transport, trust_env=False,
+            follow_redirects=False, timeout=timeout,
+            headers={'Accept-Encoding': IDENTITY_ACCEPT_ENCODING}) as client:
+        response = await client.get(identity.client_id)
+        if (response.status_code != 200
+                or response.headers.get('Content-Type', '').split(';', 1)[0] != 'application/json'):
+            raise GrantRejected('The public web CIMD did not return 200 application/json')
+        document = metadata_document(await response.aread())
+    if (document != expected or document.get('client_id') != identity.client_id
+            or document.get('redirect_uris') != [identity.redirect_uri]
+            or document.get('application_type') != 'web'
+            or document.get('token_endpoint_auth_method') != 'none'
+            or document.get('grant_types') != ['authorization_code', 'refresh_token']
+            or document.get('response_types') != ['code']
+            or any(field in document for field in ('client_secret', 'jwks', 'jwks_uri'))):
+        raise GrantRejected('The published identity changed the exact Core web client')
+    return document

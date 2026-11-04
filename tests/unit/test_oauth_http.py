@@ -33,3 +33,19 @@ async def test_oauth_total_body_budget_cannot_be_bypassed_with_sse_mime():
 def test_body_streaming_policy_must_be_an_explicit_boolean(value):
     with pytest.raises(ValueError, match='SSE policy'):
         MCPResponseBudget(4096, allow_sse=value)
+
+
+async def test_unapproved_oauth_origin_is_refused_before_any_dns(monkeypatch):
+    import socket
+    from kestrel_feature_mcp.oauth_http import OriginPinnedTransport
+    def forbidden(*args, **kwargs):
+        raise AssertionError('no DNS before policy approval')
+    monkeypatch.setattr(socket, 'getaddrinfo', forbidden)
+    transport = OriginPinnedTransport(lambda: {'https://resource.example'})
+    try:
+        with pytest.raises(GrantRejected, match='currently approved'):
+            await transport.handle_async_request(httpx2.Request('GET', 'https://issuer.example/token'))
+    finally:
+        await transport.aclose()
+    with pytest.raises(GrantRejected, match='currently approved'):
+        await transport.handle_async_request(httpx2.Request('GET', 'https://resource.example/mcp'))
