@@ -200,6 +200,19 @@ identity. It has separate discovery and authorization modes and keeps tokens
 in memory. It does not enable production OAuth connections or establish refresh
 after restart.
 
+The unreleased production-custody work uses one encrypted credential slot per
+agent, principal, and connection. It records authorization and exchange intent
+before token HTTP, requires commit acknowledgment and readback before use, and
+retains unknown exchange/refresh outcomes without replay. Status and restart
+metadata reads neither load encryption keys nor decrypt credentials. Local
+revocation leaves a tombstone and does not claim vendor revocation.
+
+Its table is `mcp_oauth_credential_slots`. The earlier `mcp_oauth_grants`
+foundation was used only by isolated tests and is not read or migrated. Scope
+and issuer changes replace the same slot under its current revision; they
+cannot create parallel live grants. Production OAuth connections and the
+Console flow still require the feature runtime and native host acceptance.
+
 ```bash
 uv pip install -e ".[test]"
 uv run pytest

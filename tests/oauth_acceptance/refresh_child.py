@@ -39,7 +39,8 @@ async def with_store(config, store, binding):
     httpcore2.AnyIOBackend.connect_tcp = dial
     os.environ['SSL_CERT_FILE'] = config['certificate']
     os.environ.pop('SSL_CERT_DIR', None)
-    snapshot = await store.read(binding)
+    metadata = await store.read(binding)
+    snapshot = await store.read_tokens(metadata)
     assert snapshot is not None and snapshot.state == 'active'
     token = snapshot.tokens
     saved = dict(access_token=token.access_token, refresh_token=token.refresh_token,
@@ -106,7 +107,7 @@ async def main(config):
     assert path.is_relative_to(Path(config['owned_root']))
     binding = OAuthGrantBinding('did:test:refresh-owner', 'fixture-operator', 'fixture-connection',
         config['server_url'], config['resource'], config['issuer'], config['client_id'],
-        config['redirect_uri'], frozenset({'read'}))
+        config['redirect_uri'], frozenset({'read'}), config['protected_metadata'], config['authorization_metadata'])
     database = SQLiteBackend(str(path))
     await database.connect()
     try:
