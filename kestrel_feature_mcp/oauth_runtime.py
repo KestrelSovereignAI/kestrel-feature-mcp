@@ -101,7 +101,7 @@ class OAuthRuntime:
         snapshot = await operation.complete(value, check)
         await self.retire_authorization(handle)
         check()
-        return self._status(snapshot)
+        return self._status(snapshot, self.host.client_identity(context))
 
     async def cancel(self, handle, check):
         owner = self._operations.get(handle)
@@ -122,7 +122,13 @@ class OAuthRuntime:
             await owner.operation.retire()
             del self._operations[handle]
 
-    def _status(self, snapshot):
+    @staticmethod
+    def _identity_matches(binding, identity):
+        document = identity['client_document']
+        return (binding.client_id == document['client_id']
+            and [binding.redirect_uri] == document['redirect_uris'])
+
+    def _status(self, snapshot, identity):
         binding = snapshot.binding
         credential = self._credentials.get(binding.connection_id)
         record = self.feature._remote_connections.get(binding.connection_id)
@@ -139,17 +145,19 @@ class OAuthRuntime:
         if snapshot.state == 'revoked' and snapshot.reason in {'abandoned', 'exchange_rejected', 'refresh_rejected'}:
             state = 'reauthorization_required'
         if snapshot.state == 'active' and credential is not None:
-            if credential.withdrawal_reason in {'resource_rejected', 'reauthorization_required'}:
-                state = credential.withdrawal_reason
+            if credential.withdrawal_reason == 'resource_rejected':
+                state = 'resource_rejected'
         if connected:
             state = 'connected'
+        if not self._identity_matches(binding, identity):
+            state, connected = 'reauthorization_required', False
         return {'connection_id': binding.connection_id, 'server_url': binding.server_url,
             'issuer': binding.issuer, 'resource': binding.resource, 'scopes': sorted(binding.scopes),
             'state': state, 'connected': bool(connected)}
 
     async def list(self, context):
-        _, store = self._identity_store(context)
-        return [self._status(snapshot) for snapshot in await store.list_principal(context.principal_id)]
+        identity, store = self._identity_store(context)
+        return [self._status(snapshot, identity) for snapshot in await store.list_principal(context.principal_id)]
 
     async def _snapshot(self, store, context, name, check):
         check()
@@ -168,6 +176,8 @@ class OAuthRuntime:
         identity, store = self._identity_store(context)
         # Resolve this principal's slot before touching any process-local owner.
         snapshot = await self._snapshot(store, context, name, check)
+        if not self._identity_matches(snapshot.binding, identity):
+            raise GrantRejected('The OAuth client identity changed; new authorization is required')
         if snapshot.state != 'active':
             raise GrantRejected('This OAuth grant requires new authorization or explicit local disconnect')
         if self.settings.close_seconds >= identity['lease_seconds']:
@@ -195,7 +205,7 @@ class OAuthRuntime:
                 await self.feature._load_remote_connection(snapshot.binding.server_url, None, credential=credential)
                 check()
                 ready = True
-                return self._status(credential.snapshot)
+                return self._status(credential.snapshot, identity)
             finally:
                 if not ready:
                     await self._retire_connection(name, credential)

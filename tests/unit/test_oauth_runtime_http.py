@@ -18,8 +18,8 @@ from kestrel_feature_mcp.oauth_grants import OAuthGrantStore
 from kestrel_feature_mcp.oauth_runtime import OAuthRuntime, OAuthSettings
 from kestrel_feature_mcp.remote import remote_owner
 from tests.http_peers import serve_http
-from tests.unit.test_oauth_acceptance_http import oauth_peers
-from tests.unit.test_oauth_credentials import credential_boundary
+from tests.unit.test_oauth_acceptance_http import oauth_peers as oauth_peers
+from tests.unit.test_oauth_credentials import credential_boundary as credential_boundary
 from tests.unit.test_oauth_production_acquisition_http import approve
 
 
@@ -31,8 +31,10 @@ pytestmark = [pytest.mark.parametrize('mcp_http_server', [{'tls': True, 'oauth':
 async def oauth_runtime(credential_boundary, tmp_path):
     b = credential_boundary
     b.app.include_router(public_oauth_router)
-    b.original_hosts = [b.host]
-    b.app.include_router(b.agent.create_mcp_oauth_router(b.feature, resolve_host=lambda: b.original_hosts[0]))
+    await b.host.close()
+    await b.feature.set_config({'oauth': {'enabled': True, 'close_seconds': 2.0}})
+    b.host, b.runtime = b.feature._oauth_host, b.feature._oauth_runtime
+    b.app.include_router(b.feature.get_router())
     async with AsyncExitStack() as owned:
         console = await owned.enter_async_context(serve_http(b.app, tmp_path / 'console', certificate_host='console.example'))
         origin = 'https://console.example:' + str(urlsplit(console.url).port)
@@ -44,8 +46,6 @@ async def oauth_runtime(credential_boundary, tmp_path):
             bundle.write(Path(console.certificate_file).read_bytes())
         b.peer.wire.state.client_id, b.peer.wire.state.redirect_uri = policy.client_id, policy.redirect_uri
         b.peer.selection = replace(b.peer.selection, client_id=policy.client_id, redirect_uri=policy.redirect_uri)
-        b.runtime = OAuthRuntime(b.feature, b.host, OAuthSettings(enabled=True, close_seconds=2.0))
-        b.host.attach(b.runtime)
         b.owned = owned
         yield b
 
@@ -121,11 +121,9 @@ async def test_durable_grant_restarts_dormant_then_explicitly_refreshes_without_
         guard.setattr(OAuthGrantStore, '_cipher', forbidden)
         await b.feature.on_agent_ready()
         assert not b.feature._remote_connections
-        b.host = b.agent.create_mcp_oauth_host(b.feature, is_current=lambda: True)
-        b.runtime = OAuthRuntime(b.feature, b.host, OAuthSettings(enabled=True, close_seconds=2.0))
-        b.host.attach(b.runtime)
-        b.owned.push_async_callback(b.host.close)
-        b.original_hosts[0] = b.host
+        await b.agent._unregister_feature_runtime(b.feature, unload=False)
+        await b.agent._activate_feature_runtime(b.feature)
+        b.host, b.runtime = b.feature._oauth_host, b.feature._oauth_runtime
         result = await b.client.get('/api/mcp/oauth/connections')
         assert result.status_code == 200 and result.json()['connections'][0]['state'] == 'authorized'
     assert (b.peer.resource.requests, b.peer.requests) == before
@@ -162,3 +160,25 @@ async def test_generic_mcp_unload_cannot_bypass_original_oauth_owner(oauth_runti
     assert await b.feature._read_server_delta(name) is not None
     assert (await b.client.post('/api/owned-credential-call')).status_code == 200
     assert b.peer.resource.witness == ['owned-effect']
+
+
+
+
+async def test_changing_oauth_configuration_recreates_both_shared_generation_hosts(oauth_runtime):
+    b = oauth_runtime
+    original = b.feature._oauth_host
+    settings = await b.feature.get_config()
+    settings['apps']['max_views'] = 16
+    await b.feature.set_config(settings)
+    assert original.retired
+    assert b.feature._oauth_host is not original and not b.feature._oauth_maintenance.done()
+    result = await b.client.get('/api/mcp/oauth/connections')
+    assert result.status_code == 200, result.text
+
+
+async def test_invalid_oauth_settings_cannot_retire_a_current_original_host(oauth_runtime):
+    b = oauth_runtime
+    original = b.feature._oauth_host
+    with pytest.raises(ValidationError):
+        await b.feature.set_config({'oauth': {'enabled': True, 'close_seconds': -1}})
+    assert b.feature._oauth_host is original and not original.retired

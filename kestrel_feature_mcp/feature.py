@@ -25,7 +25,7 @@ from .constants import SESSION_CONNECT_TIMEOUT_DEFAULT
 from .remote import RemoteMCPServer, RemoteMCPError, connection_error_message, remote_name_for_url, remote_owner
 from .dynamic_tools import build_wrappers
 from .apps_execution import RegisteredAppTool
-from .apps_host import MCPAppsFeatureMixin
+from .host_configuration import MCPHostFeatureMixin
 from ._lifecycle import MCPFeatureClosingError, run_cleanup_steps
 from .images import normalize_image_ref
 from .registry import (
@@ -141,7 +141,7 @@ def _official_record_blocks(records: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-class MCPAgent(MCPAppsFeatureMixin, Feature):
+class MCPAgent(MCPHostFeatureMixin, Feature):
     """
     A Feature Agent that manages Model Context Protocol (MCP) tools.
     It encapsulates the complexity of Docker container management and tool discovery,
@@ -161,7 +161,7 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         self._lifecycle_generation = 0
         self._owner_did: str | None = None
         self._closing = False
-        self._init_apps()
+        self._init_hosts()
 
     @property
     def tool_description(self) -> str:
@@ -174,8 +174,8 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
     async def initialize(self):
         owner_did = require_owner_did(self.agent.agent_id)
         async with self._lifecycle_transition:
-            if (not self._closing and self._apps_maintenance is not None
-                    and self._apps_maintenance.done()):
+            if (not self._closing and any(task is not None and task.done()
+                    for task in (self._apps_maintenance, self._oauth_maintenance))):
                 self._closing = True
                 self._lifecycle_generation += 1
             if self._closing:
@@ -186,8 +186,7 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
                     self.manager = None
             self._owner_did = owner_did
             self._closing = False
-            if self._apps_settings.enabled and self._apps_host is None:
-                await self._start_apps()
+            await self._start_configured_hosts()
         logger.info("MCPAgent initialized; Docker connects only for container operations.")
 
     def _require_open(self, generation: int | None = None) -> None:
@@ -1437,7 +1436,7 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
                         or not isinstance(metadata.get('grant'), str)
                         or len(metadata['grant']) != 64
                         or any(char not in '0123456789abcdef' for char in metadata['grant'])):
-                    logger.error("Refusing malformed saved OAuth MCP metadata")
+                    logger.error("Refusing unsupported saved OAuth MCP metadata: malformed grant reference")
                 # A saved grant is dormant metadata. Only its freshly
                 # authenticated principal may connect, decrypt or refresh it.
                 continue
@@ -1492,6 +1491,8 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         self._lifecycle_generation += 1
         if self._apps_host is not None:
             self._apps_host.withdraw_private_data()
+        if self._oauth_host is not None:
+            self._oauth_host.withdraw()
         async with self._lifecycle_transition:
             self._closing = True
             await self._shutdown_connections()
@@ -1501,7 +1502,7 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         # initialization gate also joins direct manager acquisition, so no
         # client can appear after the cleanup snapshot and escape custody.
         async with self._docker_operations, self._docker_initialization:
-            await run_cleanup_steps([(True, self._close_apps), (True, self._release_connections)])
+            await run_cleanup_steps([(True, self._close_oauth), (True, self._close_apps), (True, self._release_connections)])
 
     async def _release_connections(self):
         manager = self.manager

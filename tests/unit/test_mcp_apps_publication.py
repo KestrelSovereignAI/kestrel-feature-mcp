@@ -836,8 +836,9 @@ async def test_faulty_source_is_isolated_and_drain_joins_its_required_audit(app_
                 draining.cancel()
             peer.store.release_dispatch.set()
             if fault_kind == "control-and-join-cancellation":
-                with pytest.raises(BaseExceptionGroup) as caught:
+                with pytest.raises(asyncio.CancelledError) as caught:
                     await draining
+                assert draining.cancelled()
                 assert is_execution_control_error(caught.value)
                 def explicit_errors(error):
                     yield error
