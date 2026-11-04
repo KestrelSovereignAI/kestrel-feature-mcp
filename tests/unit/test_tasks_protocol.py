@@ -102,6 +102,8 @@ def test_claim_uses_the_native_sdk_extension_registry_without_legacy_protocols()
     ("ttlMs", 2**53), ("ttlMs", -(2**53)),
     ("pollIntervalMs", 2**53), ("pollIntervalMs", -(2**53)),
     ("ttlMs", 1.5), ("pollIntervalMs", -1.5),
+    ("ttlMs", True), ("ttlMs", False),
+    ("pollIntervalMs", True), ("pollIntervalMs", False),
 ])
 def test_task_fields_reject_values_refused_by_the_official_schema(official_tasks_schema, field, value):
     from jsonschema.exceptions import ValidationError as SchemaValidationError

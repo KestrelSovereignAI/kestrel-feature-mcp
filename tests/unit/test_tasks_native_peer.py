@@ -160,11 +160,14 @@ async def test_sdk_claim_and_current_task_verbs_cross_real_http_without_tool_rep
         assert not mcp_http_server.witness  # the native task did not invoke echo inline
         messages = [(scope, json.loads(body)) for scope, body in mcp_http_server.requests if body]
         assert sum(message["method"] == "tools/call" for _, message in messages) == 1
+        task_requests = {"tasks/get": "GetTaskRequest", "tasks/update": "UpdateTaskRequest",
+            "tasks/cancel": "CancelTaskRequest"}
         for scope, message in messages:
             capabilities = message["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
             assert "io.modelcontextprotocol/tasks" in capabilities["extensions"]
             assert "form" in capabilities["elicitation"]
             if message["method"].startswith("tasks/"):
+                official_tasks_schema(task_requests[message["method"]], message)
                 header = dict(scope["headers"])[b"mcp-name"]
                 assert b"\r" not in header and b"\n" not in header
                 assert header == expected_header
