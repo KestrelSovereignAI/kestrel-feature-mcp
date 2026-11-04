@@ -132,7 +132,7 @@ async def test_resource_metadata_is_bound_to_the_selected_grant(selection, chang
     assert not policy.resource_verified
 
 
-@pytest.mark.parametrize("scope", [None, "", "write", "read write"])
+@pytest.mark.parametrize("scope", ["", "write", "read write"])
 async def test_token_scope_is_checked_before_memory_storage(selection, scope):
     policy = GrantPolicy(selection)
     storage = MemoryGrant(policy)
@@ -238,3 +238,25 @@ async def test_in_memory_refresh_request_profile_is_bound_without_claiming_resta
     else:
         with pytest.raises(GrantRejected):
             await policy.request(request)
+
+
+async def test_omitted_token_scope_retains_the_exact_authorization_request(selection):
+    policy = GrantPolicy(replace(selection, scopes=frozenset({"read", "write"})))
+    storage = MemoryGrant(policy)
+    await discover(policy)
+    policy.redirect(authorization(policy, {"scope": "read"}))
+    token = OAuthToken(access_token="synthetic-access", token_type="Bearer", scope=None)
+    await storage.set_tokens(token)
+    assert (await storage.get_tokens()).scope == "read"
+    assert token.scope is None, "Stored receipt normalization mutated the SDK token response"
+
+
+async def test_token_cannot_expand_the_actual_request_inside_the_profile_ceiling(selection):
+    policy = GrantPolicy(replace(selection, scopes=frozenset({"read", "write"})))
+    storage = MemoryGrant(policy)
+    await discover(policy)
+    policy.redirect(authorization(policy, {"scope": "read"}))
+    token = OAuthToken(access_token="synthetic-access", token_type="Bearer", scope="read write")
+    with pytest.raises(GrantRejected, match="operator-approved grant"):
+        await storage.set_tokens(token)
+    assert await storage.get_tokens() is None

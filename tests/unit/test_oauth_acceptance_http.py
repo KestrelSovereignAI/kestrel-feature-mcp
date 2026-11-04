@@ -142,6 +142,8 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         result = {"access_token": state.access_token, "token_type": "Bearer",
                   "expires_in": 3600,
                   "scope": "read write" if options.get("overgrant") else "read"}
+        if options.get("omit_token_scope"):
+            result.pop("scope")
         if fields["grant_type"] == ["refresh_token"] and options.get("refresh"):
             assert fields["client_id"] == [state.client_id]
             assert fields["resource"] == [resource_id]
@@ -190,7 +192,8 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             server_url=resource_url, resource=resource_id, issuer=state.issuer,
             protected_metadata=resource_peer.settings["oauth"]["metadata"],
             authorization_metadata=state.issuer + "/.well-known/oauth-authorization-server",
-            client_id=state.client_id, redirect_uri=callback, scopes=frozenset({"read"}),
+            client_id=state.client_id, redirect_uri=callback,
+            scopes=frozenset(options.get("approved_scopes", ["read"])),
         )
         authorities = {("remote.example", resource_port), ("issuer.example", issuer_port)}
         original_dns = socket.getaddrinfo
@@ -523,3 +526,31 @@ async def test_resource_auth_policy_stops_an_unapproved_native_request(
         # Positive control: removing only this wiring sends the refused verb
         # to the independent server. Its 405 response is not a policy refusal.
         assert len(sent) == 1 and sent[0]["method"] == "tools/list"
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
+@pytest.mark.parametrize("oauth_peers", [
+    {"omit_token_scope": True},
+    {"omit_token_scope": True, "approved_scopes": ["read", "write"]},
+], indirect=True)
+async def test_native_initial_grant_accepts_a_scope_omitted_by_the_authorization_server(oauth_peers):
+    result = await drive(oauth_peers)
+    assert result["grant_obtained"] is True and result["stage"] == "authorized_and_discovered"
+    assert result["granted_scopes"] == ["read"]
+    assert oauth_peers.requests.count(("POST", "/token")) == 1
+    assert oauth_peers.resource.witness == []
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
+@pytest.mark.parametrize("oauth_peers", [{
+    "approved_scopes": ["read", "write"], "overgrant": True,
+}], indirect=True)
+async def test_native_token_cannot_expand_consent_within_the_configured_ceiling(oauth_peers):
+    with pytest.raises(GrantRejected, match="operator-approved grant"):
+        await drive(oauth_peers)
+    assert len(oauth_peers.browser_requests) == 1
+    assert parse_qs(urlsplit(oauth_peers.browser_requests[0]).query)["scope"] == ["read"]
+    assert oauth_peers.requests.count(("POST", "/token")) == 1
+    assert all(b"authorization" not in dict(scope["headers"])
+               for scope, _ in oauth_peers.resource.requests)
+    assert oauth_peers.resource.witness == []

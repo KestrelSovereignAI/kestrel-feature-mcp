@@ -87,6 +87,7 @@ class GrantPolicy:
         self.token_endpoint: str | None = None
         self.resource_verified = False
         self.redirected = False
+        self.requested_scopes: frozenset[str] | None = None
 
     async def request(self, request: httpx2.Request) -> None:
         url = str(request.url)
@@ -208,6 +209,7 @@ class GrantPolicy:
             raise GrantRejected("The SDK requested scopes outside the approved grant")
         if self.redirected:
             raise GrantRejected("This spike cannot silently start another consent attempt")
+        self.requested_scopes = scopes
         self.redirected = True
         return query["state"][0]
 
@@ -238,10 +240,13 @@ class MemoryGrant:
         return None if self._tokens is None else self._tokens.model_copy(deep=True)
 
     async def set_tokens(self, tokens: OAuthToken):
-        if (not self.policy.redirected or not tokens.scope
-                or not frozenset(tokens.scope.split()) <= self.policy.selection.scopes):
+        requested = self.policy.requested_scopes
+        granted = requested if tokens.scope is None else frozenset(tokens.scope.split())
+        if (not self.policy.redirected or requested is None or not granted
+                or not granted <= requested):
             raise GrantRejected("A token exceeded the operator-approved grant")
-        self._tokens = tokens.model_copy(deep=True)
+        # RFC 6749 section 5.1: omitted scope is the actual request, not the profile ceiling.
+        self._tokens = tokens.model_copy(update={"scope": " ".join(sorted(granted))}, deep=True)
 
 
 class GuardedAuth(httpx2.Auth):
