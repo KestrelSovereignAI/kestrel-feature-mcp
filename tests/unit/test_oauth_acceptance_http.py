@@ -139,6 +139,18 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
     async def token(request):
         state.requests.append(("POST", "/token"))
         fields = parse_qs((await request.body()).decode("ascii"), strict_parsing=True)
+        if fields["grant_type"] == ["refresh_token"] and options.get("refresh"):
+            assert fields["client_id"] == [state.client_id]
+            assert fields["resource"] == [resource_id]
+            assert fields["scope"] == ["read"]
+            assert fields["refresh_token"] == ["native-fixture-refresh"]
+            assert set(fields) == {"grant_type", "client_id", "resource", "scope", "refresh_token"}
+            assert "authorization" not in request.headers
+            result = {"access_token": state.access_token, "token_type": "Bearer",
+                      "expires_in": 3600, "scope": "read"}
+            if options.get("refresh_rotate"):
+                result["refresh_token"] = "native-fixture-rotated"
+            return JSONResponse(result)
         assert fields["grant_type"] == ["authorization_code"]
         assert fields["client_id"] == [state.client_id]
         assert fields["redirect_uri"] == [callback]

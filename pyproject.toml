@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
+    "Authlib>=1.9.3,<2",
     "kestrel-sovereign>=0.61.1,<1",
     "packaging",
     "pytest>=8.0.0",

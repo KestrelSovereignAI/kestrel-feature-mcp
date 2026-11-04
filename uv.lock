@@ -1579,6 +1579,7 @@ dependencies = [
 
 [package.optional-dependencies]
 test = [
+    { name = "authlib" },
     { name = "cryptography" },
     { name = "kestrel-sovereign" },
     { name = "packaging" },
@@ -1590,6 +1591,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "anyio", specifier = ">=4.7,<5" },
+    { name = "authlib", marker = "extra == 'test'", specifier = ">=1.9.3,<2" },
     { name = "cryptography", marker = "extra == 'test'", specifier = ">=46" },
     { name = "docker", specifier = ">=7.1.0" },
     { name = "jsonschema", specifier = ">=4.26,<5" },
