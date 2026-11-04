@@ -304,7 +304,7 @@ new required scenarios as the remaining host capabilities land.
 
 The optional host composes native AppBridge rendering, Core-authenticated View
 routes, governed App tool calls and bounded private result retention. It requires
-Core 0.60.0 or newer and a separate credential-free sandbox origin. Apps are
+Core 0.61.1 or newer and a separate credential-free sandbox origin. Apps are
 disabled by default. Configure the feature before loading MCP connections:
 
 ```json
@@ -325,6 +325,12 @@ sandbox service with the same `hostOrigin`; its policy and the feature's
 per-connection policy must both allow any requested network or device grants.
 Empty policies deny those grants. Invalid configuration is rejected before
 replacing the current host. Unload connections before changing configuration.
+
+Saved connections restore in the native `on_agent_ready` phase, after initial
+registration or soft re-enable commits. Maintenance boot does not restore
+outbound connections. Core reports ready-hook failures and keeps the committed
+feature enabled; failed connections remain unavailable. At initial boot,
+agent cognition may begin while saved connections are still restoring.
 
 Only the enabled complete host advertises the official Apps extension, across
 remote, container and gateway connections. The parent renderer receives the
@@ -348,7 +354,7 @@ completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
 Base MCP connections and governed tools require Core 0.55.2 or newer. Initial
 publication and result associations require Core 0.59.0 or newer, as detailed
-below. The test profile uses Core 0.60.0 for the complete Apps host suite.
+below. The test profile uses Core 0.61.1 for the complete Apps host suite.
 An unsupported host is refused before connecting or saving enablement.
 When a server rejects a call with `HeaderMismatch`, Kestrel retires the original
 catalog. Reload the connection to discover and admit the new contract before

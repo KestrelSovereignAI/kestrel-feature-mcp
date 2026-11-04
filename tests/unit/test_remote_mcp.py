@@ -151,7 +151,7 @@ async def test_same_instance_reenable_restores_remote_and_retires_old_callers(re
         assert not old_connection.is_connected and not host.registered
         assert name in host.saved
         await feature.initialize()
-        await feature.post_all_features_loaded()
+        await feature.on_agent_ready()
         assert set(feature._remote_connections) == {name}
         assert feature._remote_connections[name].connection is not old_connection
         rejected = await old_wrapper.execute(text="stale-before-reenable")
@@ -312,7 +312,7 @@ async def test_saved_unauthenticated_endpoint_restores_and_explicit_unload_clear
         await first.shutdown()
         assert host.saved and not host.registered
         await restored.initialize()
-        await restored.post_all_features_loaded()
+        await restored.on_agent_ready()
         assert set(restored._remote_connections) == {one.data["connection"]}
         assert len(host.registered) == 1
         assert (await restored.unload_tool(remote_peer.url)).status is ToolResultStatus.OK
@@ -329,7 +329,7 @@ async def test_restore_rejects_invalid_saved_url(caplog):
     feature = MCPAgent(host)
     await feature.initialize()
     try:
-        await feature.post_all_features_loaded()
+        await feature.on_agent_ready()
         assert not feature._remote_connections and not host.registered
         assert "Failed to restore remote" in caplog.text
     finally:
@@ -344,7 +344,7 @@ async def test_wrong_agent_saved_identity_is_refused_before_dns(remote_peer, cap
         assert (await first.load_tool(remote_peer.url)).status is ToolResultStatus.OK
         second.agent.saved = dict(first.agent.saved)
         before = list(remote_peer.resolutions)
-        await second.post_all_features_loaded()
+        await second.on_agent_ready()
         assert remote_peer.resolutions == before
         assert not second._remote_connections and not second.agent.registered
         assert "does not match this agent" in caplog.text
@@ -593,7 +593,7 @@ async def test_catalog_is_not_callable_before_persistence_ack(remote_peer, shutd
             restored = MCPAgent(host)
             try:
                 await restored.initialize()
-                await restored.post_all_features_loaded()
+                await restored.on_agent_ready()
                 wrapper = next(t for ts in host.registered.values() for t in ts if t._real_name == "echo")
                 called = await wrapper.execute(text="restored-after-aborted-load")
                 assert remote_peer.peer.witness == ["restored-after-aborted-load"]
@@ -666,7 +666,7 @@ async def test_restore_reads_existing_enablement_without_rewriting_it(
     feature._load_via_container = AsyncMock()
     try:
         await feature.initialize()
-        await feature.post_all_features_loaded()
+        await feature.on_agent_ready()
         if read_failure:
             assert not host.registered and not feature._remote_connections
             assert remote_peer.peer.witness == []
@@ -711,7 +711,7 @@ async def test_reenable_does_not_abandon_failed_shutdown_custody(remote_peer, mo
         monkeypatch.setattr(connection, "close", close)
         await feature.initialize()
         assert not connection.is_connected and not feature._remote_connections
-        await feature.post_all_features_loaded()
+        await feature.on_agent_ready()
         wrapper = next(t for ts in feature.agent.registered.values() for t in ts if t._real_name == "echo")
         result = await wrapper.execute(text="after-custody-settled")
         assert remote_peer.peer.witness == ["after-custody-settled"]
@@ -744,7 +744,7 @@ async def test_restore_does_not_suppress_programming_errors_or_cancellation(remo
     await feature.initialize()
     try:
         with pytest.raises(error_type, match="Unexpected restore interruption"):
-            await feature.post_all_features_loaded()
+            await feature.on_agent_ready()
         assert not feature._remote_connections and not host.registered
         assert remote_peer.peer.witness == []
     finally:
@@ -765,7 +765,7 @@ async def test_post_ack_mount_rejection_discloses_saved_enablement(remote_peer):
         assert loaded.status is ToolResultStatus.ERROR
         assert host.saved and not host.registered and not feature._remote_connections
         host.register_dynamic_tools = register
-        await feature.post_all_features_loaded()
+        await feature.on_agent_ready()
         wrapper = next(t for ts in host.registered.values() for t in ts if t._real_name == "echo")
         result = await wrapper.execute(text="restored-after-rejected-mount")
         assert remote_peer.peer.witness == ["restored-after-rejected-mount"]
@@ -793,7 +793,7 @@ async def test_restore_rechecks_enablement_removed_during_discovery(remote_peer,
     feature = MCPAgent(host)
     try:
         await feature.initialize()
-        await feature.post_all_features_loaded()
+        await feature.on_agent_ready()
         assert remote_peer.peer.witness == []
         assert not host.saved and not host.registered and not feature._remote_connections
         assert "did not retain MCP enablement" in caplog.text
@@ -842,7 +842,7 @@ async def test_restore_refuses_unsupported_saved_configuration_before_dns(remote
     restored = MCPAgent(host)
     try:
         await restored.initialize()
-        await restored.post_all_features_loaded()
+        await restored.on_agent_ready()
         assert remote_peer.peer.witness == []
         assert not host.registered and not restored._remote_connections
         assert len(remote_peer.resolutions) == before
@@ -870,7 +870,7 @@ async def test_unsupported_remote_host_is_refused_before_dns_or_persistence(remo
             assert result.status is ToolResultStatus.ERROR
             assert "governed dynamic tool registry" in result.error
         else:
-            await feature.post_all_features_loaded()
+            await feature.on_agent_ready()
             assert "governed dynamic tool registry" in caplog.text
     finally:
         await feature.shutdown()
@@ -903,3 +903,77 @@ async def test_remote_discovery_preserves_the_standard_tool_record(remote_peer):
         assert relisted["_meta"] == expected_wire["_meta"]
     finally:
         await feature.shutdown()
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "apps_tools": True}], indirect=True)
+async def test_native_core_restores_apps_connection_only_after_soft_activation_commits(
+    remote_peer, tmp_path, monkeypatch,
+):
+    from contextlib import AsyncExitStack
+    from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import FeatureEnablementStore
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    async with AsyncExitStack() as owned:
+        agent = KestrelAgent(did="did:test:apps-native-restore", storage_path=str(tmp_path / "agent.db"),
+            allowed_features=set(), sync_enabled=False, llm_service=LLMService(agent_data_dir=tmp_path))
+        owned.push_async_callback(agent.llm_service.close)
+        backend = SQLiteBackend(str(tmp_path / "enablement.db"))
+        await backend.connect()
+        owned.push_async_callback(backend.close)
+        store = FeatureEnablementStore(backend)
+        await store.initialize()
+        agent._feature_enablement_store = store
+        feature = MCPAgent(agent)
+        await agent._register_feature(feature)
+        owned.push_async_callback(agent._unregister_feature_runtime, feature, unload=True)
+        assert not hasattr(feature, "enabled")
+        await feature.set_config({"apps": {"enabled": True, "host": {
+            "sandbox_url": "https://sandbox.apps.test/", "host_origin": "https://host.apps.test"}}})
+        loaded = await feature.load_tool(remote_peer.url)
+        assert loaded.status is ToolResultStatus.OK, loaded.to_dict()
+        name = loaded.data["connection"]
+        original = feature._remote_connections[name].connection
+        assert original.is_connected
+        assert any(row["name"] == name and row["state"] == "enabled"
+            for row in await agent.get_enablement_deltas("mcp_server"))
+        original_batch = feature._apps_publications._batches["mcp:remote:" + name]
+        original_batch.require_current()
+
+        await agent._unregister_feature_runtime(feature, unload=False)
+        assert feature.enabled is False and not original.is_connected
+        assert not original_batch.is_live()
+        phases = []
+        before_commit = feature.post_all_features_loaded
+        ready = getattr(feature, "on_agent_ready", None)
+
+        async def observe_before_commit(host):
+            phases.append("before-commit")
+            assert feature.enabled is False
+            requests = len(remote_peer.peer.requests)
+            await before_commit(host)
+            assert len(remote_peer.peer.requests) == requests, "Restore performed network I/O before activation committed"
+            assert not feature._remote_connections
+
+        async def observe_ready(host):
+            phases.append("ready")
+            assert feature.enabled is True
+            await ready(host)
+
+        # Observe the real hooks without replacing their implementation.
+        monkeypatch.setattr(feature, "post_all_features_loaded", observe_before_commit)
+        if ready is not None:
+            monkeypatch.setattr(feature, "on_agent_ready", observe_ready)
+        await agent._activate_feature_runtime(feature)
+        assert phases == ["before-commit", "ready"], "Native ready hook was not invoked after activation committed"
+        assert feature.enabled is True
+        assert name in feature._remote_connections, "Saved Apps connection was not restored after activation committed"
+        restored = feature._remote_connections[name].connection
+        assert restored is not original and restored.is_connected
+        batch = feature._apps_publications._batches["mcp:remote:" + name]
+        assert batch is not original_batch
+        batch.require_current()
+        assert any(owner == "mcp:remote:" + name for owner in agent._tool_to_feature.values())
+        assert not original_batch.is_live()
