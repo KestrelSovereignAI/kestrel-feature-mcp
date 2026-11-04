@@ -37,11 +37,13 @@ def test_app_host_tests_require_authenticated_physical_view_ownership():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     (core,) = [Requirement(raw) for raw in project["optional-dependencies"]["test"]
                if Requirement(raw).name == "kestrel-sovereign"]
-    for old in ["0.55.0", "0.55.1", "0.55.2", "0.56.0", "0.57.0", "0.58.0", "0.59.0"]:
+    for old in ["0.55.0", "0.55.1", "0.55.2", "0.56.0", "0.57.0", "0.58.0", "0.59.0", "0.60.0", "0.61.0"]:
         assert not core.specifier.contains(old)
-    assert core.specifier.contains("0.60.0")
-    assert core.specifier.contains("0.61.0")
+    assert any(spec.operator == ">=" and Version(spec.version) >= Version("0.61.1")
+               for spec in core.specifier)
+    assert core.specifier.contains("0.61.1")
+    assert core.specifier.contains("0.62.0")
     packages = {item["name"]: item for item in tomllib.loads(
         (ROOT / "uv.lock").read_text())["package"]}
-    assert Version(packages["kestrel-sovereign"]["version"]) >= Version("0.60.0")
+    assert Version(packages["kestrel-sovereign"]["version"]) >= Version("0.61.1")
     assert packages["kestrel-sovereign"]["source"] == {"registry": "https://pypi.org/simple"}
