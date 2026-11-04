@@ -1,0 +1,17 @@
+{
+  "repository": "modelcontextprotocol/ext-tasks",
+  "schema_revision": "2026-07-28",
+  "commit": "0d0a6bd4c258b35caa3c810a1dd506cf105b1501",
+  "files": {
+    "schema/2026-07-28/schema.json": {
+      "url": "https://raw.githubusercontent.com/modelcontextprotocol/ext-tasks/0d0a6bd4c258b35caa3c810a1dd506cf105b1501/schema/2026-07-28/schema.json",
+      "bytes": 99192,
+      "sha256": "bf30afb7ac251e3e22c037b7a685f60ef6603031b5484c0d08b1fa0bbe86d460"
+    },
+    "LICENSE": {
+      "url": "https://raw.githubusercontent.com/modelcontextprotocol/ext-tasks/0d0a6bd4c258b35caa3c810a1dd506cf105b1501/LICENSE",
+      "bytes": 10786,
+      "sha256": "70559d215777f20bb14de53b336db2bb41fc58712f1d6f43e6a7dd2c82b1d6df"
+    }
+  }
+}

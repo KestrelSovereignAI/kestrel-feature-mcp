@@ -95,7 +95,7 @@ async def mcp_http_server(request, tmp_path, app_resource_html):
                 )
             return types.ListToolsResult(tools=listed)
 
-    extensions = []
+    extensions = list(settings.get("extensions", ()))
     if settings.get("apps_tools"):
         apps = Apps()
 
