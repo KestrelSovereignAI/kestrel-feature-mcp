@@ -1571,7 +1571,7 @@ dependencies = [
     { name = "anyio" },
     { name = "docker" },
     { name = "jsonschema" },
-    { name = "kestrel-sovereign-sdk", extra = ["httpx2"] },
+    { name = "kestrel-sovereign-sdk", extra = ["crypto", "httpx2"] },
     { name = "mcp" },
     { name = "pydantic" },
     { name = "requests" },
@@ -1596,7 +1596,7 @@ requires-dist = [
     { name = "docker", specifier = ">=7.1.0" },
     { name = "jsonschema", specifier = ">=4.26,<5" },
     { name = "kestrel-sovereign", marker = "extra == 'test'", specifier = ">=0.61.1,<1" },
-    { name = "kestrel-sovereign-sdk", extras = ["httpx2"], specifier = ">=0.46.0,<1" },
+    { name = "kestrel-sovereign-sdk", extras = ["crypto", "httpx2"], specifier = ">=0.46.0,<1" },
     { name = "mcp", specifier = ">=2.3,<3" },
     { name = "packaging", marker = "extra == 'test'" },
     { name = "pydantic", specifier = ">=2.12,<3" },
@@ -1818,6 +1818,9 @@ a2a = [
     { name = "pyjwt", extra = ["crypto"] },
     { name = "sse-starlette" },
     { name = "starlette" },
+]
+crypto = [
+    { name = "cryptography" },
 ]
 httpx = [
     { name = "certifi" },

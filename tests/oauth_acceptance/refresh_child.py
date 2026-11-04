@@ -47,6 +47,8 @@ async def with_store(config, store, binding):
         scope=' '.join(sorted(token.scopes)))
     assert saved['access_token'] in {'fixture-expired-access', 'native-fixture-access'}
     assert saved['refresh_token'] in {'native-fixture-refresh', 'native-fixture-rotated'}
+    if config['phase'] == 'fresh':
+        assert saved['refresh_token'] == config['expected_refresh_token']
     expiry = saved['expires_at']
     # Discovery uses separate pinned origins with no credentials. The returned
     # issuer and token endpoint must match the independently configured grant.

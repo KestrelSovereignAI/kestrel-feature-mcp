@@ -1,9 +1,9 @@
 """Real encrypted SQL grant custody, independent owners, and stale completion."""
 
 import asyncio
-import base64
 from contextlib import asynccontextmanager
 from dataclasses import replace
+import hashlib
 
 import pytest
 
@@ -31,8 +31,7 @@ def tokens():
 
 
 @pytest.fixture
-async def owners(tmp_path, monkeypatch, binding):
-    monkeypatch.setenv('KESTREL_DATA_KEY', base64.urlsafe_b64encode(b'k' * 32).decode())
+async def owners(tmp_path, binding, owned_oauth_key):
     databases = [SQLiteBackend(str(tmp_path / 'grants.db')) for _ in range(2)]
     try:
         for db in databases:
@@ -44,6 +43,27 @@ async def owners(tmp_path, monkeypatch, binding):
     finally:
         for db in reversed(databases):
             await db.close()
+
+
+@pytest.mark.asyncio
+async def test_outer_transaction_never_publishes_an_uncommitted_refresh(owners, binding, tokens):
+    databases, (first, second) = owners
+    installed = await first.install(binding, tokens)
+    async with databases[0].transaction():
+        with pytest.raises(OAuthGrantRejected, match='top-level'):
+            await first.begin_refresh(installed)
+        with pytest.raises(OAuthGrantRejected, match='top-level'):
+            await first.read(binding)
+    assert await second.read(binding) == installed
+
+
+@pytest.mark.asyncio
+async def test_unknown_native_custody_is_refused_before_sql(owners, binding, tokens, monkeypatch):
+    databases, (store, _) = owners
+    monkeypatch.setattr(type(databases[0]), 'owns_open_transaction', property(lambda self: None))
+    with pytest.raises(OAuthGrantRejected, match='top-level'):
+        await store.install(binding, tokens)
+    assert await databases[0].fetch_val('SELECT COUNT(*) FROM mcp_oauth_grants') == 0
 
 
 @pytest.mark.asyncio
@@ -101,9 +121,12 @@ async def test_only_one_independent_refresh_claim_can_commit(owners, binding, to
     claim = claims[0]
     assert claim.state == 'refreshing'
     restored = await second.read(binding)
-    assert restored == claim
+    assert restored.revision == claim.revision and restored.state == claim.state
+    assert restored.tokens is None
     with pytest.raises(OAuthGrantRejected, match='another refresh'):
         await second.begin_refresh(restored)
+    with pytest.raises(OAuthGrantRejected, match='original durable claim'):
+        await second.finish_refresh(restored, tokens)
     rotated = replace(tokens, access_token='next-access', refresh_token='rotated-refresh',
                       expires_at=1_900_000_000)
     complete = await first.finish_refresh(claim, rotated)
@@ -115,7 +138,7 @@ async def test_only_one_independent_refresh_claim_can_commit(owners, binding, to
         await first.begin_refresh(installed)
     with pytest.raises(OAuthGrantChanged):
         await first.finish_refresh(claim, rotated)
-    assert (await first.read(binding)) == next_claim
+    assert (await first.read(binding)).revision == next_claim.revision
 
 
 @pytest.mark.asyncio
@@ -125,6 +148,7 @@ async def test_local_revocation_cannot_be_undone_by_stale_refresh_or_insert(owne
     claim = await first.begin_refresh(installed)
     revoked = await second.revoke_local(claim)
     assert revoked.state == 'revoked' and revoked.tokens is None
+    assert await second.revoke_local(revoked) == revoked
     with pytest.raises(OAuthGrantChanged):
         await first.finish_refresh(claim, replace(tokens, refresh_token='rotated'))
     with pytest.raises(OAuthGrantChanged):
@@ -144,7 +168,41 @@ async def test_scope_expansion_refused_before_initial_or_rotated_storage(owners,
     claim = await store.begin_refresh(await store.install(binding, tokens))
     with pytest.raises(OAuthGrantRejected, match='original token scopes'):
         await store.finish_refresh(claim, replace(tokens, scopes=frozenset({'read', 'write'})))
-    assert (await store.read(binding)) == claim
+    assert (await store.read(binding)).revision == claim.revision
+
+
+@pytest.mark.asyncio
+async def test_claim_secret_is_not_stored_and_scope_metadata_is_not_authority(owners, binding, tokens):
+    databases, (first, second) = owners
+    claim = await first.begin_refresh(await first.install(binding, tokens))
+    row = await databases[0].fetch_one('SELECT claim_hash, ciphertext FROM mcp_oauth_grants')
+    assert row[0] == hashlib.sha256(claim.secret.encode()).hexdigest()
+    assert claim.secret not in row[1] and claim.secret not in repr(claim)
+    with pytest.raises(OAuthGrantChanged):
+        await second.finish_refresh(replace(claim, secret='x' * 43), tokens)
+    expanded = replace(tokens, scopes=binding.scopes)
+    with pytest.raises(OAuthGrantRejected, match='original token scopes'):
+        await first.finish_refresh(replace(claim, tokens=expanded), expanded)
+    finished = await first.finish_refresh(claim, replace(tokens, refresh_token=None))
+    assert finished.tokens.refresh_token == tokens.refresh_token
+
+
+@pytest.mark.asyncio
+async def test_begin_refresh_uses_committed_tokens_instead_of_snapshot_metadata(owners, binding, tokens):
+    _, (store, _) = owners
+    snapshot = await store.install(binding, tokens)
+    forged = replace(snapshot, tokens=replace(tokens, refresh_token='forged-refresh', scopes=binding.scopes))
+    claim = await store.begin_refresh(forged)
+    assert claim.tokens == tokens
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('secret', [None, 1, b'x' * 43, 'short'])
+async def test_malformed_claim_secret_is_rejected_without_disclosure(owners, binding, tokens, secret):
+    _, (store, _) = owners
+    claim = await store.begin_refresh(await store.install(binding, tokens))
+    with pytest.raises(OAuthGrantRejected, match='original claim secret'):
+        await store.finish_refresh(replace(claim, secret=secret), tokens)
 
 
 @pytest.mark.asyncio
@@ -195,7 +253,10 @@ async def test_custody_state_and_revision_authenticated(owners, binding, tokens,
     databases, (store, _) = owners
     await store.install(binding, tokens)
     assert column in {'revision', 'state'}
-    await databases[0].execute('UPDATE mcp_oauth_grants SET ' + column + ' = ?', (value,))
+    if column == 'state':
+        await databases[0].execute('UPDATE mcp_oauth_grants SET state = ?, claim_hash = ?', (value, 'altered-claim-hash'))
+    else:
+        await databases[0].execute('UPDATE mcp_oauth_grants SET revision = ?', (value,))
     with pytest.raises(DecryptionError):
         await store.read(binding)
 
@@ -211,7 +272,14 @@ async def test_token_budget_refuses_write_and_oversized_stored_ciphertext(owners
         await store.read(binding)
 
 
-@pytest.mark.parametrize('expiry', [True, -1, float('nan'), float('inf'), '3600'])
+@pytest.mark.parametrize('expiry', [True, -1, float('nan'), float('inf'), '3600', 10**400])
 def test_expiry_is_absolute_finite_and_never_coerced(tokens, expiry):
     with pytest.raises(OAuthGrantRejected, match='absolute finite timestamp'):
         replace(tokens, expires_at=expiry)
+
+
+@pytest.mark.parametrize('field,value', [('resource', 'https://@remote.example/mcp'),
+    ('issuer', 'https://issuer.example?changed=true')])
+def test_malformed_frozen_urls_are_refused(binding, field, value):
+    with pytest.raises(OAuthGrantRejected):
+        replace(binding, **{field: value})

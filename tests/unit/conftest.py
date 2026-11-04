@@ -1,6 +1,7 @@
 """Real HTTP fixtures shared by native MCP lifecycle and deadline tests."""
 
 import asyncio
+import base64
 import gzip
 from copy import deepcopy
 from dataclasses import dataclass
@@ -17,6 +18,16 @@ from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.shared.exceptions import MCPError
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from tests.http_peers import serve_http
+
+
+@pytest.fixture
+def owned_oauth_key(tmp_path, monkeypatch):
+    """Explicit owned file takes precedence over every ambient key source."""
+    path = tmp_path / "owned-oauth-data-key"
+    path.write_text(base64.urlsafe_b64encode(b"q" * 32).decode())
+    monkeypatch.setenv("KESTREL_DATA_KEY_FILE", str(path))
+    monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+    return path
 
 
 @pytest.fixture

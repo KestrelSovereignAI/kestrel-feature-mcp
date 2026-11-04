@@ -14,7 +14,7 @@ def test_remote_mcp_requires_the_shared_sdk_trust_bundle_policy():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     (sdk,) = [Requirement(raw) for raw in project["dependencies"]
               if Requirement(raw).name == "kestrel-sovereign-sdk"]
-    assert sdk.extras == {"httpx2"}
+    assert sdk.extras == {"crypto", "httpx2"}
     assert not sdk.specifier.contains("0.42.3")
     assert not sdk.specifier.contains("0.42.4")
     assert not sdk.specifier.contains("0.43.0")

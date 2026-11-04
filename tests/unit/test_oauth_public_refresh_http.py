@@ -1,6 +1,5 @@
 """Actual independent AS/resource TLS with two fresh clients per grant."""
 import asyncio
-import base64
 import json
 import os
 from pathlib import Path
@@ -20,10 +19,9 @@ from kestrel_feature_mcp.oauth_grants import OAuthGrantBinding, OAuthGrantStore,
     {'refresh': True, 'refresh_rotate': True},
     {'refresh': True, 'refresh_rotate': False},
 ], indirect=True)
-async def test_public_authlib_refresh_survives_two_fresh_processes(oauth_peers, tmp_path, monkeypatch):
+async def test_public_authlib_refresh_survives_two_fresh_processes(oauth_peers, tmp_path, owned_oauth_key):
     peers = oauth_peers
     selection = peers.selection
-    monkeypatch.setenv('KESTREL_DATA_KEY', base64.urlsafe_b64encode(b'r' * 32).decode())
     path = tmp_path / 'synthetic-grant.db'
     expired = {'access_token': 'fixture-expired-access', 'refresh_token': 'native-fixture-refresh',
         'token_type': 'Bearer', 'expires_in': 3600, 'expires_at': int(time.time()) - 300,
@@ -66,8 +64,12 @@ async def test_public_authlib_refresh_survives_two_fresh_processes(oauth_peers, 
     assert [r['refresh_performed'] for r in results] == [True, False]
     assert all(r['absolute_expiry_preserved'] for r in results)
     assert all(r['encrypted_grant_restored'] for r in results)
-    assert b'fixture-expired-access' not in path.read_bytes()
-    assert b'native-fixture-refresh' not in path.read_bytes()
+    for file in (path, path.with_name(path.name + '-wal')):
+        if file.exists():
+            stored = file.read_bytes()
+            for secret in (b'fixture-expired-access', b'native-fixture-refresh',
+                           b'native-fixture-access', b'native-fixture-rotated'):
+                assert secret not in stored
     assert peers.requests.count(('POST', '/token')) == 1
     assert ('GET', '/authorize') not in peers.requests and not peers.browser_requests
     assert peers.resource.witness == []
