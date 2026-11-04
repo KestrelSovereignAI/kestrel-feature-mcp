@@ -1,6 +1,7 @@
 """Remote connection records; URL and egress policy belong to the shared SDK."""
 
 from dataclasses import dataclass
+import json
 
 from mcp import types
 from kestrel_sdk.security.outbound import ValidatedOutboundURL
@@ -18,8 +19,10 @@ def connection_error_message(error: BaseException) -> str:
     return str(error)
 
 
-def remote_name_for_url(canonical_url: str, owner_did: str) -> str:
-    return "mcp-remote-" + connection_digest(canonical_url, owner_did)
+def remote_name_for_url(canonical_url: str, owner_did: str, *, principal_id: str | None = None) -> str:
+    resource = canonical_url if principal_id is None else json.dumps(
+        ['oauth', principal_id, canonical_url], separators=(',', ':'))
+    return "mcp-remote-" + connection_digest(resource, owner_did)
 
 
 def remote_owner(name: str) -> str:
@@ -32,6 +35,7 @@ class RemoteMCPServer:
     endpoint: ValidatedOutboundURL
     connection: MCPConnection
     tools: list[types.Tool] | None = None
+    credential: object | None = None
 
     @property
     def owner(self) -> str:

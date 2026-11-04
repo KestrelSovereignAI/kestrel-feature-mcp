@@ -15,6 +15,7 @@ from starlette.responses import JSONResponse
 
 from kestrel_sovereign import server
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
+from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import FeatureEnablementStore
 from kestrel_sovereign.auth import caller_context_scope
 from kestrel_sovereign.endpoints.auth_oauth import _create_jwt
 from kestrel_sovereign.features.privacy import PrivacyAgent
@@ -67,6 +68,8 @@ async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_ke
         agent.privacy_agent = PrivacyAgent(agent._raw_storage, agent.privacy_mode)
         agent.observability_store = ObservabilityStore(database)
         await agent.observability_store.initialize()
+        agent._feature_enablement_store = FeatureEnablementStore(database)
+        await agent._feature_enablement_store.initialize()
         permissions = PermissionStore(str(tmp_path / 'permissions.db'))
         await permissions.initialize()
         queue = ApprovalQueue(permission_store=permissions, agent=agent)
@@ -83,6 +86,7 @@ async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_ke
             path=path, credential=None, connection=None, caller=None, handle=None,
             withdrawals=[], callers=[], permissions=permissions, key=key, alice=alice, peer=oauth_peers)
         app = FastAPI()
+        b.app = app
         app.state.agent = agent
         app.state.mcp_oauth_policy = MCPOAuthHostPolicy(console_origin='https://console.example')
         service = RequestAuthenticationService(api_key=lambda: server.get_api_key(generate_if_missing=False))

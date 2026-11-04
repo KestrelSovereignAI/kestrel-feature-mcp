@@ -500,7 +500,10 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         record = self._remote_connections.get(name)
         if record is not None:
             record.tools = None
-            await record.connection.close()
+            steps = [(True, record.connection.close)]
+            if record.credential is not None:
+                steps.insert(0, (True, record.credential.retire))
+            await run_cleanup_steps(steps)
             del self._remote_connections[name]
 
     async def _read_server_delta(self, name: str) -> dict | None:
@@ -515,7 +518,7 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         if saved is None or saved["state"] != state or saved.get("metadata") != metadata:
             raise RemoteMCPError("Host did not retain MCP enablement; initialize its durable store")
 
-    async def _load_remote_connection(self, url: str, expected_name: str | None) -> ToolResult:
+    async def _load_remote_connection(self, url: str, expected_name: str | None, *, credential=None) -> ToolResult:
         generation = self._lifecycle_generation
         self._require_open(generation)
         invalid = _selector_failure(url)
@@ -525,11 +528,14 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         if urlsplit(url).fragment:
             raise RemoteMCPError("Remote MCP endpoints must not contain URL fragments")
         owner_did = self._connection_owner_did()
-        if expected_name is not None and remote_name_for_url(url, owner_did) != expected_name:
+        principal_id = None if credential is None else credential.principal_id
+        if expected_name is not None and remote_name_for_url(url, owner_did, principal_id=principal_id) != expected_name:
             raise RemoteMCPError("Stored MCP connection identifier does not match this agent's ownership")
         async with asyncio.timeout(SESSION_CONNECT_TIMEOUT_DEFAULT):
             endpoint = await assert_safe_url(url, allowed_schemes=("https",))
-        name = remote_name_for_url(endpoint.url, owner_did)
+        name = remote_name_for_url(endpoint.url, owner_did, principal_id=principal_id)
+        if credential is not None and name != credential.snapshot.binding.connection_id:
+            raise RemoteMCPError("OAuth endpoint changed its original canonical connection binding")
         if expected_name is not None and name != expected_name:
             raise RemoteMCPError("Stored MCP endpoint is not canonical; reconnect it explicitly")
         async with self._lifecycle_transition, connection_lifecycle(self._remote_lifecycle, name):
@@ -537,14 +543,18 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
             owner = remote_owner(name)
             self._unmount_tools(owner)
             await self._retire_remote(name)
-            record = RemoteMCPServer(name, endpoint, self._new_mcp_connection(endpoint))
+            record = RemoteMCPServer(name, endpoint, self._new_mcp_connection(endpoint,
+                **({} if credential is None else {'auth': credential.bearer_auth()})), credential=credential)
             self._remote_connections[name] = record
             published = False
             persistent = False
             try:
                 discovered = await record.connection.connect()
                 self._require_open()
-                metadata = {"mode": "remote", "url": endpoint.url, "auth": "none"}
+                authentication = "none" if credential is None else "oauth"
+                metadata = {"mode": "remote", "url": endpoint.url, "auth": authentication}
+                if credential is not None:
+                    metadata['grant'] = credential.slot_id
                 # Restore reads existing desired state; it must not require a
                 # redundant write or change the saved row's audit metadata.
                 if expected_name is not None:
@@ -552,18 +562,23 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
                     persistent = True
                 else:
                     persistent = await self._persist_server(name, "enabled", metadata=metadata)
+                if credential is not None:
+                    if not persistent:
+                        raise RemoteMCPError("OAuth connections require acknowledged durable enablement")
+                    await self._require_saved_configuration(name, "enabled", metadata)
                 self._require_open()
                 record.tools = discovered
                 caller = bind_tool_caller(
                     record.connection,
                     lambda: (self._remote_connections.get(name) is record and record.tools is not None),
                     name,
+                    admit=None if credential is None else credential.admit,
                 )
                 mounted = self._mount_tools(
                     owner, f"remote_{name[-12:]}", record.tool_descriptions(), caller,
                 )
                 tools = [tool.name for tool in record.tools]
-                data = {"connection": name, "url": endpoint.url, "via": "remote", "auth": "none",
+                data = {"connection": name, "url": endpoint.url, "via": "remote", "auth": authentication,
                         "tools": tools, "mounted": mounted, "persistent": persistent,
                         "protocol_version": record.connection.protocol_version}
                 published = True
@@ -599,6 +614,10 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
     async def _unload_remote(self, name: str) -> ToolResult:
         async with connection_lifecycle(self._remote_lifecycle, name):
             record = self._remote_connections.get(name)
+            saved = await self._read_server_delta(name) if self._supports_enablement_persistence() else None
+            if (record is not None and record.credential is not None
+                    or saved is not None and (saved.get('metadata') or {}).get('auth') == 'oauth'):
+                return ToolResult.failed("Use the authenticated MCP connection panel to disconnect this OAuth grant")
             retained = False
             try:
                 if record is not None:
@@ -1412,6 +1431,16 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         containers = [d for d in enabled if _mode(d) == "container"]
         for saved in (d for d in enabled if _mode(d) == "remote"):
             metadata = saved["metadata"]
+            if metadata.get('auth') == 'oauth':
+                if (set(metadata) != {'mode', 'url', 'auth', 'grant'}
+                        or not isinstance(metadata.get('url'), str)
+                        or not isinstance(metadata.get('grant'), str)
+                        or len(metadata['grant']) != 64
+                        or any(char not in '0123456789abcdef' for char in metadata['grant'])):
+                    logger.error("Refusing malformed saved OAuth MCP metadata")
+                # A saved grant is dormant metadata. Only its freshly
+                # authenticated principal may connect, decrypt or refresh it.
+                continue
             if (metadata.get("auth") != "none"
                     or set(metadata) - {"mode", "url", "auth"}):
                 logger.error("Refusing unsupported authentication/configuration for remote MCP %s", saved["name"])

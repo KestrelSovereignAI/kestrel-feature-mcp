@@ -41,6 +41,7 @@ class OAuthPeers:
     requests: list
     browser_requests: list
     release_body: asyncio.Event
+    wire: object | None = None
 
     async def browser(self, url):
         self.browser_requests.append(url)
@@ -85,7 +86,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             return StreamingResponse(held_body(b"X" * 65537), media_type=options.get('oversize_media_type', 'application/json'))
         document = {
             "client_id": state.client_id, "client_name": "Kestrel OAuth wire fixture",
-            "application_type": "web" if options.get("web_identity") else "native", "redirect_uris": [callback],
+            "application_type": "web" if options.get("web_identity") else "native", "redirect_uris": [state.redirect_uri],
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"], "token_endpoint_auth_method": "none",
         }
@@ -123,7 +124,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         state.requests.append(("GET", "/authorize"))
         fields = parse_qs(request.url.query, strict_parsing=True)
         assert fields["client_id"] == [state.client_id]
-        assert fields["redirect_uri"] == [callback]
+        assert fields["redirect_uri"] == [state.redirect_uri]
         assert fields["resource"] == [resource_id]
         assert fields["code_challenge_method"] == ["S256"]
         assert fields["scope"] == ["read"]
@@ -142,7 +143,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         }
         if options.get("extra_callback_fields"):
             parameters.update(session_state="opaque-session", scope="read")
-        return RedirectResponse(callback + "?" + urlencode(parameters), status_code=302)
+        return RedirectResponse(state.redirect_uri + "?" + urlencode(parameters), status_code=302)
 
     def token_response(result):
         if options.get('token_error_status'):
@@ -177,7 +178,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             return token_response(result)
         assert fields["grant_type"] == ["authorization_code"]
         assert fields["client_id"] == [state.client_id]
-        assert fields["redirect_uri"] == [callback]
+        assert fields["redirect_uri"] == [state.redirect_uri]
         assert fields["resource"] == [resource_id]
         assert "client_secret" not in fields and "authorization" not in request.headers
         original = state.codes.pop(fields["code"][0])
@@ -197,6 +198,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         state.client_id = state.issuer + "/client.json"
         if options.get("web_identity"):
             callback = state.issuer + "/oauth/callback"
+        state.redirect_uri = callback
         resource_peer.settings["oauth"].update(
             resource=resource_id, issuer=state.issuer, access_token=state.access_token,
             metadata=resource_url.replace("/mcp", "/.well-known/oauth-protected-resource/mcp"),
@@ -231,7 +233,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
 
         async def dial(backend, host, port, **kwargs):
             if host == "8.8.8.8":
-                assert port in {resource_port, issuer_port}
+                assert port in {authority[1] for authority in authorities}
             else:
                 assert host == "127.0.0.1" and port == callback_port
             return await original_dial(backend, "127.0.0.1", port, **kwargs)
@@ -248,7 +250,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         monkeypatch.setenv("NO_PROXY", "")
         try:
             yield OAuthPeers(selection, options, issuer_peer, resource_peer, state.requests, [],
-                             state.release_body)
+                state.release_body, SimpleNamespace(state=state, authorities=authorities, bundle=bundle))
         finally:
             state.release_body.set()
 
