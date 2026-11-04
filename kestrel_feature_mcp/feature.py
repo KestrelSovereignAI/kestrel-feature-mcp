@@ -999,7 +999,7 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
 
     @tool(
         name="mcp_search",
-        description="Search the official MCP Registry by server name, or select source='local' for bundled capability/category search.",
+        description="Search official MCP Registry server names with at least three characters, or select source='local' for bundled capability/category search.",
         category=ToolCategory.SYSTEM,
         command_prefix="!mcp-search"
     )
@@ -1011,7 +1011,7 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         Search the MCP server catalog for servers matching a query.
 
         Args:
-            query: Official server-name substring, or local capability/category
+            query: Official server-name substring (at least three characters after trimming whitespace), or local capability/category
             source: Explicit catalog; entries never override another source
             cursor: Official registry's opaque next-page cursor
             limit: Official registry page size (1 to 100, default 20); omit for local

@@ -271,8 +271,10 @@ class OfficialRegistryClient:
             raise OfficialRegistryError("MCP Registry page size must be an integer from 1 to 100")
         if cursor is not None and (not isinstance(cursor, str) or not cursor):
             raise OfficialRegistryError("MCP Registry cursor must be a nonempty opaque string")
-        if query is not None and (not isinstance(query, str) or not query.strip()):
-            raise OfficialRegistryError("MCP Registry search must be a nonempty string")
+        if query is not None and (not isinstance(query, str) or len(query.strip()) < 3):
+            raise OfficialRegistryError(
+                "Official MCP Registry search requires a string of at least three characters after trimming whitespace"
+            )
         params: dict[str, Any] = {"version": "latest", "limit": limit}
         if query is not None:
             params["search"] = query

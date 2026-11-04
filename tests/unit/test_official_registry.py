@@ -78,13 +78,13 @@ def test_registry_contract_is_the_pinned_published_openapi_snapshot():
 async def test_search_preserves_published_records_source_and_opaque_cursor(registry_http, page):
     state = registry_http
     state.responses.append(httpx2.Response(200, json=page))
-    result = await state.client.search("notes", cursor="opaque:+ /?&=", limit=1)
+    result = await state.client.search("not", cursor="opaque:+ /?&=", limit=1)
     assert result.registry_url == "https://registry.example/v0.1"
     assert result.payload == page
     assert result.servers[0] == page["servers"][0]
     assert result.next_cursor == page["metadata"]["nextCursor"]
     assert dict(state.requests[0].url.params) == {
-        "search": "notes", "cursor": "opaque:+ /?&=", "limit": "1", "version": "latest",
+        "search": "not", "cursor": "opaque:+ /?&=", "limit": "1", "version": "latest",
     }
     assert state.approved[0].url == "https://registry.example/v0.1/servers"
     assert [str(ip) for ip in state.approved[0].ip_addresses] == ["8.8.8.8"]
@@ -345,6 +345,40 @@ async def test_invalid_pagination_or_search_fails_before_io(registry_http, kwarg
     with pytest.raises(OfficialRegistryError):
         await registry_http.client.search(**kwargs)
     assert registry_http.approved == registry_http.requests == []
+
+
+@pytest.fixture
+def forbid_registry_dns(monkeypatch):
+    """Rejecting invalid input must not acquire a resolver or HTTP transport."""
+    def forbidden_dns(*args, **kwargs):
+        pytest.fail("A short official Registry query reached DNS before validation")
+
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden_dns)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query", ["a", "ab", " ab ", "éé", "語語", "😀😀", "e\u0301", "\n ab\t"])
+async def test_official_short_query_is_rejected_before_dns(query, forbid_registry_dns):
+    with pytest.raises(OfficialRegistryError, match="at least three"):
+        await OfficialRegistryClient().search(query)
+
+
+@pytest.mark.asyncio
+async def test_short_official_query_returns_actionable_tool_error_before_dns(forbid_registry_dns):
+    feature = MCPAgent(SimpleNamespace())
+    result = await feature.search_servers("ab")
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data == {"source": "official"}
+    assert "at least three" in result.error
+
+
+@pytest.mark.asyncio
+async def test_short_local_query_uses_the_actual_bundled_catalog():
+    feature = MCPAgent(SimpleNamespace())
+    result = await feature.search_servers("a", source="local")
+    assert result.status is ToolResultStatus.OK
+    assert result.data["source"] == "local"
+    assert result.data["matches"]
 
 
 @pytest.mark.asyncio
