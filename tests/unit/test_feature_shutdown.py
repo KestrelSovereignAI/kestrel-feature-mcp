@@ -92,7 +92,7 @@ async def test_shutdown_joins_restore_manager_acquisition_before_its_cleanup_sna
         return manager
 
     monkeypatch.setattr(MCPToolManager, "create", create)
-    restoring = asyncio.create_task(feature.post_all_features_loaded())
+    restoring = asyncio.create_task(feature.on_agent_ready())
     stopping = None
     try:
         await asyncio.wait_for(entered.wait(), 1)
@@ -448,7 +448,7 @@ async def test_settled_shutdown_restore_cannot_acquire_a_container_manager(monke
     create = AsyncMock(side_effect=AssertionError("settled feature acquired a Docker client"))
     monkeypatch.setattr(MCPToolManager, "create", create)
     with pytest.raises(MCPFeatureClosingError, match="shutting down"):
-        await feature.post_all_features_loaded()
+        await feature.on_agent_ready()
     create.assert_not_awaited()
     assert feature.manager is None and not host.registered
     assert set(host.saved) == {name}

@@ -206,7 +206,7 @@ async def test_saved_container_mode_never_reenters_environment_dependent_routing
     feature.agent.persist_feature_enablement = AsyncMock()
     feature._resolve_load_route = AsyncMock(side_effect=AssertionError("saved container mode consulted catalog routing"))
     try:
-        await feature.post_all_features_loaded(feature.agent)
+        await feature.on_agent_ready(feature.agent)
         feature._resolve_load_route.assert_not_awaited()
         assert manager.owned_containers[name]["connection"].is_connected
         assert {t.name for t in manager.owned_containers[name]["tools"]} == {"echo", "fail"}

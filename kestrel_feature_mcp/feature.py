@@ -1379,8 +1379,12 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
             data={"query": query, "results": [s['name'] for s in results]},
         )
 
-    async def post_all_features_loaded(self, agent=None):
-        """Auto-restore MCP servers this agent previously enabled.
+    async def on_agent_ready(self, agent=None):
+        """Restore saved servers after native feature activation has committed.
+
+        The ready phase runs after both initial registration and soft re-enable
+        are committed. Earlier lifecycle hooks can still carry an explicit host
+        restriction, so they must not publish callable App connections.
 
         Reads the persisted ``mcp_server`` enablement deltas (foundation) and
         re-starts the gateway / re-loads containers so an ``enable`` survives a
