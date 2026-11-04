@@ -1565,7 +1565,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-mcp"
-version = "0.11.1"
+version = "0.11.2"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -1593,7 +1593,7 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'test'", specifier = ">=46" },
     { name = "docker", specifier = ">=7.1.0" },
     { name = "jsonschema", specifier = ">=4.26,<5" },
-    { name = "kestrel-sovereign", marker = "extra == 'test'", specifier = ">=0.60.0,<1" },
+    { name = "kestrel-sovereign", marker = "extra == 'test'", specifier = ">=0.61.1,<1" },
     { name = "kestrel-sovereign-sdk", extras = ["httpx2"], specifier = ">=0.46.0,<1" },
     { name = "mcp", specifier = ">=2.3,<3" },
     { name = "packaging", marker = "extra == 'test'" },
@@ -1714,7 +1714,7 @@ all = [
 
 [[package]]
 name = "kestrel-sovereign"
-version = "0.60.0"
+version = "0.61.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1783,9 +1783,9 @@ dependencies = [
     { name = "urllib3" },
     { name = "uvicorn" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3f/ff/c3482aea0590d3d97679ad1bd1a80b8667b8b91f2ce556e42f7b30989a7f/kestrel_sovereign-0.60.0.tar.gz", hash = "sha256:b6f21ffe6a8af3f08ccfd11e433357bc7a113adc62d9951e3cef2102ddef7801", size = 6725720, upload-time = "2026-11-03T23:03:55.295Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9d/8d/e47eaf4e22f2d34cfdc5bad72504a4730607f66611a2897f656e88856293/kestrel_sovereign-0.61.1.tar.gz", hash = "sha256:9abbe8435e932be2c890564341b98b29858fbae0a8e2ac9d5bc2575c66a699c8", size = 6732740, upload-time = "2026-11-04T05:58:34.142Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0a/26/c1d373a048341fd6d077714f5eab604c0e0d81bf61f79a9ca200004bab7f/kestrel_sovereign-0.60.0-py3-none-any.whl", hash = "sha256:7a8dff13fd1e68f7d960efb2f5b18b9494a91a6afcbf12bd76ec63cbc07fed92", size = 7347408, upload-time = "2026-11-03T23:03:52.541Z" },
+    { url = "https://files.pythonhosted.org/packages/9c/50/9cddb5498ec28dec413bc774a7ca4a5e4bca8017ac096d787a7d4f548a9f/kestrel_sovereign-0.61.1-py3-none-any.whl", hash = "sha256:338c1b9ae9b9848c20d064a813380954fd49e4513c9ea349d96b5aed42494de0", size = 7354207, upload-time = "2026-11-04T05:58:30.111Z" },
 ]
 
 [[package]]
