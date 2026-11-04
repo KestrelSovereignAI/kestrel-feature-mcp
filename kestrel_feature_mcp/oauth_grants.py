@@ -164,6 +164,52 @@ def _slot_id(agent_did, principal_id, connection_id):
     return hashlib.sha256(_json(['kestrel-mcp-oauth-slot-v1', agent_did, principal_id, connection_id])).hexdigest()
 
 
+def _native_database(database):
+    if not isinstance(database, DatabaseBackend):
+        raise OAuthGrantRejected('OAuth custody requires a native database backend')
+
+
+def _require_top_level(database):
+    if database.owns_open_transaction is not False:
+        raise OAuthGrantRejected('OAuth custody requires a known top-level transaction boundary')
+
+
+async def initialize_grant_schema(database):
+    """Initialize native metadata custody without a key or credential budget."""
+    _native_database(database)
+    _require_top_level(database)
+    options = {}
+    if database.backend_type == 'sqlite':
+        supported = getattr(database, 'transaction_options', None)
+        if not isinstance(supported, frozenset) or 'immediate' not in supported:
+            raise OAuthGrantRejected('OAuth schema creation requires native SQLite immediate transactions')
+        options['immediate'] = True
+    elif database.backend_type != 'postgres':
+        raise OAuthGrantRejected('OAuth custody requires SQLite or PostgreSQL')
+    async with database.transaction(**options):
+        if database.backend_type == 'postgres':
+            # Serialize first DDL across native owners, including a table
+            # that does not exist yet. This is transaction-scoped custody.
+            key = int.from_bytes(hashlib.sha256(b'mcp_oauth_credential_slots').digest()[:8], 'big') & ((1 << 63) - 1)
+            await database.fetch_val('SELECT pg_advisory_xact_lock(?)', (key,))
+        await database.execute('''CREATE TABLE IF NOT EXISTS mcp_oauth_credential_slots (
+            agent_did TEXT NOT NULL, principal_id TEXT NOT NULL, slot_id TEXT NOT NULL,
+            binding_id TEXT NOT NULL, binding TEXT NOT NULL,
+            revision TEXT NOT NULL, state TEXT NOT NULL,
+            ciphertext TEXT, claim_hash TEXT, reason TEXT,
+            PRIMARY KEY (agent_did, slot_id),
+            CHECK (state IN ('authorizing', 'exchanging', 'active', 'refreshing', 'revoked')),
+            CHECK ((state IN ('active', 'refreshing') AND ciphertext IS NOT NULL)
+                OR (state NOT IN ('active', 'refreshing') AND ciphertext IS NULL)),
+            CHECK ((state IN ('authorizing', 'exchanging', 'refreshing') AND claim_hash IS NOT NULL)
+                OR (state IN ('active', 'revoked') AND claim_hash IS NULL)),
+            CHECK ((state = 'revoked' AND reason IS NOT NULL AND reason IN ('local', 'abandoned', 'exchange_rejected', 'refresh_rejected'))
+                OR (state != 'revoked' AND reason IS NULL))
+        )''')
+        await database.execute('CREATE INDEX IF NOT EXISTS idx_mcp_oauth_principal '
+            'ON mcp_oauth_credential_slots (agent_did, principal_id, slot_id)')
+
+
 class OAuthGrantStore:
     """One durable CAS per agent/principal/connection; no background authority.
 
@@ -176,44 +222,14 @@ class OAuthGrantStore:
         self.agent_did = require_owner_did(agent_did)
         if type(max_token_bytes) is not int or max_token_bytes < 1:
             raise OAuthGrantRejected('OAuth token budget must be a positive integer')
-        if not isinstance(database, DatabaseBackend):
-            raise OAuthGrantRejected('OAuth custody requires a native database backend')
+        _native_database(database)
         self._db, self._max_token_bytes = database, max_token_bytes
 
     async def initialize(self):
-        self._require_top_level()
-        options = {}
-        if self._db.backend_type == 'sqlite':
-            supported = getattr(self._db, 'transaction_options', None)
-            if not isinstance(supported, frozenset) or 'immediate' not in supported:
-                raise OAuthGrantRejected('OAuth schema creation requires native SQLite immediate transactions')
-            options['immediate'] = True
-        elif self._db.backend_type != 'postgres':
-            raise OAuthGrantRejected('OAuth custody requires SQLite or PostgreSQL')
-        async with self._db.transaction(**options):
-            if self._db.backend_type == 'postgres':
-                # Serialize first DDL across native owners, including a table
-                # that does not exist yet. This is transaction-scoped custody.
-                key = int.from_bytes(hashlib.sha256(b'mcp_oauth_credential_slots').digest()[:8], 'big') & ((1 << 63) - 1)
-                await self._db.fetch_val('SELECT pg_advisory_xact_lock(?)', (key,))
-            await self._db.execute('''CREATE TABLE IF NOT EXISTS mcp_oauth_credential_slots (
-                agent_did TEXT NOT NULL, slot_id TEXT NOT NULL,
-                binding_id TEXT NOT NULL, binding TEXT NOT NULL,
-                revision TEXT NOT NULL, state TEXT NOT NULL,
-                ciphertext TEXT, claim_hash TEXT, reason TEXT,
-                PRIMARY KEY (agent_did, slot_id),
-                CHECK (state IN ('authorizing', 'exchanging', 'active', 'refreshing', 'revoked')),
-                CHECK ((state IN ('active', 'refreshing') AND ciphertext IS NOT NULL)
-                    OR (state NOT IN ('active', 'refreshing') AND ciphertext IS NULL)),
-                CHECK ((state IN ('authorizing', 'exchanging', 'refreshing') AND claim_hash IS NOT NULL)
-                    OR (state IN ('active', 'revoked') AND claim_hash IS NULL)),
-                CHECK ((state = 'revoked' AND reason IS NOT NULL AND reason IN ('local', 'abandoned', 'exchange_rejected', 'refresh_rejected'))
-                    OR (state != 'revoked' AND reason IS NULL))
-            )''')
+        await initialize_grant_schema(self._db)
 
     def _require_top_level(self):
-        if self._db.owns_open_transaction is not False:
-            raise OAuthGrantRejected('OAuth custody requires a known top-level transaction boundary')
+        _require_top_level(self._db)
 
     def _binding(self, binding):
         _record(binding, OAuthGrantBinding)
@@ -247,12 +263,12 @@ class OAuthGrantStore:
     async def _read_slot(self, slot_id, *, secret=None, decrypt=False):
         self._require_top_level()
         payload_column = 'ciphertext' if decrypt else 'NULL'
-        row = await self._db.fetch_one('SELECT binding_id, binding, revision, state, claim_hash, reason, '
+        row = await self._db.fetch_one('SELECT principal_id, binding_id, binding, revision, state, claim_hash, reason, '
             'LENGTH(ciphertext), ' + payload_column + ' FROM mcp_oauth_credential_slots '
             'WHERE agent_did = ? AND slot_id = ?', (self.agent_did, slot_id))
         if row is None:
             return None
-        binding_id, encoded, revision, state, claim_hash, reason, size, ciphertext = row
+        principal_id, binding_id, encoded, revision, state, claim_hash, reason, size, ciphertext = row
         if not isinstance(encoded, str) or len(encoded) > 65_536:
             raise OAuthGrantRejected('OAuth binding metadata is invalid')
         try:
@@ -266,7 +282,7 @@ class OAuthGrantStore:
             raise OAuthGrantRejected('OAuth binding metadata is invalid')
         value['scopes'] = frozenset(value['scopes'])
         binding = OAuthGrantBinding(**value)
-        if (self._binding(binding) != slot_id or binding.identifier != binding_id
+        if (principal_id != binding.principal_id or self._binding(binding) != slot_id or binding.identifier != binding_id
                 or self._binding_json(binding) != encoded):
             raise OAuthGrantRejected('OAuth binding metadata integrity failed')
         _text(revision)
@@ -299,6 +315,21 @@ class OAuthGrantStore:
     async def read_slot(self, principal_id, connection_id):
         """Read canonical non-secret metadata, never credential payloads."""
         return await self._read_slot(_slot_id(self.agent_did, principal_id, connection_id))
+
+    async def list_principal(self, principal_id):
+        """Enumerate this principal's metadata, including grants never connected."""
+        _text(principal_id)
+        self._require_top_level()
+        rows = await self._db.fetch_all('SELECT slot_id FROM mcp_oauth_credential_slots '
+            'WHERE agent_did = ? AND principal_id = ? ORDER BY slot_id', (self.agent_did, principal_id))
+        snapshots = []
+        for row in rows:
+            snapshot = await self._read_slot(row[0])
+            if snapshot is not None:
+                if snapshot.binding.principal_id != principal_id:
+                    raise OAuthGrantRejected('OAuth principal metadata integrity failed')
+                snapshots.append(snapshot)
+        return snapshots
 
     async def read(self, binding):
         actual = await self._read_slot(self._binding(binding))
@@ -335,12 +366,12 @@ class OAuthGrantStore:
             self._expected(expected, binding)
         claim_hash = hashlib.sha256(claim_secret.encode()).hexdigest() if claim_secret is not None else None
         ciphertext = self._encode(binding, revision, state, tokens, claim_hash) if state in {'active', 'refreshing'} else None
-        fields = (binding.identifier, self._binding_json(binding), revision, state, ciphertext, claim_hash, reason)
+        fields = (binding.principal_id, binding.identifier, self._binding_json(binding), revision, state, ciphertext, claim_hash, reason)
         async with self._db.transaction():
             if expected is None:
                 affected = await self._db.execute('''INSERT INTO mcp_oauth_credential_slots
-                    (binding_id, binding, revision, state, ciphertext, claim_hash, reason, agent_did, slot_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (agent_did, slot_id) DO NOTHING''',
+                    (principal_id, binding_id, binding, revision, state, ciphertext, claim_hash, reason, agent_did, slot_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (agent_did, slot_id) DO NOTHING''',
                     fields + (self.agent_did, slot_id))
             else:
                 predicate = '' if expected_secret is None else ' AND claim_hash = ?'
@@ -348,7 +379,7 @@ class OAuthGrantStore:
                 if expected_secret is not None:
                     parameters += (hashlib.sha256(expected_secret.encode()).hexdigest(),)
                 affected = await self._db.execute('''UPDATE mcp_oauth_credential_slots
-                    SET binding_id = ?, binding = ?, revision = ?, state = ?, ciphertext = ?, claim_hash = ?, reason = ?
+                    SET principal_id = ?, binding_id = ?, binding = ?, revision = ?, state = ?, ciphertext = ?, claim_hash = ?, reason = ?
                     WHERE agent_did = ? AND slot_id = ? AND binding_id = ? AND revision = ? AND state = ?''' + predicate, parameters)
         if affected != 1:
             raise OAuthGrantChanged('OAuth grant changed before durable custody committed')

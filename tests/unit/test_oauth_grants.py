@@ -161,13 +161,13 @@ async def test_every_frozen_binding_field_isolated(owners, binding, tokens, fiel
     assert await read_payload(store, other) is None
     # Even a ciphertext copied to the other binding cannot decrypt there.
     if other.slot_id == binding.slot_id:
-        await databases[0].execute('UPDATE mcp_oauth_credential_slots SET binding_id = ?, binding = ?',
-            (other.identifier, store._binding_json(other)))
+        await databases[0].execute('UPDATE mcp_oauth_credential_slots SET principal_id = ?, binding_id = ?, binding = ?',
+            (other.principal_id, other.identifier, store._binding_json(other)))
     else:
         await databases[0].execute('INSERT INTO mcp_oauth_credential_slots '
-            '(agent_did, slot_id, binding_id, binding, revision, state, ciphertext) '
-            'SELECT agent_did, ?, ?, ?, revision, state, ciphertext FROM mcp_oauth_credential_slots',
-            (other.slot_id, other.identifier, store._binding_json(other)))
+            '(agent_did, principal_id, slot_id, binding_id, binding, revision, state, ciphertext) '
+            'SELECT agent_did, ?, ?, ?, ?, revision, state, ciphertext FROM mcp_oauth_credential_slots',
+            (other.principal_id, other.slot_id, other.identifier, store._binding_json(other)))
     with pytest.raises(DecryptionError):
         await read_payload(store, other)
 
@@ -655,3 +655,46 @@ async def test_sqlite_schema_creation_refuses_missing_native_writer_capability(o
 def test_token_expiry_uses_the_persisted_absolute_timestamp(expiry, now, expected):
     token = OAuthGrantTokens('owned-access', None, expiry, frozenset({'read'}))
     assert token.is_expired(now) is expected
+
+
+@pytest.mark.asyncio
+async def test_principal_listing_uses_metadata_only_and_includes_unconnected_grants(owners, binding, tokens, monkeypatch):
+    _, (store, _) = owners
+    active = await install_grant(store, binding, tokens)
+    pending_binding = replace(binding, connection_id='not-yet-connected')
+    await store.begin_authorization(pending_binding)
+    foreign = replace(binding, principal_id='another-operator')
+    await install_grant(store, foreign, tokens)
+    def forbidden_key():
+        raise AssertionError('Metadata listing must not access credential keys')
+    monkeypatch.setattr(store, '_cipher', forbidden_key)
+    rows = await store.list_principal(binding.principal_id)
+    assert {row.binding.connection_id for row in rows} == {binding.connection_id, pending_binding.connection_id}
+    assert {row.state for row in rows} == {'active', 'authorizing'}
+    assert all(row.tokens is None for row in rows)
+    assert await store.list_principal('no-grants') == []
+    assert (await store.read(binding)).revision == active.revision
+
+
+@pytest.mark.asyncio
+async def test_principal_index_cannot_relabel_another_principals_grant(owners, binding, tokens):
+    databases, (store, _) = owners
+    await install_grant(store, binding, tokens)
+    await databases[0].execute('UPDATE mcp_oauth_credential_slots SET principal_id = ?', ('other-operator',))
+    with pytest.raises(OAuthGrantRejected, match='integrity'):
+        await store.list_principal('other-operator')
+    with pytest.raises(OAuthGrantRejected, match='integrity'):
+        await store.read(binding)
+
+
+@pytest.mark.asyncio
+async def test_schema_bootstrap_needs_neither_credential_budget_nor_encryption_key(owners, binding, monkeypatch):
+    from kestrel_feature_mcp.oauth_grants import initialize_grant_schema
+    import kestrel_feature_mcp.oauth_grants as module
+    databases, _ = owners
+    await databases[0].execute('DROP TABLE mcp_oauth_credential_slots')
+    def forbidden_key(*args):
+        raise AssertionError('Schema bootstrap must not read a credential key')
+    monkeypatch.setattr(module, 'get_agent_key', forbidden_key)
+    await initialize_grant_schema(databases[0])
+    assert await databases[1].fetch_val('SELECT COUNT(*) FROM mcp_oauth_credential_slots') == 0
