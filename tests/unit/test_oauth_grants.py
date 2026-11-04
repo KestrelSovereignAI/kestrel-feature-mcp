@@ -1,9 +1,12 @@
 """Real encrypted SQL grant custody, independent owners, and stale completion."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 import hashlib
+import os
+from urllib.parse import urlsplit
+import uuid
 
 import pytest
 
@@ -30,19 +33,46 @@ def tokens():
                            1_700_000_000, frozenset({'read'}))
 
 
-@pytest.fixture
-async def owners(tmp_path, binding, owned_oauth_key):
-    databases = [SQLiteBackend(str(tmp_path / 'grants.db')) for _ in range(2)]
-    try:
-        for db in databases:
-            await db.connect()
+@pytest.fixture(params=['sqlite', 'postgres'])
+async def owners(tmp_path, binding, owned_oauth_key, request):
+    async with AsyncExitStack() as cleanup:
+        databases = []
+        if request.param == 'sqlite':
+            for _ in range(2):
+                db = SQLiteBackend(str(tmp_path / 'grants.db'))
+                await db.connect()
+                cleanup.push_async_callback(db.close)
+                databases.append(db)
+        else:
+            if os.environ.get('GITHUB_ACTIONS') != 'true':
+                pytest.skip('Native PostgreSQL grant tests run only in the dedicated CI service')
+            dsn = os.environ.get('TEST_POSTGRES_URL')
+            if not dsn:
+                if os.environ.get('KESTREL_REQUIRE_POSTGRES_TESTS') == '1':
+                    pytest.fail('The native PostgreSQL grant lane requires TEST_POSTGRES_URL')
+                pytest.skip('The dedicated native PostgreSQL grant lane provides TEST_POSTGRES_URL')
+            parsed = urlsplit(dsn)
+            if parsed.hostname not in {'localhost', '127.0.0.1'} or parsed.path != '/kestrel_mcp_oauth_test':
+                pytest.fail('Native grant tests require their dedicated local CI database')
+            import asyncpg
+            from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+            admin = await asyncpg.connect(dsn)
+            cleanup.push_async_callback(admin.close)
+            schema = 'mcp_grants_' + uuid.uuid4().hex
+            await admin.execute('CREATE SCHEMA "' + schema + '"')
+            cleanup.push_async_callback(admin.execute, 'DROP SCHEMA "' + schema + '" CASCADE')
+            for _ in range(2):
+                pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2,
+                    server_settings={'search_path': schema})
+                cleanup.push_async_callback(pool.close)
+                db = PostgresBackend.from_pool(pool)
+                cleanup.push_async_callback(db.close)
+                databases.append(db)
         stores = [OAuthGrantStore(db, binding.agent_did, max_token_bytes=4096) for db in databases]
         for store in stores:
             await store.initialize()
         yield databases, stores
-    finally:
-        for db in reversed(databases):
-            await db.close()
 
 
 @pytest.mark.asyncio
@@ -55,6 +85,32 @@ async def test_outer_transaction_never_publishes_an_uncommitted_refresh(owners, 
         with pytest.raises(OAuthGrantRejected, match='top-level'):
             await first.read(binding)
     assert await second.read(binding) == installed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('operation', ['install', 'begin', 'finish', 'revoke'])
+async def test_every_grant_write_refuses_before_changing_an_outer_transaction(
+        owners, binding, tokens, operation):
+    databases, (first, second) = owners
+    original = await first.install(binding, tokens)
+    target = binding
+    claim = None
+    if operation == 'install':
+        target = replace(binding, client_id='another-approved-client')
+    elif operation == 'finish':
+        claim = await first.begin_refresh(original)
+    before = await second.read(target)
+    async with databases[0].transaction():
+        with pytest.raises(OAuthGrantRejected, match='top-level'):
+            if operation == 'install':
+                await first.install(target, tokens)
+            elif operation == 'begin':
+                await first.begin_refresh(original)
+            elif operation == 'finish':
+                await first.finish_refresh(claim, tokens)
+            else:
+                await first.revoke_local(original)
+    assert await second.read(target) == before, 'Refused OAuth write changed durable grant custody'
 
 
 @pytest.mark.asyncio
