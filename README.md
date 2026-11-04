@@ -131,6 +131,11 @@ capability/category. Docker discovery retains the separate `mcp_docker_catalog`
 tool. A local entry never overrides an official entry with the same name, and
 an official registry error never becomes a successful local result.
 
+Official server-name searches require at least three Unicode characters after
+trimming surrounding whitespace. The original query is sent unchanged. Use
+`mcp_catalog` to list servers without a search, or `source="local"` for shorter
+bundled capability/category queries.
+
 Official catalog and search requests return one page, with `limit` from 1 to 100
 (default 20). Omit `limit` and `cursor` for the local source; explicit values
 are refused there. Search and catalog list latest versions only; detail lookup
