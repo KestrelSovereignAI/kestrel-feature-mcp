@@ -30,7 +30,7 @@ from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 from kestrel_feature_mcp.apps_host import AppsSettings
 from kestrel_feature_mcp.connection import bind_tool_caller
-from kestrel_feature_mcp.feature import MCPAgent
+from kestrel_feature_mcp.feature import MCPAgent, MCPHostCapabilityError
 from tests.unit.test_mcp_core_registry import CoreRegistryHost
 
 
@@ -91,7 +91,7 @@ async def test_apps_are_explicitly_disabled_and_unsupported_host_fails_clearly()
 
 
 @pytest_asyncio.fixture
-async def native_apps_host(mcp_http_server, tmp_path, monkeypatch, apps_sandbox_url, apps_host_origin):
+async def native_apps_host(request, mcp_http_server, tmp_path, monkeypatch, apps_sandbox_url, apps_host_origin):
     key = "owned-mcp-composition-api-key"
     monkeypatch.setenv("KESTREL_API_KEY", key)
     monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
@@ -114,10 +114,14 @@ async def native_apps_host(mcp_http_server, tmp_path, monkeypatch, apps_sandbox_
         owned.callback(queue.cancel_all)
         agent.hooks_manager.register(SecurityHook(permissions, queue))
         feature = MCPAgent(agent)
-        agent.features[feature.name] = feature
-        feature.enabled = True
-        await feature.initialize()
-        owned.push_async_callback(feature.shutdown)
+        await agent._register_feature(feature)
+        owned.push_async_callback(agent._unregister_feature_runtime, feature, unload=True)
+        assert not hasattr(feature, "enabled")
+        if getattr(request, "param", "reactivate") == "reactivate":
+            # Exercise the public Core's actual soft reactivation lifecycle.
+            # Initial registration is covered separately, without adding flags.
+            await agent._unregister_feature_runtime(feature, unload=False)
+            await agent._activate_feature_runtime(feature)
         await feature.set_config({"apps": {"enabled": True,
             "host": {"sandbox_url": apps_sandbox_url, "host_origin": apps_host_origin}}})
         connection = feature._new_mcp_connection(mcp_http_server.url)
@@ -139,6 +143,40 @@ async def native_apps_host(mcp_http_server, tmp_path, monkeypatch, apps_sandbox_
         client = await owned.enter_async_context(httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app),
             base_url="https://composition.test", headers={"X-API-Key": key}))
         yield AppsBoundary(app, feature, agent, connection, client, backend, permissions, queue, requests)
+
+
+@pytest.mark.parametrize("native_apps_host", ["startup"], indirect=True)
+@pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True, "apps_execution_tools": True,
+    "app_mutate_visibility": ["model", "app"]}], indirect=True)
+@pytest.mark.parametrize("retirement", ["deactivate", "missing-runtime", "host-disabled"])
+async def test_initial_core_registration_mounts_the_actual_apps_producer_without_an_enabled_attribute(
+    native_apps_host, retirement,
+):
+    b = native_apps_host
+    assert not hasattr(b.feature, "enabled")
+    assert b.agent.feature_contribution_runtime.is_active(b.feature)
+    batch = b.feature._apps_publications._batches["mcp:composition"]
+    batch.require_current()
+    assert batch.tools and b.connection.is_connected
+    runtime = b.agent.feature_contribution_runtime
+    if retirement == "deactivate":
+        assert runtime.deactivate(b.feature)
+    elif retirement == "missing-runtime":
+        b.agent.feature_contribution_runtime = None
+    else:
+        b.feature.enabled = False
+    try:
+        # A feature still present in agent.features cannot keep the native batch.
+        assert b.agent.features[b.feature.name] is b.feature
+        assert not batch.is_live()
+        with pytest.raises(MCPHostCapabilityError, match="active native Core feature registration"):
+            b.feature._mount_tools("mcp:composition", "native",
+                [item.tool.native_tool.model_dump(mode="json", by_alias=True) for item in batch.tools],
+                batch.tools[0].tool.bound_caller)
+        assert b.feature._apps_publications._batches["mcp:composition"] is batch
+        assert all(item.binding.is_current for item in batch.tools)
+    finally:
+        b.agent.feature_contribution_runtime = runtime
 
 
 @pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True, "apps_execution_tools": True,

@@ -247,6 +247,20 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         """
         self._require_governed_host()
         publications = self._apps_publications
+        runtime = getattr(self.agent, "feature_contribution_runtime", None)
+        generation = self._lifecycle_generation
+
+        def app_registration_current():
+            return (runtime is not None and callable(getattr(runtime, "is_active", None))
+                and self.agent.feature_contribution_runtime is runtime
+                and runtime.is_active(self) is True
+                and self._apps_publications is publications and not self._closing
+                and self._lifecycle_generation == generation
+                and self.agent.features.get(self.name) is self
+                and getattr(self, "enabled", True) is True)
+
+        if publications is not None and app_registration_current() is not True:
+            raise MCPHostCapabilityError("MCP Apps require the original active native Core feature registration")
         wrappers = build_wrappers(handle_prefix, tool_dicts, caller,
             app_executor=publications.executor if publications is not None else None)
         self._unmount_tools(owner)
@@ -255,11 +269,7 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         registered = []
         count = self.agent.register_dynamic_tools(owner, wrappers,
             on_registered=lambda tool, binding: registered.append(RegisteredAppTool(tool, binding)))
-        generation = self._lifecycle_generation
-        publications.register(owner, registered, is_current=lambda: (
-            self._apps_publications is publications and not self._closing
-            and self._lifecycle_generation == generation
-            and self.agent.features.get(self.name) is self and self.enabled is True))
+        publications.register(owner, registered, is_current=app_registration_current)
         return count
 
     def _unmount_tools(self, owner: str) -> int:
