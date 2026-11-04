@@ -2,12 +2,14 @@
 import json
 
 import pytest
+import httpx2
+from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
 from mcp import types
 from mcp.client.extension import UnexpectedClaimedResult
 from mcp.server.extension import Extension, MethodBinding
 from pydantic import TypeAdapter
 
-from kestrel_feature_mcp.connection import MCPConnection
 from kestrel_feature_mcp.tasks_protocol import (
     CancelTaskRequest, CreateTaskResult, DetailedTaskResult, GetTaskRequest,
     TaskAcknowledgement, TaskIdParams, TasksExtension, UpdateTaskParams,
@@ -95,11 +97,18 @@ async def test_sdk_claim_and_current_task_verbs_cross_real_http_without_tool_rep
 ):
     peer = mcp_http_server.settings["extensions"][0]
     peer.task_id = task_id
-    connection = MCPConnection(mcp_http_server.url,
-        extensions=[TasksExtension(no_implicit_resolution)])
-    try:
-        await connection.connect()
-        session = connection._require_client().session
+    input_callbacks = []
+
+    async def elicitation(context, params):
+        input_callbacks.append(params)
+        return types.ElicitResult(action="decline")
+
+    async with httpx2.AsyncClient(trust_env=False, follow_redirects=False) as http_client, Client(
+        streamable_http_client(mcp_http_server.url, http_client=http_client),
+        extensions=[TasksExtension(no_implicit_resolution)],
+        elicitation_callback=elicitation, input_required_max_rounds=0,
+    ) as client:
+        session = client.session
         if scenario == "unclaimed":
             with pytest.raises(UnexpectedClaimedResult) as unresolved:
                 await session.call_tool("echo", {"text": "accepted once"})
@@ -145,9 +154,9 @@ async def test_sdk_claim_and_current_task_verbs_cross_real_http_without_tool_rep
         for scope, message in messages:
             capabilities = message["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
             assert "io.modelcontextprotocol/tasks" in capabilities["extensions"]
+            assert "form" in capabilities["elicitation"]
             if message["method"].startswith("tasks/"):
                 header = dict(scope["headers"])[b"mcp-name"]
                 assert b"\r" not in header and b"\n" not in header
                 assert header == expected_header
-    finally:
-        await connection.close()
+        assert input_callbacks == []  # the host owns explicit input admission
