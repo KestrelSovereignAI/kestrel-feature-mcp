@@ -681,14 +681,56 @@ async def test_native_host_reinitialization_requires_the_outcome_contract(oauth_
     assert not b.peer.requests and not b.peer.resource.requests and not b.peer.resource.witness
 
 
+async def permission_mount(b, producer, monkeypatch):
+    """Keep Core/SDK/TLS real; substitute only the Docker process/catalog."""
+    if producer == 'remote':
+        name = await authorize(b)
+        await connect(b, name)
+        return remote_owner(name)
+
+    from types import SimpleNamespace
+    from kestrel_feature_mcp.manager import MCPGatewayManager
+    from kestrel_sdk.security.outbound import assert_safe_url
+
+    endpoint = await assert_safe_url(b.peer.selection.server_url, allowed_schemes=('https',))
+    managers = []
+
+    async def start(servers):
+        assert servers == ['owned-peer']
+        return 'native-fixture-access'
+
+    async def stop():
+        return None
+
+    async def known_catalog(servers):
+        assert servers == ['owned-peer']
+        return None
+
+    def manager_factory(**kwargs):
+        manager = MCPGatewayManager(**kwargs)
+        manager.gateway = SimpleNamespace(endpoint_url=endpoint,
+            is_running=True, start=start, stop=stop)
+        managers.append(manager)
+        return manager
+
+    monkeypatch.setattr('kestrel_feature_mcp.feature.check_docker_mcp_available', lambda: True)
+    monkeypatch.setattr('kestrel_feature_mcp.manager.MCPGatewayManager', manager_factory)
+    b.feature._reject_unknown_servers = known_catalog
+    result = await b.feature.gateway_start('owned-peer')
+    assert result.status.value == 'ok', result.error
+    assert len(managers) == 1 and managers[0].connection.is_connected
+    b.handle = next(name for name, owner in b.agent._tool_to_feature.items()
+        if owner == 'mcp:gateway' and name.endswith('__echo'))
+    return 'mcp:gateway'
+
+
+@pytest.mark.parametrize('producer', ['remote', 'gateway'])
 @pytest.mark.parametrize('lane', ['chat', 'inline'])
-async def test_native_model_permission_deny_has_no_wire_effect_or_credential_refresh(oauth_runtime, lane):
+async def test_native_model_permission_deny_has_no_wire_effect_or_credential_refresh(oauth_runtime, lane, producer, monkeypatch):
     import json
 
     b = oauth_runtime
-    name = await authorize(b)
-    await connect(b, name)
-    owner = remote_owner(name)
+    owner = await permission_mount(b, producer, monkeypatch)
     await b.permissions.set_permission(owner, b.handle, PermissionLevel.DENY)
     tokens_before = b.peer.requests.count(('POST', '/token'))
     result = await b.client.post('/api/owned-credential-call', params={'mode': lane})
@@ -705,14 +747,13 @@ async def test_native_model_permission_deny_has_no_wire_effect_or_credential_ref
     assert len(rows) == 1 and rows[0][0] == 'policy_denied'
 
 
+@pytest.mark.parametrize('producer', ['remote', 'gateway'])
 @pytest.mark.parametrize('lane', ['chat', 'inline'])
-async def test_native_model_one_shot_approval_race_cannot_authorize_the_next_call(oauth_runtime, lane):
+async def test_native_model_one_shot_approval_race_cannot_authorize_the_next_call(oauth_runtime, lane, producer, monkeypatch):
     import json
 
     b = oauth_runtime
-    name = await authorize(b)
-    await connect(b, name)
-    owner = remote_owner(name)
+    owner = await permission_mount(b, producer, monkeypatch)
     await b.permissions.set_permission(owner, b.handle, PermissionLevel.ASK)
     calls = []
     try:
