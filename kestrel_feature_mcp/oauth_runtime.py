@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -26,6 +27,7 @@ class OAuthSettings(BaseModel):
     close_seconds: float = Field(default=10.0, gt=0, le=60)
     maintenance_seconds: float = Field(default=1.0, gt=0, le=60)
     max_connections: int = Field(default=64, gt=0, le=1024)
+    max_status_entries: int = Field(default=256, gt=0, le=10000)
     max_connections_per_principal: int = Field(default=8, gt=0, le=128)
 
     @model_validator(mode='after')
@@ -48,6 +50,7 @@ class OAuthRuntime:
         self.feature, self.host, self.settings = feature, host, settings
         self._operations = {}
         self._credentials = {}
+        self._resource_rejections = OrderedDict()
         self._connections = {}
         self._accepting = True
 
@@ -148,9 +151,9 @@ class OAuthRuntime:
             state = 'authorizing'
         if snapshot.state == 'revoked' and snapshot.reason in {'abandoned', 'exchange_rejected', 'refresh_rejected'}:
             state = 'reauthorization_required'
-        if snapshot.state == 'active' and credential is not None:
-            if credential.withdrawal_reason == 'resource_rejected':
-                state = 'resource_rejected'
+        if (snapshot.state == 'active'
+                and self._resource_rejections.get(binding.connection_id) == snapshot.revision):
+            state = 'resource_rejected'
         if connected:
             state = 'connected'
         if not self._identity_matches(binding, identity):
@@ -213,15 +216,21 @@ class OAuthRuntime:
                     >= self.settings.max_connections_per_principal):
                 raise ResourceConflict('Disconnect an owned OAuth connection before opening another')
             lease = self.host.issue_lease(context, connection_id=name, slot_id=snapshot.binding.slot_id)
-            def withdraw(_reason):
+            def withdraw(reason):
                 record = self.feature._remote_connections.get(name)
                 if record is not None and record.credential is credential:
                     self.feature._unmount_tools(remote_owner(name))
+                    if reason == 'resource_rejected':
+                        self._resource_rejections[name] = credential.snapshot.revision
+                        self._resource_rejections.move_to_end(name)
+                        while len(self._resource_rejections) > self.settings.max_status_entries:
+                            self._resource_rejections.popitem(last=False)
 
             credential = OAuthConnectionCredential(store, snapshot, lease, identity,
                 close_seconds=self.settings.close_seconds,
                 withdraw=withdraw)
             self._credentials[name] = credential
+            self._resource_rejections.pop(name, None)
             ready = False
             try:
                 await credential.admit(force_refresh=refresh)
@@ -251,6 +260,7 @@ class OAuthRuntime:
                 if await self.feature._read_server_delta(name) is not None:
                     raise GrantRejected('OAuth enablement removal was not acknowledged')
                 check()
+                self._resource_rejections.pop(name, None)
             steps = [(True, forget)]
             if credential is not None:
                 steps.append((True, partial(self._retire_connection, name, credential)))
@@ -271,6 +281,7 @@ class OAuthRuntime:
             for name, credential in tuple(self._credentials.items()))
         await run_cleanup_steps(steps)
         self._credentials.clear()
+        self._resource_rejections.clear()
 
     async def maintain(self):
         steps = [(True, self.host.maintain)]

@@ -497,3 +497,84 @@ async def test_unacknowledged_native_close_keeps_custody_and_capacity_until_orig
     assert first not in b.feature._remote_connections and not b.runtime.has_owners
     await connect(b, second, headers=foreign)
     assert b.feature._remote_connections[second].connection.is_connected
+
+
+@pytest.mark.parametrize('status', [401, 403])
+async def test_recent_resource_rejection_survives_original_close_without_retaining_capacity(
+    oauth_runtime, status,
+):
+    b = oauth_runtime
+    await b.feature.set_config({'oauth': {'enabled': True, 'close_seconds': 2.0, 'maintenance_seconds': 60.0}})
+    b.host, b.runtime = b.feature._oauth_host, b.feature._oauth_runtime
+    name = await authorize(b)
+    await connect(b, name)
+    credential = b.runtime._credentials[name]
+    b.peer.resource.settings['http_status'] = status
+    await b.client.post('/api/owned-credential-call')
+    assert credential.withdrawal_reason == 'resource_rejected'
+    assert b.peer.resource.witness == []
+    await b.runtime.maintain()
+    assert not b.runtime.has_owners and not b.feature._remote_connections
+    rows = (await b.client.get('/api/mcp/oauth/connections')).json()['connections']
+    assert rows[0]['state'] == 'resource_rejected' and not rows[0]['connected']
+    foreign = {'X-API-Key': '', 'Authorization': 'Bearer ' + _create_jwt(b.alice)}
+    assert (await b.client.get('/api/mcp/oauth/connections', headers=foreign)).json()['connections'] == []
+    assert (await b.client.delete('/api/mcp/oauth/connections/' + name, headers=foreign)).status_code == 503
+    rows = (await b.client.get('/api/mcp/oauth/connections')).json()['connections']
+    assert rows[0]['state'] == 'resource_rejected'
+    b.peer.resource.settings['http_status'] = None
+    await connect(b, name, refresh=True)
+    assert not b.runtime._resource_rejections
+    assert b.peer.requests.count(('POST', '/token')) == 2
+    assert (await b.client.post('/api/owned-credential-call')).status_code == 200
+    assert b.peer.resource.witness == ['owned-effect']
+    await b.client.delete('/api/mcp/oauth/connections/' + name)
+    assert not b.runtime._resource_rejections and not b.runtime.has_owners
+
+
+async def test_recent_rejection_history_is_bounded_and_excluded_from_connection_capacity(oauth_runtime):
+    b = oauth_runtime
+    await b.feature.set_config({'oauth': {'enabled': True, 'close_seconds': 2.0, 'maintenance_seconds': 60.0,
+        'max_status_entries': 1, 'max_connections': 1, 'max_connections_per_principal': 1}})
+    b.host, b.runtime = b.feature._oauth_host, b.feature._oauth_runtime
+    foreign = {'X-API-Key': '', 'Authorization': 'Bearer ' + _create_jwt(b.alice)}
+    names = []
+    for headers in [None, foreign]:
+        b.peer.resource.settings['http_status'] = None
+        name = await authorize(b, headers=headers)
+        names.append(name)
+        await connect(b, name, headers=headers)
+        b.peer.resource.settings['http_status'] = 401
+        await b.client.post('/api/owned-credential-call', headers=headers)
+        await b.runtime.maintain()
+        assert not b.runtime.has_owners and not b.feature._remote_connections
+        assert len(b.runtime._resource_rejections) == 1
+    assert list(b.runtime._resource_rejections) == [names[-1]]
+    assert (await b.client.get('/api/mcp/oauth/connections', headers=foreign)).json()['connections'][0]['state'] == 'resource_rejected'
+    assert (await b.client.get('/api/mcp/oauth/connections')).json()['connections'][0]['state'] == 'authorized'
+    assert b.peer.resource.witness == []
+    await b.client.delete('/api/mcp/oauth/connections/' + names[-1], headers=foreign)
+    assert not b.runtime._resource_rejections
+
+
+async def test_resource_rejection_projection_defers_to_durable_state_and_revision(oauth_runtime):
+    b = oauth_runtime
+    await b.feature.set_config({'oauth': {'enabled': True, 'close_seconds': 2.0, 'maintenance_seconds': 60.0}})
+    b.host, b.runtime = b.feature._oauth_host, b.feature._oauth_runtime
+    name = await authorize(b)
+    await connect(b, name)
+    credential = b.runtime._credentials[name]
+    snapshot = credential.snapshot
+    b.peer.resource.settings['http_status'] = 401
+    await b.client.post('/api/owned-credential-call')
+    await b.runtime.maintain()
+    assert (await b.client.get('/api/mcp/oauth/connections')).json()['connections'][0]['state'] == 'resource_rejected'
+    # Pure metadata projections: a diagnostic grants no authority and cannot
+    # override a different committed revision or an unknown durable outcome.
+    replacement = replace(snapshot, revision='different-committed-grant-revision')
+    assert b.runtime._status(replacement, credential.budgets)['state'] == 'authorized'
+    for state, expected in [('exchanging', 'outcome_unknown'), ('refreshing', 'refresh_unknown'),
+            ('revoked', 'revoked')]:
+        metadata = replace(snapshot, state=state, reason='local' if state == 'revoked' else None)
+        assert b.runtime._status(metadata, credential.budgets)['state'] == expected
+    assert b.peer.resource.witness == [] and not b.runtime.has_owners

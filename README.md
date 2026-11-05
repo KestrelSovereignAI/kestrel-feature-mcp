@@ -124,6 +124,10 @@ principal must explicitly connect it under fresh Core authority. Changing the
 client identity requires new consent before using the old grant.
 
 **Refresh credentials** refreshes and reconnects under the current principal.
+Recent resource-rejection labels survive connection cleanup without keeping a
+connection open. These diagnostics last for the current feature runtime;
+`oauth.max_status_entries` bounds their retained count (default 256). They apply
+only to the saved grant revision that the resource refused.
 Unknown exchange or refresh outcomes remain visible and are never automatically
 replayed; explicitly acknowledge an uncertain outcome before starting replacement
 consent. **Disconnect locally** withdraws tools, deletes local tokens and removes
