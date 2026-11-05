@@ -15,6 +15,7 @@ uv pip install kestrel-feature-mcp
 - `mcp>=2.3,<3`
 - `requests>=2.34.2`
 - `anyio>=4.7,<5`
+- `Authlib>=1.9.4,<2`
 - `pydantic>=2.12,<3`
 - `jsonschema>=4.26,<5`
 
@@ -81,16 +82,59 @@ requested replacement. If publication fails after that acknowledgement, the
 error discloses the retained enablement and, for gateway start, the replaced
 server set. Unload the saved connection to disable restoration.
 
-This release supports `auth="none"` only. It does not accept token headers or
-start OAuth registration/consent when a server challenges for authentication.
-Saved authentication modes or fields it cannot implement are refused. Vendor
-OAuth, encrypted grants and refresh after restart remain part of
-[Kestrel #3679](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3679),
-including the native SDK gate in
-[#3690](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3690).
-Connecting to a public documentation server is not the three-vendor OAuth
-acceptance experiment. Remote write scopes remain gated on
+The generic load command accepts `auth="none"` only. OAuth connections use the
+authenticated Console flow below; commands never accept token headers or
+start consent implicitly. Saved authentication modes or fields that are not
+supported are refused. Connecting to a public documentation server is not the
+three-vendor OAuth acceptance experiment in
+[Kestrel #3679](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3679).
+Remote write scopes remain gated on
 [#596](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/596).
+
+## Optional OAuth connectors (0.13)
+
+OAuth is disabled by default and requires Core 0.62.0 or newer. Configure the
+Console's public HTTPS origin in Core with
+`KESTREL_MCP_OAUTH_CONSOLE_ORIGIN=https://console.example.com`. That origin must
+serve the native callback page and `/js` assets. Core owns the client metadata,
+callback routing, authentication, CSRF and finite connection authority; the
+feature owns encrypted grants and the original native MCP connections.
+
+Enable the feature's OAuth settings before opening **MCP connectors**:
+
+```json
+{"oauth": {"enabled": true}}
+```
+
+Enter the HTTPS MCP server URL and the requested scopes, then choose
+**Authorize connector**. Consent opens in the same tab. Return to Console and
+choose **Connect** after authorization completes. This profile uses a public
+Client ID Metadata Document, PKCE S256 and issuer-bound responses; it requires
+the provider to accept that client identity. Providers requiring a registered
+client or a different profile are refused. Three-vendor acceptance remains an
+explicit release gate, not a claim established by synthetic integration tests.
+
+The SDK discovers the protected resource and authorization server and performs
+the single authorization-code exchange. Authlib performs explicit, single-attempt
+refresh. Tokens are encrypted with the SDK's agent key; provision the normal
+Kestrel data key before authorization and preserve it across restarts. Tokens
+never enter browser storage or enablement records. Status reads do not load the
+key or decrypt credentials. A saved connection restarts dormant: the same
+principal must explicitly connect it under fresh Core authority. Changing the
+client identity requires new consent before using the old grant.
+
+**Refresh credentials** refreshes and reconnects under the current principal.
+Unknown exchange or refresh outcomes remain visible and are never automatically
+replayed; explicitly acknowledge an uncertain outcome before starting replacement
+consent. **Disconnect locally** withdraws tools, deletes local tokens and removes
+the saved connection. It does not revoke the grant at the provider. The generic
+unload command refuses an OAuth connection so it cannot bypass the original
+principal's authority. Authorization alone grants no tool permission: calls still
+pass through Core's permission, approval, policy and audit boundary.
+
+Apps and OAuth share one feature configuration generation. Omitted settings are
+preserved, both domains are validated before replacement, and existing
+connections or pending authorizations must be retired before changing settings.
 
 ## Calling tools
 
@@ -200,7 +244,7 @@ identity. It has separate discovery and authorization modes and keeps tokens
 in memory. It does not enable production OAuth connections or establish refresh
 after restart.
 
-The unreleased production-custody work uses one encrypted credential slot per
+Production custody uses one encrypted credential slot per
 agent, principal, and connection. It records authorization and exchange intent
 before token HTTP, requires commit acknowledgment and readback before use, and
 retains unknown exchange/refresh outcomes without replay. Status and restart
@@ -210,8 +254,10 @@ revocation leaves a tombstone and does not claim vendor revocation.
 Its table is `mcp_oauth_credential_slots`. The earlier `mcp_oauth_grants`
 foundation was used only by isolated tests and is not read or migrated. Scope
 and issuer changes replace the same slot under its current revision; they
-cannot create parallel live grants. Production OAuth connections and the
-Console flow still require the feature runtime and native host acceptance.
+cannot create parallel live grants. The native HTTP and Console browser tests exercise
+Core controllers, independent TLS authorization/resource peers, governed tool
+dispatch, refresh, dormant restart and local disconnect. They establish neither
+real-vendor compatibility nor the remaining full permission acceptance gate.
 
 ```bash
 uv pip install -e ".[test]"

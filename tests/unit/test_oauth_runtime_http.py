@@ -114,7 +114,9 @@ async def test_durable_grant_restarts_dormant_then_explicitly_refreshes_without_
     await connect(b, name)
     await b.host.close()
     before = list(b.peer.resource.requests), list(b.peer.requests)
+    forbidden_attempts = []
     def forbidden(*args, **kwargs):
+        forbidden_attempts.append(True)
         raise AssertionError('Dormant OAuth restore/status must not perform DNS or decrypt')
     with monkeypatch.context() as guard:
         guard.setattr(socket, 'getaddrinfo', forbidden)
@@ -127,6 +129,7 @@ async def test_durable_grant_restarts_dormant_then_explicitly_refreshes_without_
         result = await b.client.get('/api/mcp/oauth/connections')
         assert result.status_code == 200 and result.json()['connections'][0]['state'] == 'authorized'
     assert (b.peer.resource.requests, b.peer.requests) == before
+    assert forbidden_attempts == []
     await connect(b, name, refresh=True)
     assert b.peer.requests.count(('GET', '/authorize')) == 1
     assert b.peer.requests.count(('POST', '/token')) == 2
@@ -182,3 +185,60 @@ async def test_invalid_oauth_settings_cannot_retire_a_current_original_host(oaut
     with pytest.raises(ValidationError):
         await b.feature.set_config({'oauth': {'enabled': True, 'close_seconds': -1}})
     assert b.feature._oauth_host is original and not original.retired
+
+
+async def test_changed_native_client_identity_requires_consent_before_any_restored_credential_use(
+    oauth_runtime, monkeypatch,
+):
+    b = oauth_runtime
+    name = await authorize(b)
+    await connect(b, name)
+    await b.agent._unregister_feature_runtime(b.feature, unload=False)
+    before = list(b.peer.resource.requests), list(b.peer.requests)
+    b.app.state.mcp_oauth_policy = MCPOAuthHostPolicy(console_origin='https://changed-console.example',
+        network_seconds=2.0, operation_seconds=10.0)
+    forbidden_attempts = []
+
+    def forbidden(*args, **kwargs):
+        forbidden_attempts.append(True)
+        raise AssertionError('A changed OAuth client identity must not resolve or decrypt the old grant')
+
+    with monkeypatch.context() as guard:
+        guard.setattr(socket, 'getaddrinfo', forbidden)
+        guard.setattr(OAuthGrantStore, '_cipher', forbidden)
+        await b.agent._activate_feature_runtime(b.feature)
+        b.host, b.runtime = b.feature._oauth_host, b.feature._oauth_runtime
+        rows = (await b.client.get('/api/mcp/oauth/connections')).json()['connections']
+        assert rows[0]['state'] == 'reauthorization_required' and rows[0]['connected'] is False
+        response = await b.client.post('/api/mcp/oauth/connections/' + name + '/connect', json={'refresh': True})
+        assert response.status_code == 503, response.text
+    assert (b.peer.resource.requests, b.peer.requests) == before
+    assert forbidden_attempts == []
+    assert not b.feature._remote_connections
+    assert b.handle not in b.agent._direct_tools
+
+
+async def test_enabled_apps_and_oauth_share_configuration_and_soft_reactivation_generation(
+    oauth_runtime, apps_sandbox_url, apps_host_origin,
+):
+    b = oauth_runtime
+    await b.feature.set_config({'apps': {'enabled': True,
+        'host': {'sandbox_url': apps_sandbox_url, 'host_origin': apps_host_origin}}})
+    original = b.feature._apps_host, b.feature._oauth_host
+    tasks = b.feature._apps_maintenance, b.feature._oauth_maintenance
+    generation = b.feature._lifecycle_generation
+    configuration = await b.feature.get_config()
+    configuration['oauth']['max_connections'] += 1
+    await b.feature.set_config(configuration)
+    assert all(host.retired for host in original) and all(task.done() for task in tasks)
+    assert b.feature._lifecycle_generation == generation + 1
+    assert b.feature._apps_host is not original[0] and b.feature._oauth_host is not original[1]
+    assert not b.feature._apps_maintenance.done() and not b.feature._oauth_maintenance.done()
+    current = b.feature._apps_host, b.feature._oauth_host
+    await b.agent._unregister_feature_runtime(b.feature, unload=False)
+    assert all(host.retired for host in current)
+    await b.agent._activate_feature_runtime(b.feature)
+    assert b.feature._apps_host is not current[0] and b.feature._oauth_host is not current[1]
+    assert (await b.feature.get_config()) == configuration
+    assert not b.feature._apps_maintenance.done() and not b.feature._oauth_maintenance.done()
+    assert (await b.client.get('/api/mcp/oauth/connections')).status_code == 200

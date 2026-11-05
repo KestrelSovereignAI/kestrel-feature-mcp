@@ -180,6 +180,28 @@ async def test_foreign_native_principal_cannot_dispatch_or_withdraw_the_owner(cr
     assert b.peer.resource.witness == ['owned-effect']
 
 
+async def test_native_wire_credential_check_independently_refuses_a_foreign_request(credential_boundary):
+    b = credential_boundary
+    assert (await b.client.post('/api/owned-credential-connect')).status_code == 200
+
+    @b.app.post('/api/owned-credential-wire-check')
+    async def wire_check(request: Request):
+        with caller_context_scope(request.state.caller):
+            try:
+                await b.credential.dispatch_token('principal')
+            except HostCapabilityAccessDenied:
+                return JSONResponse({'error': 'original_principal_required'}, status_code=403)
+        return {'authorized': True}
+
+    foreign = await b.client.post('/api/owned-credential-wire-check', headers={
+        'X-API-Key': '', 'Authorization': 'Bearer ' + _create_jwt(b.alice)})
+    assert foreign.status_code == 403, foreign.text
+    assert not b.withdrawals and not b.peer.resource.witness
+    own = await b.client.post('/api/owned-credential-wire-check')
+    assert own.status_code == 200 and own.json() == {'authorized': True}
+    assert not b.withdrawals and not b.peer.resource.witness
+
+
 async def test_expired_grant_refreshes_under_the_original_core_connect_task(credential_boundary):
     b = credential_boundary
     result = await b.client.post('/api/owned-credential-connect?expired=1')

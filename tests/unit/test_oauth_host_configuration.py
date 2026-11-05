@@ -10,4 +10,3 @@ from kestrel_feature_mcp.oauth_runtime import OAuthSettings
 def test_invalid_oauth_configuration_refuses_before_native_owners(configuration):
     with pytest.raises(ValidationError):
         OAuthSettings.model_validate(configuration)
-

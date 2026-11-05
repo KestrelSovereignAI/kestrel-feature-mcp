@@ -138,6 +138,12 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
         return self._host_router
 
     def get_ui_contributions(self):
-        if getattr(self.agent, 'supports_mcp_apps_host', None) is not True:
+        modules = []
+        if getattr(self.agent, 'supports_mcp_apps_host', None) is True:
+            modules.append('parent-entry.js')
+        if getattr(self.agent, 'supports_mcp_oauth_host', None) is True:
+            modules.append('oauth-panel.js')
+        if not modules:
             return None
-        return UIContributions(static_dir=str(Path(__file__).with_name('apps_sandbox')), modules=['parent-entry.js'])
+        return UIContributions(static_dir=str(Path(__file__).with_name('apps_sandbox')), modules=modules,
+            css=['oauth-panel.css'] if 'oauth-panel.js' in modules else [])

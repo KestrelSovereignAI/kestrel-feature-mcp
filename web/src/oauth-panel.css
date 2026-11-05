@@ -1,0 +1,44 @@
+.mcp-connectors-panel {
+    max-width: 72rem;
+    color: var(--text-primary);
+}
+.mcp-connectors-panel > p { margin: 0.75rem 0; }
+.mcp-connectors-panel form {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1rem;
+    margin: 1.5rem 0 1rem;
+}
+.mcp-oauth-field { display: grid; gap: 0.5rem; }
+.mcp-oauth-field input {
+    min-width: 0;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.65rem;
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+}
+.mcp-oauth-choice {
+    grid-column: 1 / -1;
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    color: var(--text-secondary);
+}
+.mcp-connectors-panel form > button { justify-self: start; }
+.mcp-connector-card {
+    margin-top: 1.25rem;
+    padding: 1.25rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.75rem;
+    background: var(--bg-secondary);
+    overflow-wrap: anywhere;
+}
+.mcp-connector-card h3 { margin: 0 0 0.75rem; }
+.mcp-connector-card p { margin: 0.5rem 0; }
+.mcp-connector-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem; }
+@media (max-width: 42rem) {
+    .mcp-connectors-panel form { grid-template-columns: minmax(0, 1fr); }
+}

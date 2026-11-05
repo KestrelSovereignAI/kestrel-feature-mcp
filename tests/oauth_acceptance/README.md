@@ -9,11 +9,11 @@ issuer, resource, callback and scope boundaries without changing requests or
 overriding private SDK methods.
 
 This tool measures **initial authorization and MCP discovery**. Production
-remote connections still support `auth="none"`. The console connect flow,
-agent-scoped encrypted grants, governed tool dispatch, refresh after restart
-and write-scope acceptance remain separate epic requirements. The native SDK
-restart-state issue remains
-[#3690](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3690).
+remote connections use the separate native web Console profile described in
+the [package README](../../README.md#optional-oauth-connectors-013). That profile
+owns encrypted grants, governed dispatch and explicit refresh after dormant
+restart. This in-memory native-client spike does not establish its deployed
+acceptance or the remaining write-scope permission gate.
 
 ## Run in an isolated environment
 
