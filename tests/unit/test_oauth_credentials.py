@@ -4,6 +4,7 @@ The fixture issuer route exercises real Core authority, not the future Console
 controller. Independent SDK consent and refresh are tested in their wire suites.
 """
 
+import asyncio
 from contextlib import AsyncExitStack
 import time
 from types import SimpleNamespace
@@ -72,7 +73,9 @@ async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_ke
         await agent._feature_enablement_store.initialize()
         permissions = PermissionStore(str(tmp_path / 'permissions.db'))
         await permissions.initialize()
-        queue = ApprovalQueue(permission_store=permissions, agent=agent)
+        requests = asyncio.Queue()
+        queue = ApprovalQueue(permission_store=permissions, agent=agent,
+            on_request_added=requests.put)
         owned.callback(queue.cancel_all)
         agent.hooks_manager.register(SecurityHook(permissions, queue))
         feature = MCPAgent(agent)
@@ -84,7 +87,8 @@ async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_ke
         await store.initialize()
         b = SimpleNamespace(agent=agent, feature=feature, host=host, store=store,
             path=path, credential=None, connection=None, caller=None, handle=None,
-            withdrawals=[], callers=[], permissions=permissions, key=key, alice=alice, peer=oauth_peers)
+            withdrawals=[], callers=[], permissions=permissions, approvals=queue,
+            approval_requests=requests, key=key, alice=alice, peer=oauth_peers)
         app = FastAPI()
         b.app = app
         app.state.agent = agent

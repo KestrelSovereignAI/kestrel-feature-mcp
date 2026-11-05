@@ -647,6 +647,85 @@ async def test_real_core_authority_loss_after_a_continuation_never_refreshes_or_
 
 
 @pytest.mark.parametrize('lane', ['chat', 'inline'])
+async def test_native_model_permission_deny_has_no_wire_effect_or_credential_refresh(oauth_runtime, lane):
+    import json
+
+    b = oauth_runtime
+    name = await authorize(b)
+    await connect(b, name)
+    owner = remote_owner(name)
+    await b.permissions.set_permission(owner, b.handle, PermissionLevel.DENY)
+    tokens_before = b.peer.requests.count(('POST', '/token'))
+    result = await b.client.post('/api/owned-credential-call', params={'mode': lane})
+    assert result.status_code == 200, result.text
+    assert result.json()['success'] is False
+    assert not b.peer.resource.witness
+    assert not [json.loads(body) for _, body in b.peer.resource.requests if body
+        and json.loads(body).get('method') == 'tools/call']
+    assert b.peer.requests.count(('POST', '/token')) == tokens_before
+    decisions = [row['decision'] for row in await b.permissions.get_audit_log()
+        if row['feature'] == owner and row['tool'] == b.handle]
+    assert decisions == ['auto_denied']
+    rows = await b.host.database.fetch_all('SELECT result_status FROM a2a_tool_dispatches')
+    assert len(rows) == 1 and rows[0][0] == 'policy_denied'
+
+
+@pytest.mark.parametrize('lane', ['chat', 'inline'])
+async def test_native_model_one_shot_approval_race_cannot_authorize_the_next_call(oauth_runtime, lane):
+    import json
+
+    b = oauth_runtime
+    name = await authorize(b)
+    await connect(b, name)
+    owner = remote_owner(name)
+    await b.permissions.set_permission(owner, b.handle, PermissionLevel.ASK)
+    calls = []
+    try:
+        first = asyncio.create_task(b.client.post('/api/owned-credential-call', params={'mode': lane}))
+        calls.append(first)
+        request = await asyncio.wait_for(b.approval_requests.get(), 5)
+        assert (request.feature_name, request.tool_name) == (owner, b.handle)
+        assert request.tool_args == {'text': 'owned-effect'}
+        assert not first.done() and not b.peer.resource.witness
+        assert not [json.loads(body) for _, body in b.peer.resource.requests if body
+            and json.loads(body).get('method') == 'tools/call']
+        accepted = await asyncio.gather(
+            b.approvals.submit_decision(request.id, True, scope='once'),
+            b.approvals.submit_decision(request.id, True, scope='once'),
+        )
+        assert sorted(decision.in_memory for decision in accepted) == [False, True]
+        assert all(decision.persisted and not decision.awaiter_gone
+            for decision in accepted if decision.in_memory)
+        result = await asyncio.wait_for(first, 5)
+        assert result.status_code == 200, result.text
+        assert b.peer.resource.witness == ['owned-effect']
+        assert not await b.approvals.submit_decision(request.id, True, scope='once')
+        second = asyncio.create_task(b.client.post('/api/owned-credential-call', params={'mode': lane}))
+        calls.append(second)
+        following = await asyncio.wait_for(b.approval_requests.get(), 5)
+        assert following.id != request.id and not second.done()
+        assert b.peer.resource.witness == ['owned-effect']
+        assert await b.approvals.submit_decision(following.id, False)
+        refused = await asyncio.wait_for(second, 5)
+        assert refused.status_code == 200 and refused.json()['success'] is False
+        assert b.peer.resource.witness == ['owned-effect']
+        wire = [json.loads(body) for _, body in b.peer.resource.requests if body
+            and json.loads(body).get('method') == 'tools/call']
+        assert len(wire) == 1
+        decisions = [row['decision'] for row in await b.permissions.get_audit_log()
+            if row['feature'] == owner and row['tool'] == b.handle]
+        assert decisions.count('user_approved') == decisions.count('user_denied') == 1
+        rows = await b.host.database.fetch_all('SELECT result_status FROM a2a_tool_dispatches ORDER BY id')
+        assert [row[0] for row in rows] == ['success', 'policy_denied']
+    finally:
+        b.approvals.cancel_all()
+        for call in calls:
+            if not call.done():
+                call.cancel()
+        await asyncio.gather(*calls, return_exceptions=True)
+
+
+@pytest.mark.parametrize('lane', ['chat', 'inline'])
 async def test_model_dispatch_keeps_unknown_outcome_after_unexpected_native_continuation_failure(
     oauth_runtime, monkeypatch, lane,
 ):
