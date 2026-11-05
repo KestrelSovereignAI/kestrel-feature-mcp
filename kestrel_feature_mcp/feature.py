@@ -503,7 +503,8 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
             if record.credential is not None:
                 steps.insert(0, (True, record.credential.retire))
             await run_cleanup_steps(steps)
-            del self._remote_connections[name]
+            if self._remote_connections.get(name) is record:
+                del self._remote_connections[name]
 
     async def _read_server_delta(self, name: str) -> dict | None:
         reader = getattr(self.agent, "get_enablement_deltas", None)
@@ -537,6 +538,9 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
             raise RemoteMCPError("OAuth endpoint changed its original canonical connection binding")
         if expected_name is not None and name != expected_name:
             raise RemoteMCPError("Stored MCP endpoint is not canonical; reconnect it explicitly")
+        # DNS validation can outlive shutdown admission. Refuse before queuing
+        # behind the lifecycle lock held by that shutdown.
+        self._require_open(generation)
         async with self._lifecycle_transition, connection_lifecycle(self._remote_lifecycle, name):
             self._require_open(generation)
             owner = remote_owner(name)

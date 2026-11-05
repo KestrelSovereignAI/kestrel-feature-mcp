@@ -7,7 +7,6 @@ import contextvars
 from copy import deepcopy
 from pathlib import Path
 
-from fastapi import APIRouter
 from kestrel_sdk.features.ui import UIContributions
 from kestrel_sdk.resources import ResourceConflict
 
@@ -117,8 +116,8 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
         if maintenance is not None and not maintenance.done():
             maintenance.cancel()
         try:
-            await run_cleanup_steps([(True, host.close),
-                (True, lambda: join_maintenance(maintenance, 'MCP OAuth'))])
+            await run_cleanup_steps([(True, lambda: join_maintenance(maintenance, 'MCP OAuth')),
+                (True, host.close)])
         finally:
             if host.retired and (maintenance is None or maintenance.done()):
                 self._oauth_host = self._oauth_runtime = self._oauth_maintenance = None
@@ -128,6 +127,8 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
         oauth = getattr(self.agent, 'supports_mcp_oauth_host', None) is True
         if not apps and not oauth:
             return None
+        from fastapi import APIRouter
+
         if self._host_router is None:
             router = APIRouter()
             if apps:

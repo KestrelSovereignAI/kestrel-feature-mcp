@@ -6,6 +6,7 @@ vendor credentials are involved; actual vendor acceptance remains a manual gate.
 
 import base64
 import asyncio
+from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import gzip
@@ -63,7 +64,7 @@ class OAuthPeers:
 
 @pytest.fixture
 async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
-    options = getattr(request, "param", {})
+    options = deepcopy(getattr(request, "param", {}))
     resource_peer = mcp_http_server
     resource_port = urlsplit(resource_peer.url).port
     resource_url = f"https://remote.example:{resource_port}/mcp"

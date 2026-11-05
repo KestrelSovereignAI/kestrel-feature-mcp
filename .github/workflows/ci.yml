@@ -155,6 +155,9 @@ jobs:
       - name: Verify the installed public sandbox and credential boundary
         run: |
           "$RUNNER_TEMP/mcp-apps-install/bin/python" -I tests/packaging/sandbox_installed.py --node "$(command -v node)"
+      - name: Verify the feature imports with only its declared runtime dependencies
+        run: |
+          "$RUNNER_TEMP/mcp-apps-install/bin/python" -I -c "from kestrel_feature_mcp import MCPAgent, get_registry; assert get_registry().list_all()"
       - name: Verify the standalone sandbox image and filtered build context
         run: |
           "$RUNNER_TEMP/mcp-apps-install/bin/python" -I tests/packaging/sandbox_container.py

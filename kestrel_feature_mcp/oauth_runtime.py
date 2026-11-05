@@ -98,7 +98,11 @@ class OAuthRuntime:
         operation = owner.operation
         if operation.storage.principal_id != context.principal_id:
             raise GrantRejected('The original OAuth principal is required')
-        snapshot = await operation.complete(value, check)
+        try:
+            snapshot = await operation.complete(value, check)
+        except BaseException as error:
+            await run_cleanup_steps([(True, partial(self.retire_authorization, handle))], failure=error)
+            raise
         await self.retire_authorization(handle)
         check()
         return self._status(snapshot, self.host.client_identity(context))
@@ -168,8 +172,23 @@ class OAuthRuntime:
         return snapshot
 
     async def _retire_connection(self, name, credential):
-        self.feature._unmount_tools(remote_owner(name))
-        await run_cleanup_steps([(True, partial(self.feature._retire_remote, name)), (True, credential.retire)])
+        """Retire an original physical record inside its admitted OAuth operation."""
+        async with connection_lifecycle(self.feature._remote_lifecycle, name):
+            record = self.feature._remote_connections.get(name)
+            steps = [(True, credential.retire)]
+            if record is not None and record.credential is credential:
+                self.feature._unmount_tools(remote_owner(name))
+                steps.insert(0, (True, partial(self.feature._retire_remote, name)))
+            await run_cleanup_steps(steps)
+            # Metadata remains in durable custody. The process retains only
+            # original owners whose complete physical close is unacknowledged.
+            if self._credentials.get(name) is credential:
+                del self._credentials[name]
+
+    async def _retire_idle_connection(self, name, credential):
+        """Join foreground admission before a background or close retirement."""
+        async with connection_lifecycle(self._connections, name):
+            await self._retire_connection(name, credential)
 
     async def connect(self, context, check, name, *, refresh=False):
         self._require_open()
@@ -194,9 +213,14 @@ class OAuthRuntime:
                     >= self.settings.max_connections_per_principal):
                 raise ResourceConflict('Disconnect an owned OAuth connection before opening another')
             lease = self.host.issue_lease(context, connection_id=name, slot_id=snapshot.binding.slot_id)
+            def withdraw(_reason):
+                record = self.feature._remote_connections.get(name)
+                if record is not None and record.credential is credential:
+                    self.feature._unmount_tools(remote_owner(name))
+
             credential = OAuthConnectionCredential(store, snapshot, lease, identity,
                 close_seconds=self.settings.close_seconds,
-                withdraw=lambda _reason: self.feature._unmount_tools(remote_owner(name)))
+                withdraw=withdraw)
             self._credentials[name] = credential
             ready = False
             try:
@@ -231,7 +255,6 @@ class OAuthRuntime:
             if credential is not None:
                 steps.append((True, partial(self._retire_connection, name, credential)))
             await run_cleanup_steps(steps)
-            self._credentials.pop(name, None)
             return {'local_tokens_deleted': True, 'remote_revocation': 'not_attempted'}
 
     def withdraw_authorizations(self):
@@ -244,7 +267,7 @@ class OAuthRuntime:
         self._accepting = False
         self.withdraw_authorizations()
         steps = [(True, partial(self.retire_authorization, handle)) for handle in tuple(self._operations)]
-        steps.extend((True, partial(self._retire_connection, name, credential))
+        steps.extend((True, partial(self._retire_idle_connection, name, credential))
             for name, credential in tuple(self._credentials.items()))
         await run_cleanup_steps(steps)
         self._credentials.clear()
@@ -262,5 +285,5 @@ class OAuthRuntime:
                         credential.withdraw('reauthorization_required')
             if credential.withdrawal_reason is not None and (
                     not credential.retired or name in self.feature._remote_connections):
-                steps.append((True, partial(self._retire_connection, name, credential)))
+                steps.append((True, partial(self._retire_idle_connection, name, credential)))
         await run_cleanup_steps(steps)
