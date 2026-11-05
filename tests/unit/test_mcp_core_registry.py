@@ -4,14 +4,15 @@ from copy import deepcopy
 
 import pytest
 from pydantic import ValidationError
+from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 
 from kestrel_feature_mcp.connection import MCPConnection
 from kestrel_feature_mcp.feature import MCPAgent
 
 
-class CoreRegistryHost(ToolRegistryMixin):
-    """Inject registry state into the real production implementation."""
+class CoreRegistryHost(OrchestratorEngineMixin, ToolRegistryMixin):
+    """Use the production execution and registry implementations for the host contract."""
 
     def __init__(self):
         self.did = "did:test:registry-catalog"

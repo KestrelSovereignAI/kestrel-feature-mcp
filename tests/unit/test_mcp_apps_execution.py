@@ -14,7 +14,6 @@ from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
 from kestrel_sdk.tools import DeferredToolResult
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
-from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
@@ -27,7 +26,7 @@ from kestrel_feature_mcp.dynamic_tools import MCPToolWrapper
 from tests.unit.test_mcp_core_registry import CoreRegistryHost
 
 
-class GovernedMCPHost(OrchestratorEngineMixin, CoreRegistryHost):
+class GovernedMCPHost(CoreRegistryHost):
     def __init__(self, store):
         super().__init__()
         self.observability_store = store

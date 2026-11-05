@@ -16,6 +16,8 @@ from kestrel_sdk.tools.result import ToolResultStatus
 
 
 class RegistryHost:
+    supports_unconfirmed_tool_outcomes = True
+
     def __init__(self, did="did:test:remote"):
         self.agent_id = did
         self.registered = {}
@@ -878,6 +880,40 @@ async def test_unsupported_remote_host_is_refused_before_dns_or_persistence(remo
         assert not remote_peer.resolutions and not remote_peer.dials
         assert host.saved == saved
         assert not host.registered and not feature._remote_connections
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+@pytest.mark.parametrize("producer", ["load", "restore"])
+@pytest.mark.parametrize("claim", ["missing", None, False, 1, "yes"])
+async def test_missing_unknown_outcome_contract_is_refused_before_dns_or_saving(
+    remote_peer, producer, claim, monkeypatch, caplog,
+):
+    from kestrel_feature_mcp.remote import remote_name_for_url
+
+    host = RegistryHost()
+    if claim == "missing":
+        monkeypatch.delattr(RegistryHost, "supports_unconfirmed_tool_outcomes")
+    else:
+        host.supports_unconfirmed_tool_outcomes = claim
+    if producer == "restore":
+        name = remote_name_for_url(remote_peer.url, host.agent_id)
+        host.saved[name] = {"name": name, "state": "enabled", "metadata": {
+            "mode": "remote", "url": remote_peer.url, "auth": "none"}}
+    saved = dict(host.saved)
+    feature = MCPAgent(host)
+    try:
+        if producer == "load":
+            result = await feature.load_tool(remote_peer.url)
+            assert result.status is ToolResultStatus.ERROR
+            assert "unconfirmed tool outcomes" in result.error
+        else:
+            await feature.on_agent_ready()
+            assert "unconfirmed tool outcomes" in caplog.text
+    finally:
+        await feature.shutdown()
+        assert not remote_peer.peer.requests and not remote_peer.peer.witness
+        assert not remote_peer.resolutions and not remote_peer.dials
+        assert host.saved == saved and not host.registered and not feature._remote_connections
 
 
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True, "apps_tools": True}], indirect=True)

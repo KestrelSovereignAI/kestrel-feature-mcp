@@ -646,6 +646,41 @@ async def test_real_core_authority_loss_after_a_continuation_never_refreshes_or_
         assert b.peer.requests.count(('POST', '/token')) == 2
 
 
+@pytest.mark.parametrize('claim', ['missing', False, 1, 'yes'])
+async def test_unsupported_native_host_cannot_enable_oauth_or_start_consent(
+    credential_boundary, monkeypatch, claim,
+):
+    from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
+    from kestrel_feature_mcp.feature import MCPHostCapabilityError
+
+    b = credential_boundary
+    if claim == 'missing':
+        monkeypatch.delattr(OrchestratorEngineMixin, 'supports_unconfirmed_tool_outcomes', raising=False)
+    else:
+        b.agent.supports_unconfirmed_tool_outcomes = claim
+    before = await b.feature.get_config()
+    with pytest.raises(MCPHostCapabilityError, match='unconfirmed tool outcomes'):
+        await b.feature.set_config({'oauth': {'enabled': True, 'close_seconds': 2.0}})
+    assert await b.feature.get_config() == before
+    assert b.feature._oauth_host is b.feature._oauth_runtime is None
+    assert not b.peer.requests and not b.peer.resource.requests and not b.peer.resource.witness
+    assert not b.feature._remote_connections
+
+
+async def test_native_host_reinitialization_requires_the_outcome_contract(oauth_runtime):
+    from kestrel_feature_mcp.feature import MCPHostCapabilityError
+
+    b = oauth_runtime
+    original = b.feature._oauth_host, b.feature._oauth_runtime, b.feature._oauth_maintenance
+    config = await b.feature.get_config()
+    b.agent.supports_unconfirmed_tool_outcomes = False
+    with pytest.raises(MCPHostCapabilityError, match='unconfirmed tool outcomes'):
+        await b.feature.initialize()
+    assert (b.feature._oauth_host, b.feature._oauth_runtime, b.feature._oauth_maintenance) == original
+    assert await b.feature.get_config() == config
+    assert not b.peer.requests and not b.peer.resource.requests and not b.peer.resource.witness
+
+
 @pytest.mark.parametrize('lane', ['chat', 'inline'])
 async def test_native_model_permission_deny_has_no_wire_effect_or_credential_refresh(oauth_runtime, lane):
     import json
