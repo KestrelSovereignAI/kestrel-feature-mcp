@@ -263,23 +263,29 @@ async def test_local_disconnect_and_actual_maintenance_tick_join_one_original_co
     await connect(b, name)
     maintenance = b.feature._oauth_maintenance
     connection = b.feature._remote_connections[name].connection
-    original_close, original_maintain = connection.close, b.runtime.maintain
+    credential = b.runtime._credentials[name]
+    original_close, original_retire = connection.close, b.runtime._retire_idle_connection
     entered, observed_tick, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     closes = []
 
     async def close_original():
         closes.append(asyncio.current_task())
+        # Exercise the already-in-progress tick that the former observer missed.
+        await observed_tick.wait()
         entered.set()
         await release.wait()
         await original_close()
 
-    async def maintain_original():
-        if entered.is_set():
+    async def retire_original(retiring_name, retiring_credential):
+        # A tick can already be in progress before close enters its barrier.
+        # Observe the original retirement attempt rather than the next tick.
+        if (retiring_name == name and retiring_credential is credential
+                and asyncio.current_task() is maintenance):
             observed_tick.set()
-        await original_maintain()
+        await original_retire(retiring_name, retiring_credential)
 
     monkeypatch.setattr(connection, 'close', close_original)
-    monkeypatch.setattr(b.runtime, 'maintain', maintain_original)
+    monkeypatch.setattr(b.runtime, '_retire_idle_connection', retire_original)
     disconnect = asyncio.create_task(b.client.delete('/api/mcp/oauth/connections/' + name))
     try:
         await asyncio.wait_for(entered.wait(), 2)
