@@ -12,6 +12,7 @@ import pytest
 
 import kestrel_feature_mcp.feature as feat_mod
 from kestrel_feature_mcp.feature import MCPAgent
+from kestrel_sdk.tools.result import ToolResult
 from tests.unit.test_mcp_core_registry import CoreRegistryHost
 
 
@@ -98,7 +99,7 @@ class TestRestoreOnStartup:
             {"name": "old", "state": "disabled", "metadata": {"mode": "gateway"}},
         ])
         feat = _feature(host)
-        feat.gateway_start = AsyncMock()
+        feat.gateway_start = AsyncMock(return_value=ToolResult.ok("Gateway started"))
         await feat.on_agent_ready(host)
         feat.gateway_start.assert_awaited_once()
         # only the enabled gateway servers, comma-joined
@@ -115,7 +116,7 @@ class TestRestoreOnStartup:
              "metadata": {"mode": "container", "image": "org/img:1", "args": None}},
         ])
         feat = _feature(host, manager=SimpleNamespace(owner_did=host.agent_id))
-        feat._load_via_container = AsyncMock()
+        feat._load_via_container = AsyncMock(return_value=ToolResult.ok("Container loaded"))
         await feat.on_agent_ready(host)
         feat._load_via_container.assert_awaited_once_with("org/img:1", None)
 
@@ -127,7 +128,7 @@ class TestRestoreOnStartup:
             {"name": saved_name, "state": "enabled", "metadata": {"mode": "container", "image": "org/img:1"}},
         ]
         feat = _feature(host, manager=SimpleNamespace(owner_did=host.agent_id))
-        feat._load_via_container = AsyncMock()
+        feat._load_via_container = AsyncMock(return_value=ToolResult.ok("Container loaded"))
         await feat.on_agent_ready(host)
         feat._load_via_container.assert_not_awaited()
         host.persist_feature_enablement.assert_not_awaited()
@@ -144,7 +145,7 @@ class TestRestoreOnStartup:
             "state": "enabled", "metadata": {"mode": "container", "image": "org/img:1"},
         }]
         feature = _feature(host, manager=manager)
-        feature._load_via_container = AsyncMock()
+        feature._load_via_container = AsyncMock(return_value=ToolResult.ok("Container loaded"))
         await feature.on_agent_ready(host)
         feature._load_via_container.assert_awaited_once_with("org/img:1", None)
 
@@ -157,7 +158,7 @@ class TestRestoreOnStartup:
         }]
         feature = _feature(host)
         feature._ensure_container_manager = AsyncMock(return_value=False)
-        feature._load_via_container = AsyncMock()
+        feature._load_via_container = AsyncMock(return_value=ToolResult.ok("Container loaded"))
         await feature.on_agent_ready(host)
         feature._ensure_container_manager.assert_awaited_once()
         feature._load_via_container.assert_not_awaited()
@@ -168,8 +169,8 @@ class TestRestoreOnStartup:
         host = _host()
         host.get_enablement_deltas = AsyncMock(return_value=[])
         feat = _feature(host)
-        feat.gateway_start = AsyncMock()
-        feat._load_via_container = AsyncMock()
+        feat.gateway_start = AsyncMock(return_value=ToolResult.ok("Gateway started"))
+        feat._load_via_container = AsyncMock(return_value=ToolResult.ok("Container loaded"))
         await feat.on_agent_ready(host)
         feat.gateway_start.assert_not_awaited()
         feat._load_via_container.assert_not_awaited()
@@ -288,3 +289,51 @@ async def test_gateway_reconcile_requires_the_complete_saved_server_set():
     with pytest.raises(RemoteMCPError, match="requested gateway server set"):
         await feature._reconcile_gateway_persistence(["time"])
     assert set(host.saved) == {"old", "time"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["gateway", "container"])
+async def test_restore_rejects_unsupported_host_before_docker_acquisition(mode, monkeypatch, caplog):
+    from copy import deepcopy
+    from tests.unit.test_remote_mcp import RegistryHost
+
+    host = RegistryHost()
+    host.supports_unconfirmed_tool_outcomes = False
+    host.saved["saved-server"] = {
+        "name": "saved-server", "state": "enabled",
+        "metadata": {"mode": mode, "image": "org/img:1"},
+    }
+    saved = deepcopy(host.saved)
+    feature = MCPAgent(host)
+
+    def unexpected_docker_probe():
+        raise AssertionError("Unsupported host reached Docker availability probe")
+
+    async def unexpected_container_manager():
+        raise AssertionError("Unsupported host reached container manager acquisition")
+
+    monkeypatch.setattr(feat_mod, "check_docker_mcp_available", unexpected_docker_probe)
+    feature._ensure_container_manager = unexpected_container_manager
+    await feature.on_agent_ready()
+    assert "Cannot restore MCP Docker servers" in caplog.text
+    assert "unconfirmed tool outcomes (Core 0.62.2 or newer)" in caplog.text
+    assert host.saved == saved and not host.registered
+    assert feature.manager is None and feature.gateway_manager is None
+
+
+@pytest.mark.parametrize(("result", "level", "message"), [
+    (ToolResult.ok("all handles registered"), "INFO", "Restored"),
+    (ToolResult.partial("one handle registered", "registry capacity exceeded"), "WARNING", "Partially restored"),
+    (ToolResult.failed("catalog rejected"), "ERROR", "Failed to restore"),
+])
+def test_restore_result_reporting_preserves_loader_outcome(result, level, message, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="kestrel_feature_mcp.feature")
+    feat_mod._report_restore_result("MCP container from image org/img:1", result)
+    record, = caplog.records
+    assert record.levelname == level
+    assert record.getMessage().startswith(message + " MCP container from image org/img:1:")
+    for detail in (result.confirmation, result.error):
+        if detail:
+            assert detail in record.getMessage()

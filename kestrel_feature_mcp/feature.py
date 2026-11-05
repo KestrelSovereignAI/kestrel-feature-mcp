@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
-from kestrel_sdk.tools.result import ToolResult
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sdk.security.exceptions import SSRFError
 from kestrel_sdk.security.outbound import assert_safe_url
 from kestrel_sdk.storage.database import DatabaseError
@@ -114,6 +114,16 @@ def _loaded_tool_result(confirmation: str, *, data: dict) -> ToolResult:
             data=data,
         )
     return ToolResult.ok(confirmation, data=data)
+
+
+def _report_restore_result(target: str, result: ToolResult) -> None:
+    """Report the loader's actual outcome, including partial registration."""
+    if result.status is ToolResultStatus.ERROR:
+        logger.error("Failed to restore %s: %s", target, result.error)
+    elif result.status is ToolResultStatus.PARTIAL:
+        logger.warning("Partially restored %s: %s; %s", target, result.confirmation, result.error)
+    else:
+        logger.info("Restored %s: %s", target, result.confirmation)
 
 
 def _official_record_blocks(records: list[dict[str, Any]]) -> list[str]:
@@ -1455,19 +1465,22 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
                 continue
             try:
                 result = await self._load_via_remote(metadata.get("url"), expected_name=saved["name"])
-                if result.status.value == "error":
-                    logger.error("Failed to restore remote MCP %s: %s", saved["name"], result.error)
+                _report_restore_result(f"remote MCP {saved['name']}", result)
             except* DatabaseError as errors:
                 logger.error("Failed to restore remote MCP %s: %s",
                              saved["name"], connection_error_message(errors))
 
+        if gateway_servers or containers:
+            try:
+                self._require_governed_host()
+            except MCPHostCapabilityError as error:
+                logger.error("Cannot restore MCP Docker servers: %s", error)
+                return
+
         if gateway_servers and check_docker_mcp_available():
             try:
-                await self.gateway_start(",".join(gateway_servers))
-                logger.info(
-                    "Restored %d persisted MCP gateway server(s): %s",
-                    len(gateway_servers), gateway_servers,
-                )
+                result = await self.gateway_start(",".join(gateway_servers))
+                _report_restore_result(f"MCP gateway servers {gateway_servers}", result)
             except Exception as e:  # noqa: BLE001
                 logger.warning("Failed to restore MCP gateway servers %s: %s",
                                gateway_servers, e)
@@ -1489,8 +1502,8 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
                         "Stored MCP connection identifier does not match this agent's ownership. "
                         "Remove that saved connection and reconnect it explicitly."
                     )
-                await self._load_via_container(image, (d.get("metadata") or {}).get("args"))
-                logger.info("Restored persisted MCP container from image %s", image)
+                result = await self._load_via_container(image, (d.get("metadata") or {}).get("args"))
+                _report_restore_result(f"MCP container from image {image}", result)
             except Exception as e:  # noqa: BLE001
                 logger.warning("Failed to restore MCP container %s: %s", image, e)
 

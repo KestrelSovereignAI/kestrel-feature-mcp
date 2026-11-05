@@ -12,7 +12,7 @@ import httpx2
 import pytest
 
 from kestrel_feature_mcp.feature import MCPAgent
-from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 
 class RegistryHost:
@@ -664,8 +664,8 @@ async def test_restore_reads_existing_enablement_without_rewriting_it(
     feature = MCPAgent(host)
     feature.manager = SimpleNamespace(owner_did=host.agent_id, owned_containers={}, aclose=AsyncMock())
     monkeypatch.setattr("kestrel_feature_mcp.feature.check_docker_mcp_available", lambda: True)
-    feature.gateway_start = AsyncMock()
-    feature._load_via_container = AsyncMock()
+    feature.gateway_start = AsyncMock(return_value=ToolResult.ok("Gateway started"))
+    feature._load_via_container = AsyncMock(return_value=ToolResult.ok("Container loaded"))
     try:
         await feature.initialize()
         await feature.on_agent_ready()

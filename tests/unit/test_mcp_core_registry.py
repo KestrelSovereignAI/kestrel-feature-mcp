@@ -1,6 +1,7 @@
 """Catalog refresh against Core's canonical registry, with no model or network."""
 
 from copy import deepcopy
+import logging
 
 import pytest
 from pydantic import ValidationError
@@ -80,8 +81,9 @@ def test_tools_require_the_explicit_governed_host_contract_before_refresh():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("already_connected", [False, True])
+@pytest.mark.parametrize("producer", ["load", "restore"])
 async def test_bad_native_catalog_never_reaches_gateway_enablement_storage(
-    mcp_http_server, monkeypatch, already_connected,
+    mcp_http_server, monkeypatch, already_connected, producer, caplog,
 ):
     """Only substitute the Docker process; discovery uses the real SDK/HTTP."""
     from kestrel_sdk.tools.result import ToolResultStatus
@@ -113,10 +115,17 @@ async def test_bad_native_catalog_never_reaches_gateway_enablement_storage(
     host.persist_feature_enablement = unexpected_persist
     feature = MCPAgent(host)
     feature._reject_unknown_servers = approved_catalog_names
-    manager = MCPGatewayManager()
-    manager.gateway = OwnedHTTPGateway()
+    managers = []
+
+    def owned_manager(**kwargs):
+        manager = MCPGatewayManager(**kwargs)
+        manager.gateway = OwnedHTTPGateway()
+        managers.append(manager)
+        return manager
+
+    manager = owned_manager()
     monkeypatch.setattr("kestrel_feature_mcp.feature.check_docker_mcp_available", lambda: True)
-    monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", lambda *, connection_factory: manager)
+    monkeypatch.setattr("kestrel_feature_mcp.manager.MCPGatewayManager", owned_manager)
     if already_connected:
         await manager.start(["known-good"])
         feature.gateway_manager = manager
@@ -126,14 +135,26 @@ async def test_bad_native_catalog_never_reaches_gateway_enablement_storage(
         "meta": {"ui": {"visibility": ["invalid-audience"]}},
     }
     try:
-        result = await feature._load_via_gateway("invalid-app")
-        assert result.status is ToolResultStatus.ERROR
-        assert "echo" in result.error and "visibility" in result.error
-        assert "handles are unavailable" in result.error
-        assert "remains saved" not in result.error
+        if producer == "restore":
+            async def read_saved(kind):
+                assert kind == "mcp_server"
+                return [{"name": "invalid-app", "state": "enabled", "metadata": {"mode": "gateway"}}]
+
+            host.get_enablement_deltas = read_saved
+            caplog.set_level(logging.INFO, logger="kestrel_feature_mcp.feature")
+            await feature.on_agent_ready()
+            assert "Failed to restore MCP gateway" in caplog.text
+            assert "echo" in caplog.text and "visibility" in caplog.text
+            assert "Restored" not in caplog.text
+        else:
+            result = await feature._load_via_gateway("invalid-app")
+            assert result.status is ToolResultStatus.ERROR
+            assert "echo" in result.error and "visibility" in result.error
+            assert "handles are unavailable" in result.error
+            assert "remains saved" not in result.error
         assert not host._direct_tools, "Retired transport handles must not survive a failed discovery"
-        assert manager.connection is None
-        assert not manager.tools
+        assert all(item.connection is None and not item.tools for item in managers)
         assert not mcp_http_server.witness
     finally:
-        await manager.stop()
+        for item in managers:
+            await item.stop()
