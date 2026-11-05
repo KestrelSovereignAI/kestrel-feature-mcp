@@ -162,7 +162,7 @@ jobs:
       - name: Verify native Apps and OAuth through Core and independent HTTP peers
         run: |
           uv sync --locked --extra test --python 3.14
-          uv run --no-sync python -m pytest tests/browser/test_parent_bridge.py tests/browser/test_oauth_panel.py tests/browser/test_oauth_failure_panel.py -q --timeout=60
+          uv run --no-sync python -m pytest tests/browser/test_parent_bridge.py tests/browser/test_oauth_panel.py tests/browser/test_oauth_failure_panel.py tests/browser/test_oauth_hosted_panel.py -q --timeout=60
         timeout-minutes: 5
 
   install-check:

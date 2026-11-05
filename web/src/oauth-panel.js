@@ -47,9 +47,17 @@ export function mountOAuthPanel(root, api = API, events = bus, browser = window)
     const connections = element('div');
 
     const capture = () => {
-        const base = api.buildAgentUrl(ROOT);
-        const token = generation;
         const agent = api.getHostAgent();
+        let base = api.buildAgentUrl(ROOT);
+        if (agent) {
+            // Core's lossless address retains the same selected Unicode name
+            // through consent and a fresh callback-page API instance.
+            const bytes = new TextEncoder().encode(agent);
+            const encoded = browser.btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(''))
+                .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+            base = `/api/agent-routes/${encoded}${ROOT}`;
+        }
+        const token = generation;
         const check = () => {
             if (disposed || token !== generation || agent !== api.getHostAgent()) {
                 throw new Error('The original Console actor changed');

@@ -15,11 +15,32 @@ try {
     page.on('request', request => requests.push({ url: request.url(), method: request.method(), headers: request.headers() }));
     await page.goto(origin + '/#key=' + encodeURIComponent(configuration.key));
     await page.waitForFunction(() => window.ownedOAuthReady);
+    if (configuration.agent_name) {
+        await page.evaluate(async name => {
+            const { default: api } = await import('/js/api.js');
+            api.setHostAgent(name);
+        }, configuration.agent_name);
+        await page.getByRole('button', { name: 'Refresh connections', exact: true }).click();
+    }
     await expect(page.getByRole('status')).toHaveText('No saved connectors for your account.');
     await page.getByLabel('MCP server URL', { exact: true }).fill(configuration.server);
     await page.getByLabel('Scopes', { exact: true }).fill('read');
     await page.getByRole('button', { name: 'Authorize connector', exact: true }).click();
     await page.waitForURL(url => url.origin === origin && url.pathname === '/oauth/mcp/callback');
+    if (configuration.mode === 'hosted-consent') {
+        await expect(page.locator('#oauth-status')).toContainText('Authorization response received.');
+        expect(new URL(page.url()).search).toBe('');
+        expect(requests.filter(request => request.method === 'POST' && new URL(request.url).pathname.endsWith('/callback'))).toHaveLength(1);
+        for (const request of requests.filter(request => request.method === 'POST'
+            && /\/(?:authorizations|callback)$/.test(new URL(request.url).pathname))) {
+            expect(new URL(request.url).pathname.startsWith(configuration.agent_prefix + '/api/mcp/oauth/')).toBe(true);
+        }
+        expect(errors).toEqual([]);
+        process.stdout.write(JSON.stringify({ original_hosted_agent: true, callback_once: true }) + '\n');
+        input.close();
+        await browser.close();
+        process.exit(0);
+    }
     if (configuration.mode === 'exchange-error') {
         await expect(page.locator('#oauth-status')).toContainText('Authorization could not be completed.');
         expect(new URL(page.url()).search).toBe('');
