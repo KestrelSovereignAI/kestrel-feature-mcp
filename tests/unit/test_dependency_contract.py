@@ -35,19 +35,18 @@ def test_frozen_mcp_install_uses_public_patched_security_dependencies():
         assert packages[name]["source"] == {"registry": "https://pypi.org/simple"}
 
 
-def test_app_host_tests_require_authenticated_physical_view_ownership():
+def test_host_tests_require_native_apps_and_oauth_contracts():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     (core,) = [Requirement(raw) for raw in project["optional-dependencies"]["test"]
                if Requirement(raw).name == "kestrel-sovereign"]
-    for old in ["0.55.0", "0.55.1", "0.55.2", "0.56.0", "0.57.0", "0.58.0", "0.59.0", "0.60.0", "0.61.0", "0.61.1", "0.61.2"]:
-        assert not core.specifier.contains(old)
-    assert any(spec.operator == ">=" and Version(spec.version) >= Version("0.61.3")
+    floor = Version("0.62.0")
+    assert any(spec.operator == ">=" and Version(spec.version) >= floor
                for spec in core.specifier)
-    assert core.specifier.contains("0.61.3")
-    assert core.specifier.contains("0.62.0")
+    assert not core.specifier.contains("0.61.3")
+    assert core.specifier.contains(str(floor))
     packages = {item["name"]: item for item in tomllib.loads(
         (ROOT / "uv.lock").read_text())["package"]}
-    assert Version(packages["kestrel-sovereign"]["version"]) >= Version("0.61.3")
+    assert Version(packages["kestrel-sovereign"]["version"]) >= floor
     assert packages["kestrel-sovereign"]["source"] == {"registry": "https://pypi.org/simple"}
 
 

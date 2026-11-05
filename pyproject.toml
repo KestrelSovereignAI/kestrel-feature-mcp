@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "kestrel-sovereign>=0.61.3,<1",
+    "kestrel-sovereign>=0.62.0,<1",
     "packaging",
     "pytest>=8.0.0",
     "pytest-asyncio>=1.4.0",
