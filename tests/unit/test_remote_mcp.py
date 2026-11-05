@@ -510,7 +510,7 @@ async def test_lost_tool_response_is_unknown_and_is_never_replayed(remote_peer):
 
 @pytest.mark.parametrize("mcp_http_server", [
     {"tls": True, "input_required": kind}
-    for kind in ("sampling", "roots", "elicitation", "state")
+    for kind in ("sampling", "roots", "elicitation")
 ], indirect=True)
 async def test_unsupported_input_never_continues_or_loses_the_unknown_outcome(remote_peer):
     feature = MCPAgent(RegistryHost())

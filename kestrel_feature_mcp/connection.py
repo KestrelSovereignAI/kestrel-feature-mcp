@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
+from copy import deepcopy
 import math
 import logging
 import hashlib
@@ -21,8 +22,10 @@ from mcp.client import InputRequiredRoundsExceededError
 from mcp import Client, types
 from mcp.client.streamable_http import streamable_http_client
 from kestrel_sdk.security.outbound import ValidatedOutboundURL, pinned_httpx2_async_transport
+from kestrel_sdk.resources import ResourceError, ResourceOutcomeUnknown, ResourceUnsupported
 
 from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSION_CLOSE_TIMEOUT_DEFAULT, RESPONSE_MAX_BYTES_DEFAULT
+from .constants import STATE_ONLY_MAX_ROUNDS_DEFAULT, STATE_ONLY_BACKOFF_INITIAL_DEFAULT, STATE_ONLY_BACKOFF_MAX_DEFAULT
 from .http_limits import MCPResponseBudget, MCPResponseLimitError, identity_accept_encoding
 from .tool_contract import MCPToolContractError, validate_tool_contract
 from ._lifecycle import run_cleanup_steps
@@ -34,6 +37,14 @@ MCP_CONNECTION_ERRORS = (
     MCPError, InputRequiredRoundsExceededError, MCPResponseLimitError, httpx2.HTTPError, TimeoutError, OSError, ValidationError,
     BrokenResourceError, ClosedResourceError, EndOfStream,
 )
+
+MCP_REQUEST_ERRORS = (*MCP_CONNECTION_ERRORS, RuntimeError, ValueError, ResourceError)
+
+
+@dataclass
+class _RequestProgress:
+    sent: bool = False
+    intermediate: bool = False
 
 
 class MCPCallOutcomeUnknownError(RuntimeError):
@@ -96,6 +107,7 @@ class BoundMCPCaller:
     _owner_is_current: Callable[[], bool] = field(repr=False)
     tool_names: frozenset[str] | None = None
     _admit: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
+    _continuation_check: Callable[[], None] | None = field(default=None, repr=False)
 
     @property
     def is_current(self) -> bool:
@@ -111,20 +123,31 @@ class BoundMCPCaller:
             await self._admit()
             self.require_current()
 
-    async def __call__(self, tool_name: str, arguments: dict | None = None):
+    def _require_round(self, require_authority):
+        self.require_current()
+        if self._continuation_check is not None:
+            self._continuation_check()
+        if require_authority is not None:
+            require_authority()
+        self.require_current()
+
+    async def __call__(self, tool_name: str, arguments: dict | None = None, *, require_authority=None):
         await self._admitted()
         if self.tool_names is not None and tool_name not in self.tool_names:
             raise ValueError(f"Unknown tool: {tool_name}. Available: {sorted(self.tool_names)}")
-        return await self.connection.call_tool(tool_name, arguments or {})
+        return await self.connection.call_tool(tool_name, arguments or {},
+            round_check=partial(self._require_round, require_authority))
 
-    async def read_resource(self, uri: str) -> types.ReadResourceResult:
+    async def read_resource(self, uri: str, *, require_authority=None) -> types.ReadResourceResult:
         await self._admitted()
-        result = await self.connection.read_resource(uri, incarnation=self.incarnation)
+        result = await self.connection.read_resource(uri, incarnation=self.incarnation,
+            round_check=partial(self._require_round, require_authority))
         self.require_current()
         return result
 
 
-def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, tool_names=None, admit=None):
+def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, tool_names=None,
+                     admit=None, continuation_check=None):
     """Bind the advertised connection, never a later replacement's transport."""
     incarnation = connection.incarnation
     if incarnation is None:
@@ -134,6 +157,7 @@ def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, t
         _owner_is_current=is_current,
         tool_names=frozenset(tool_names) if tool_names is not None else None,
         _admit=admit,
+        _continuation_check=continuation_check,
     )
 
 
@@ -192,12 +216,24 @@ class MCPConnection:
         call_timeout: float = CALL_TOOL_TIMEOUT,
         close_timeout: float = SESSION_CLOSE_TIMEOUT_DEFAULT,
         response_max_bytes: int = RESPONSE_MAX_BYTES_DEFAULT,
+        max_state_only_rounds: int = STATE_ONLY_MAX_ROUNDS_DEFAULT,
+        state_only_backoff_initial: float = STATE_ONLY_BACKOFF_INITIAL_DEFAULT,
+        state_only_backoff_max: float = STATE_ONLY_BACKOFF_MAX_DEFAULT,
         extensions=None,
         before_close=None,
     ) -> None:
         if not all(math.isfinite(value) and value > 0
                    for value in (connect_timeout, call_timeout, close_timeout)):
             raise ValueError("MCP connection, call and shutdown timeouts must be finite positive numbers")
+        if type(max_state_only_rounds) is not int or not 0 <= max_state_only_rounds <= 10000:
+            raise ValueError("MCP state-only round limit must be an integer from 0 to 10000")
+        if (any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+                for value in (state_only_backoff_initial, state_only_backoff_max))
+                or state_only_backoff_initial > state_only_backoff_max):
+            raise ValueError("MCP state-only backoff must be finite positive numbers, initial no larger than maximum")
+        self._max_state_only_rounds = max_state_only_rounds
+        self._state_only_backoff_initial = state_only_backoff_initial
+        self._state_only_backoff_max = state_only_backoff_max
         self._outbound = url if isinstance(url, ValidatedOutboundURL) else None
         self.url = url.url if self._outbound is not None else url
         self._response_budget = MCPResponseBudget(response_max_bytes)
@@ -281,8 +317,8 @@ class MCPConnection:
                     transport,
                     cache=None,
                     extensions=self._extensions,
-                    # Operator-input continuations need the host's governed
-                    # surface. Never let the SDK reissue a tool call implicitly.
+                    # The host owns state-only rounds and authority checks.
+                    # Operator inputs require a separate governed surface.
                     input_required_max_rounds=0,
                 ))
                 self._client = client
@@ -351,7 +387,38 @@ class MCPConnection:
 
         return await asyncio.wait_for(collect(), timeout=self._call_timeout)
 
-    async def read_resource(self, uri: str, *, incarnation: object) -> types.ReadResourceResult:
+    async def _complete(self, invoke, *, incarnation, round_check, progress):
+        """Drive only explicit state-only results on the original request owner."""
+        state, rounds = None, 0
+        delay = self._state_only_backoff_initial
+        async with asyncio.timeout(self._call_timeout):
+            while True:
+                self.require_incarnation(incarnation)
+                if round_check is not None:
+                    round_check()
+                progress.sent = True
+                result = await invoke(state)
+                if isinstance(result, types.InputRequiredResult):
+                    progress.intermediate = True
+                self.require_incarnation(incarnation)
+                if round_check is not None:
+                    round_check()
+                if not isinstance(result, types.InputRequiredResult):
+                    return result
+                if result.input_requests:
+                    raise ResourceUnsupported("MCP operator inputs require a governed host input surface")
+                if round_check is None:
+                    raise ResourceUnsupported("MCP continuations require original host authority")
+                if rounds >= self._max_state_only_rounds:
+                    raise InputRequiredRoundsExceededError(self._max_state_only_rounds)
+                # Opaque and local to this invocation, never inspected or
+                # accumulated across rounds. Native validation owns its shape.
+                state = result.request_state
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._state_only_backoff_max)
+                rounds += 1
+
+    async def read_resource(self, uri: str, *, incarnation: object, round_check=None) -> types.ReadResourceResult:
         """Read through the originating native client, with a whole deadline.
 
         View ownership and the exact advertised resource association belong to
@@ -360,32 +427,50 @@ class MCPConnection:
         """
         self.require_incarnation(incarnation)
         client = self._require_client()
-        result = await asyncio.wait_for(
-            client.read_resource(uri, cache_mode="bypass"), timeout=self._call_timeout,
-        )
+        progress = _RequestProgress()
+        async def invoke(state):
+            return await client.session.read_resource(uri, request_state=state, allow_input_required=True)
+        try:
+            result = await self._complete(invoke, incarnation=incarnation,
+                round_check=round_check, progress=progress)
+        except (ExceptionGroup, *MCP_REQUEST_ERRORS) as error:
+            if isinstance(error, ExceptionGroup):
+                _, unexpected = error.split(MCP_REQUEST_ERRORS)
+                if unexpected is not None:
+                    raise
+            if progress.intermediate or isinstance(error, ValidationError):
+                # Pydantic validation text can include an untrusted opaque
+                # state. Expose only the canonical safe resource outcome.
+                raise ResourceOutcomeUnknown("MCP resource returned no confirmed final result; do not replay") from None
+            raise
         self.require_incarnation(incarnation)
         return result
 
-    async def call_tool(self, name: str, arguments: dict | None = None) -> types.CallToolResult:
+    async def call_tool(self, name: str, arguments: dict | None = None, *, round_check=None) -> types.CallToolResult:
         client = self._require_client()
+        incarnation = self.incarnation
+        arguments = deepcopy(arguments or {})
+        progress = _RequestProgress()
+        async def invoke(state):
+            # The public one-round API retains native headers and output
+            # validation, without the high-level schema-refresh resend.
+            return await client.session.call_tool(name, arguments,
+                request_state=state, allow_input_required=True)
         # ClientSession.validate_tool_result documents plain RuntimeError for
         # output-schema failures after execution. Preserve uncertainty rather
         # than treating an unreadable result as proof the tool did not run.
-        call_errors = (*MCP_CONNECTION_ERRORS, RuntimeError)
         try:
-            return await asyncio.wait_for(
-                # The public one-round API preserves native headers and output
-                # validation without Client.call_tool's schema-refresh resend.
-                # A new contract needs a new catalog and governed admission.
-                client.session.call_tool(name, arguments or {}), timeout=self._call_timeout,
-            )
-        except (ExceptionGroup, *call_errors) as error:
+            return await self._complete(invoke, incarnation=incarnation,
+                round_check=round_check, progress=progress)
+        except (ExceptionGroup, *MCP_REQUEST_ERRORS) as error:
+            if not progress.sent:
+                raise
             self._retire_changed_contract(error)
             if isinstance(error, ExceptionGroup):
-                _, unexpected = error.split(call_errors)
+                _, unexpected = error.split(MCP_REQUEST_ERRORS)
                 if unexpected is not None:
                     raise
-            if _rejected_before_execution(error):
+            if not progress.intermediate and _rejected_before_execution(error):
                 raise
             raise MCPCallOutcomeUnknownError(
                 f"MCP tool {name!r} returned no confirmed result; its execution outcome is unknown. "

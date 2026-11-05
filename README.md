@@ -287,11 +287,28 @@ The connection does not replay that call. A retry needs policy approval and an
 explicit idempotency or safe-repeat guarantee; an error is not evidence that
 nothing executed. Standard pre-execution JSON-RPC rejections retain their
 original error. Caller cancellation remains cancellation.
-Operator-input continuations are not implemented yet. The native client's
-automatic input loop is disabled; an input-required response produces an
-unknown-outcome error without another tool request. Managed container and gateway
-HTTP connections also ignore environment proxies, including for gateway bearer
-headers.
+State-only multi round-trip requests use the SDK's public one-round session
+APIs. Each round keeps the original tool/arguments or resource URI, echoes only
+the latest opaque state, and checks the original connection, caller and any
+live App View. OAuth rounds check the original principal and lease; the native
+HTTP credential boundary refuses expired credentials without starting a refresh.
+Initial foreground credential admission remains separate. The one call deadline
+includes every round and backoff. A lost response, later rejection or authority
+loss never establishes that earlier rounds were effect-free.
+
+`KESTREL_MCP_STATE_ONLY_MAX_ROUNDS` defaults to 10 continuations (up to 11
+requests); zero disables them. `KESTREL_MCP_STATE_ONLY_BACKOFF_INITIAL` and
+`KESTREL_MCP_STATE_ONLY_BACKOFF_MAX` default to 0.05 and 0.25 seconds, with capped
+exponential pacing. Low-level calls without an original host authority check
+do not continue. The SDK's automatic input loop stays disabled. Nonempty input
+requests are refused without fulfillment; operator-input continuation and durable
+resumption remain unfinished. MCP SDK 2.3 rejects an empty `inputRequests` map
+without `requestState`; that response fails without retry, rather than bypassing
+the native validator. This is a documented SDK limitation, not full conformance.
+See the [MRTR specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr)
+and [public SDK manual loop](https://py.sdk.modelcontextprotocol.io/handlers/multi-round-trip/).
+Managed container and gateway HTTP connections also ignore environment proxies,
+including for gateway bearer headers.
 Tool discovery follows pagination and fails on repeated cursors. Negotiation
 uses the connection deadline, then discovery uses the whole-call deadline.
 Cancelled startup joins its transport owner before returning. Shutdown has its

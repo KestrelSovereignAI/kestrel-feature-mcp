@@ -576,6 +576,7 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
                     lambda: (self._remote_connections.get(name) is record and record.tools is not None),
                     name,
                     admit=None if credential is None else credential.admit,
+                    continuation_check=None if credential is None else credential.lease.require_principal,
                 )
                 mounted = self._mount_tools(
                     owner, f"remote_{name[-12:]}", record.tool_descriptions(), caller,

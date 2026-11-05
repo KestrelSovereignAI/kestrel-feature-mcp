@@ -74,10 +74,11 @@ def decode_app_resource(
 
 
 async def read_app_resource(
-    caller: BoundMCPCaller, *, uri: str, max_html_bytes: int,
+    caller: BoundMCPCaller, *, uri: str, max_html_bytes: int, require_authority=None,
 ) -> AppResource:
     """Read only through the captured owner and original connection lifetime."""
     # Validate the association and configuration before any network request.
     _require_resource_request(uri, max_html_bytes)
-    result = await caller.read_resource(uri)
+    options = {} if require_authority is None else {"require_authority": require_authority}
+    result = await caller.read_resource(uri, **options)
     return decode_app_resource(result, uri=uri, max_html_bytes=max_html_bytes)

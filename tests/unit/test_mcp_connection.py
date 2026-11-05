@@ -195,10 +195,10 @@ async def test_native_resource_read_has_its_own_deadline_without_reissue(mcp_htt
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True}], indirect=True)
 async def test_resource_read_rechecks_session_after_the_native_response(mcp_http_server, monkeypatch):
-    from mcp import Client
+    from mcp.client.session import ClientSession
 
     received, release = asyncio.Event(), asyncio.Event()
-    native_read = Client.read_resource
+    native_read = ClientSession.read_resource
 
     async def hold_received_response(client, *args, **kwargs):
         result = await native_read(client, *args, **kwargs)
@@ -206,7 +206,7 @@ async def test_resource_read_rechecks_session_after_the_native_response(mcp_http
         await release.wait()
         return result
 
-    monkeypatch.setattr(Client, "read_resource", hold_received_response)
+    monkeypatch.setattr(ClientSession, "read_resource", hold_received_response)
     connection = MCPConnection(mcp_http_server.url)
     read = None
     try:
@@ -253,10 +253,10 @@ async def test_bound_connection_captures_advertised_names_and_reports_retirement
 @pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True}], indirect=True)
 @pytest.mark.parametrize("reader", ["bound", "app"])
 async def test_bound_resource_reader_rejects_owner_retirement_after_the_response(mcp_http_server, monkeypatch, reader):
-    from mcp import Client
+    from mcp.client.session import ClientSession
 
     received, release = asyncio.Event(), asyncio.Event()
-    native_read = Client.read_resource
+    native_read = ClientSession.read_resource
 
     async def hold_received_response(client, *args, **kwargs):
         result = await native_read(client, *args, **kwargs)
@@ -264,7 +264,7 @@ async def test_bound_resource_reader_rejects_owner_retirement_after_the_response
         await release.wait()
         return result
 
-    monkeypatch.setattr(Client, "read_resource", hold_received_response)
+    monkeypatch.setattr(ClientSession, "read_resource", hold_received_response)
     connection = MCPConnection(mcp_http_server.url)
     owner = {"current": True}
     read = None

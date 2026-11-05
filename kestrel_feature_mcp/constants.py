@@ -22,6 +22,11 @@ SESSION_CLOSE_TIMEOUT_DEFAULT = float(os.environ.get("KESTREL_MCP_CLOSE_TIMEOUT"
 # whole agent turn (F402). Overridable via ``KESTREL_MCP_CALL_TIMEOUT``.
 CALL_TOOL_TIMEOUT = int(os.environ.get("KESTREL_MCP_CALL_TIMEOUT", "120"))
 
+# State-only MRTR remains inside that one call deadline. Zero disables it.
+STATE_ONLY_MAX_ROUNDS_DEFAULT = int(os.environ.get("KESTREL_MCP_STATE_ONLY_MAX_ROUNDS", "10"))
+STATE_ONLY_BACKOFF_INITIAL_DEFAULT = float(os.environ.get("KESTREL_MCP_STATE_ONLY_BACKOFF_INITIAL", "0.05"))
+STATE_ONLY_BACKOFF_MAX_DEFAULT = float(os.environ.get("KESTREL_MCP_STATE_ONLY_BACKOFF_MAX", "0.25"))
+
 # Container management
 MCP_CONTAINER_BIND_HOST = "127.0.0.1"
 MCP_REMOVAL_ATTEMPTS = 10

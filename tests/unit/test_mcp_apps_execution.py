@@ -868,3 +868,40 @@ async def test_close_joins_only_the_original_borrow_not_later_host_work(app_boun
     finally:
         release.set()
         await asyncio.gather(child, *([closer] if closer else []), return_exceptions=True)
+
+
+@pytest.mark.parametrize('kind', ['tool', 'resource'])
+@pytest.mark.parametrize('expire_after', [1, 2])
+async def test_live_view_authority_is_checked_after_each_native_intermediate(
+    app_boundary, mcp_http_server, kind, expire_after,
+):
+    b = app_boundary
+    await allow(b, 'app_mutate')
+    rounds = []
+    method = 'tools/call' if kind == 'tool' else 'resources/read'
+
+    async def defer(ctx, call_next):
+        if ctx.method != method:
+            return await call_next(ctx)
+        rounds.append(ctx.params.get('requestState'))
+        if len(rounds) == expire_after:
+            # The original live View predicate models reader authorization;
+            # leave its physical owner open to exclude maintenance cancellation.
+            b.owner_current[0] = False
+        return types.InputRequiredResult(request_state='private-view-continuation')
+
+    mcp_http_server.mcp.middleware.append(defer)
+    with pytest.raises(ResourceOutcomeUnknown):
+        if kind == 'tool':
+            await b.executor.invoke(b.view, 'app_mutate', {'text': 'same-approved-call'})
+        else:
+            await b.view.read_resource('ui://status/view.html', max_html_bytes=4096)
+    assert len(rounds) == expire_after
+    calls = [json.loads(body) for _, body in mcp_http_server.requests if body
+        and json.loads(body).get('method') == method]
+    assert len(calls) == expire_after
+    assert not mcp_http_server.witness
+    rows = await b.backend.fetch_all('SELECT result_status FROM a2a_tool_dispatches')
+    assert len(rows) == (1 if kind == 'tool' else 0)
+    if rows:
+        assert rows[0][0] == 'error'

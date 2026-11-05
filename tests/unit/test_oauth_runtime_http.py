@@ -598,3 +598,90 @@ async def test_status_requires_the_current_original_grant_snapshot(oauth_runtime
     status = b.runtime._status(metadata, credential.budgets)
     assert status['state'] == 'authorized' and not status['connected']
     assert b.peer.resource.witness == []
+
+
+@pytest.mark.parametrize('loss', ['lease', 'expiry'])
+async def test_real_core_authority_loss_after_a_continuation_never_refreshes_or_sends_again(oauth_runtime, monkeypatch, loss):
+    from mcp import types
+    import json
+
+    b = oauth_runtime
+    name = await authorize(b)
+    await connect(b, name)
+    credential = b.runtime._credentials[name]
+    import kestrel_feature_mcp.oauth_credentials as native_credentials
+    original_clock = native_credentials.time
+    rounds = []
+
+    async def defer(ctx, call_next):
+        if ctx.method != 'tools/call':
+            return await call_next(ctx)
+        rounds.append(ctx.params.get('requestState'))
+        b.peer.resource.witness.append('effect-before-continuation')
+        if len(rounds) == 2:
+            if loss == 'lease':
+                credential.lease.revoke()
+            else:
+                import kestrel_feature_mcp.oauth_credentials as native_credentials
+                from types import SimpleNamespace
+                monkeypatch.setattr(native_credentials, 'time', SimpleNamespace(time=lambda: float('inf')))
+        return types.InputRequiredResult(request_state='opaque-pending-operation')
+
+    b.peer.resource.mcp.middleware.append(defer)
+    result = await b.client.post('/api/owned-credential-call')
+    assert result.status_code == 200, result.text
+    assert len(rounds) == 2
+    assert b.peer.resource.witness == ['effect-before-continuation'] * 2
+    assert result.json()['data']['execution_outcome'] == 'unknown'
+    calls = [json.loads(body) for _, body in b.peer.resource.requests if body
+        and json.loads(body).get('method') == 'tools/call']
+    assert len(calls) == 2 and len({c['id'] for c in calls}) == 2
+    assert b.peer.requests.count(('POST', '/token')) == 1
+    assert len(await b.host.database.fetch_all('SELECT * FROM a2a_tool_dispatches')) == 1
+    snapshot = await credential.store.read_slot(credential.principal_id, name)
+    assert snapshot.state == 'active'
+    if loss == 'expiry':
+        monkeypatch.setattr(native_credentials, 'time', original_clock)
+        await connect(b, name, refresh=True)
+        assert b.peer.requests.count(('POST', '/token')) == 2
+
+
+async def test_model_dispatch_keeps_unknown_outcome_after_unexpected_native_continuation_failure(
+    oauth_runtime, monkeypatch,
+):
+    from mcp import types
+    from mcp.client.session import ClientSession
+    import json
+
+    b = oauth_runtime
+    name = await authorize(b)
+    await connect(b, name)
+    rounds = []
+    async def defer(ctx, call_next):
+        if ctx.method != 'tools/call':
+            return await call_next(ctx)
+        rounds.append(ctx.params.get('requestState'))
+        b.peer.resource.witness.append('effect-before-sdk-fault')
+        return types.InputRequiredResult(request_state='opaque-real-continuation')
+    b.peer.resource.mcp.middleware.append(defer)
+    native_call = ClientSession.call_tool
+    async def fault_after_received_native_result(session, *args, **kwargs):
+        result = await native_call(session, *args, **kwargs)
+        if isinstance(result, types.InputRequiredResult) and len(rounds) == 2:
+            # Controlled SDK fault AFTER a real second HTTP response. No wire
+            # replies, authority checks or protocol validators are fabricated.
+            raise KeyError('private-sdk-bug-detail')
+        return result
+    monkeypatch.setattr(ClientSession, 'call_tool', fault_after_received_native_result)
+    result = await b.client.post('/api/owned-credential-call')
+    assert result.status_code == 200, result.text
+    assert result.json()['success'] is False
+    assert 'unconfirmed' in result.json()['error']
+    assert 'reconcile before retrying' in result.json()['error']
+    assert 'private-sdk-bug-detail' not in result.text
+    assert len(rounds) == 2 and b.peer.resource.witness == ['effect-before-sdk-fault'] * 2
+    calls = [json.loads(body) for _, body in b.peer.resource.requests if body
+        and json.loads(body).get('method') == 'tools/call']
+    assert len(calls) == 2 and len({c['id'] for c in calls}) == 2
+    rows = await b.host.database.fetch_all('SELECT result_status, error_class FROM a2a_tool_dispatches')
+    assert len(rows) == 1 and tuple(rows[0]) == ('error', 'ResourceOutcomeUnknown')
