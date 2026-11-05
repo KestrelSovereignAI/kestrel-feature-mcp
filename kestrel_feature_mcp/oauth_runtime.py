@@ -140,6 +140,7 @@ class OAuthRuntime:
         credential = self._credentials.get(binding.connection_id)
         record = self.feature._remote_connections.get(binding.connection_id)
         connected = (snapshot.state == 'active' and credential is not None
+            and credential.snapshot.revision == snapshot.revision and credential.snapshot.binding == binding
             and credential.withdrawal_reason is None and record is not None
             and record.credential is credential and record.tools is not None and record.connection.is_connected)
         state = {'active': 'authorized', 'exchanging': 'outcome_unknown', 'refreshing': 'refresh_unknown',

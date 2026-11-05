@@ -584,3 +584,17 @@ async def test_resource_rejection_projection_defers_to_durable_state_and_revisio
         metadata = replace(snapshot, state=state, reason='local' if state == 'revoked' else None)
         assert b.runtime._status(metadata, credential.budgets)['state'] == expected
     assert b.peer.resource.witness == [] and not b.runtime.has_owners
+
+
+@pytest.mark.parametrize('changed', ['revision', 'binding'])
+async def test_status_requires_the_current_original_grant_snapshot(oauth_runtime, changed):
+    b = oauth_runtime
+    name = await authorize(b)
+    await connect(b, name)
+    credential = b.runtime._credentials[name]
+    # Pure status projection of metadata changed by another durable owner.
+    metadata = replace(credential.snapshot, revision='different-committed-revision') if changed == 'revision' else replace(
+        credential.snapshot, binding=replace(credential.snapshot.binding, scopes=frozenset({'read', 'write'})))
+    status = b.runtime._status(metadata, credential.budgets)
+    assert status['state'] == 'authorized' and not status['connected']
+    assert b.peer.resource.witness == []
