@@ -646,8 +646,9 @@ async def test_real_core_authority_loss_after_a_continuation_never_refreshes_or_
         assert b.peer.requests.count(('POST', '/token')) == 2
 
 
+@pytest.mark.parametrize('lane', ['chat', 'inline'])
 async def test_model_dispatch_keeps_unknown_outcome_after_unexpected_native_continuation_failure(
-    oauth_runtime, monkeypatch,
+    oauth_runtime, monkeypatch, lane,
 ):
     from mcp import types
     from mcp.client.session import ClientSession
@@ -673,7 +674,7 @@ async def test_model_dispatch_keeps_unknown_outcome_after_unexpected_native_cont
             raise KeyError('private-sdk-bug-detail')
         return result
     monkeypatch.setattr(ClientSession, 'call_tool', fault_after_received_native_result)
-    result = await b.client.post('/api/owned-credential-call')
+    result = await b.client.post('/api/owned-credential-call', params={'mode': lane})
     assert result.status_code == 200, result.text
     assert result.json()['success'] is False
     assert 'unconfirmed' in result.json()['error']

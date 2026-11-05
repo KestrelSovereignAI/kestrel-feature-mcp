@@ -140,6 +140,14 @@ async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_ke
             with service.bind(request) as authentication, caller_context_scope(authentication.caller):
                 try:
                     b.callers.append(authentication.caller)
+                    if request.query_params.get('mode') == 'inline':
+                        executor = agent._make_inline_tool_executor('credential-chat')
+                        effective_args, result = await executor(b.handle, {'text': 'owned-effect'})
+                        await agent._append_executed_tool_breadcrumbs([], [{
+                            'id': 'owned-native-inline-call', 'name': b.handle,
+                            'arguments': effective_args, 'result': result,
+                        }], session_id='credential-chat')
+                        return result
                     return await agent._dispatch_tool_call(
                         ToolCall(id='owned-native-tool-call', name=b.handle, arguments={'text': 'owned-effect'}),
                         {}, {b.handle}, [], 0, 'Owned synthetic MCP call',
