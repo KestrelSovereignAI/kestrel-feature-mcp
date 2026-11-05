@@ -93,7 +93,7 @@ Remote write scopes remain gated on
 
 ## Optional OAuth connectors (0.13)
 
-OAuth is disabled by default and requires Core 0.62.2 or newer. Configure the
+OAuth is disabled by default and requires the [supported host contract](#runtime-requirements). Configure the
 Console's public HTTPS origin in Core with
 `KESTREL_MCP_OAUTH_CONSOLE_ORIGIN=https://console.example.com`. That origin must
 serve the native callback page and `/js` assets. Core owns the client metadata,
@@ -287,7 +287,7 @@ The connection does not replay that call. A retry needs policy approval and an
 explicit idempotency or safe-repeat guarantee; an error is not evidence that
 nothing executed. Standard pre-execution JSON-RPC rejections retain their
 original error. Caller cancellation remains cancellation.
-State-only multi round-trip requests require Core 0.62.2 or newer so faults
+State-only multi round-trip requests require the [supported host contract](#runtime-requirements) so faults
 after execution begins remain unconfirmed across model, named and direct tool
 dispatch. Hosts must declare `supports_unconfirmed_tool_outcomes` exactly true;
 unsupported hosts are refused before connection acquisition or Apps/OAuth
@@ -388,11 +388,11 @@ done
 Update the pinned harness and lock together, rerun the profile, and review
 new required scenarios as the remaining host capabilities land.
 
-## Optional MCP Apps host (0.11)
+## Optional MCP Apps host
 
 The optional host composes native AppBridge rendering, Core-authenticated View
 routes, governed App tool calls and bounded private result retention. It requires
-Core 0.61.1 or newer and a separate credential-free sandbox origin. Apps are
+the [supported host contract](#runtime-requirements) and a separate credential-free sandbox origin. Apps are
 disabled by default. Configure the feature before loading MCP connections:
 
 ```json
@@ -437,6 +437,8 @@ every original resource and propagates failures and cancellation; settled
 maintenance failures are reported without poisoning later re-enable attempts.
 An unfinished close retains its original owner and is retried before re-enable.
 
+## Runtime requirements
+
 Version 0.8.0 introduced the native components described below; 0.9.0 added
 completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
@@ -454,8 +456,7 @@ complete governed native result as unconfirmed, including native pre-execution
 errors. Consumers must not turn that uncertainty into an automatic retry.
 Construct the App executor with its actual host, for example
 `AppExecutor(host=agent, max_pending_calls=configured_limit)`. The host must
-declare `supports_deferred_tool_results` as exactly `True` (Core 0.55.2 or
-newer). App results use the SDK's deferred delivery contract: completed,
+declare `supports_deferred_tool_results` as exactly `True`. App results use the SDK's deferred delivery contract: completed,
 allowing post-tool policy on the unchanged public result is required before
 private native output can be delivered. Denial, ASK/stop, replacement,
 redaction and incomplete hooks withhold it, even if the public values did not
@@ -465,7 +466,7 @@ after admission raises `ResourceOutcomeUnknown`. An awaiting caller's own
 cancellation remains cancellation. Closing a View joins its owned calls and
 required audit finalization; it cannot undo effects already accepted remotely.
 
-Initial publication requires SDK 0.46.0 and the Core 0.59.0 host contracts
+Initial publication requires the supported host contracts
 `supports_audited_deferred_tool_results` and `supports_tool_publication_context`,
 both exactly `True`. Pass a synchronous `initial_publisher` to `AppExecutor`;
 the callback receives the original tool, actual chat destination, native result

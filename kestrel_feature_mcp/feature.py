@@ -121,9 +121,9 @@ def _report_restore_result(target: str, result: ToolResult) -> None:
     if result.status is ToolResultStatus.ERROR:
         logger.error("Failed to restore %s: %s", target, result.error)
     elif result.status is ToolResultStatus.PARTIAL:
-        logger.warning("Partially restored %s: %s; %s", target, result.confirmation, result.error)
+        logger.warning("Partially restored %s: %s", target, result.error)
     else:
-        logger.info("Restored %s: %s", target, result.confirmation)
+        logger.info("Restored %s", target)
 
 
 def _official_record_blocks(records: list[dict[str, Any]]) -> list[str]:

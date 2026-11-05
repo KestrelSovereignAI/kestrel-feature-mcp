@@ -63,3 +63,18 @@ def test_production_refresh_installs_public_authlib_without_the_test_extra():
     packages = {item['name']: item for item in tomllib.loads((ROOT / 'uv.lock').read_text())['package']}
     assert Version(packages['authlib']['version']) >= Version('1.9.4')
     assert packages['authlib']['source'] == {'registry': 'https://pypi.org/simple'}
+
+
+def test_readme_has_one_canonical_supported_core_minimum():
+    import re
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    core, = [Requirement(raw) for raw in project["optional-dependencies"]["test"]
+             if Requirement(raw).name == "kestrel-sovereign"]
+    minimum = max(Version(spec.version) for spec in core.specifier if spec.operator == ">=")
+    readme = (ROOT / "README.md").read_text()
+    assert re.findall(r"\bCore ([0-9]+\.[0-9]+\.[0-9]+)", readme) == [str(minimum)], (
+        "Declare the supported Core minimum once in Runtime requirements; link other sections to it"
+    )
+    assert "## Runtime requirements\n" in readme
+    assert readme.count("(#runtime-requirements)") >= 3

@@ -333,7 +333,25 @@ def test_restore_result_reporting_preserves_loader_outcome(result, level, messag
     feat_mod._report_restore_result("MCP container from image org/img:1", result)
     record, = caplog.records
     assert record.levelname == level
-    assert record.getMessage().startswith(message + " MCP container from image org/img:1:")
-    for detail in (result.confirmation, result.error):
-        if detail:
-            assert detail in record.getMessage()
+    assert record.getMessage().startswith(message + " MCP container from image org/img:1")
+    assert result.confirmation is None or result.confirmation not in record.getMessage()
+    if result.error:
+        assert result.error in record.getMessage()
+
+
+@pytest.mark.parametrize("result", [
+    ToolResult.ok("catalog-name\nFORGED-LOG-ENTRY" * 1000),
+    ToolResult.partial("catalog-name\nFORGED-LOG-ENTRY" * 1000, "registry capacity exceeded"),
+])
+def test_restore_logging_does_not_echo_untrusted_catalog_confirmation(result, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="kestrel_feature_mcp.feature")
+    feat_mod._report_restore_result("remote MCP owned-opaque-connection", result)
+    record, = caplog.records
+    message = record.getMessage()
+    assert result.confirmation not in message
+    assert "\n" not in message
+    assert len(message) < 256
+    if result.error:
+        assert result.error in message
