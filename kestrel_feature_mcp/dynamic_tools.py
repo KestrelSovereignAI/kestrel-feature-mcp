@@ -140,7 +140,8 @@ class MCPToolWrapper:
                 return ToolResult.failed(
                     "MCP app-only tool requires a live authorized view",
                 ).to_dict()
-            result = await self._caller(self._real_name, kwargs)
+            options = {} if invocation is None else {"require_authority": invocation.view.require_current}
+            result = await self._caller(self._real_name, kwargs, **options)
         except MCPCallOutcomeUnknownError as error:
             logger.error("MCP tool %r has an unconfirmed outcome (%s)", self._real_name,
                 type(error.__cause__).__name__)

@@ -39,6 +39,8 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
                 raise ValueError('MCP configuration accepts Apps and OAuth host settings')
             apps = AppsSettings.model_validate(deepcopy(config.get('apps', self._apps_settings.model_dump())))
             oauth = OAuthSettings.model_validate(deepcopy(config.get('oauth', self._oauth_settings.model_dump())))
+            if apps.enabled or oauth.enabled:
+                self._require_governed_host()
             # Validate both domains before retiring either original host.
             if apps.enabled:
                 validate = getattr(self.agent, 'validate_mcp_apps_host_configuration', None)
@@ -62,6 +64,8 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
             await self._start_configured_hosts()
 
     async def _start_configured_hosts(self):
+        if self._apps_settings.enabled or self._oauth_settings.enabled:
+            self._require_governed_host()
         # Readiness refusal does not consume an existing owner's cleanup
         # failure. Explicit shutdown/re-enable joins that original owner.
         if self._apps_settings.enabled and self._apps_host is not None:

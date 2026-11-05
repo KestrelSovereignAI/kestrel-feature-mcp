@@ -93,7 +93,7 @@ Remote write scopes remain gated on
 
 ## Optional OAuth connectors (0.13)
 
-OAuth is disabled by default and requires Core 0.62.0 or newer. Configure the
+OAuth is disabled by default and requires the [supported host contract](#runtime-requirements). Configure the
 Console's public HTTPS origin in Core with
 `KESTREL_MCP_OAUTH_CONSOLE_ORIGIN=https://console.example.com`. That origin must
 serve the native callback page and `/js` assets. Core owns the client metadata,
@@ -287,11 +287,31 @@ The connection does not replay that call. A retry needs policy approval and an
 explicit idempotency or safe-repeat guarantee; an error is not evidence that
 nothing executed. Standard pre-execution JSON-RPC rejections retain their
 original error. Caller cancellation remains cancellation.
-Operator-input continuations are not implemented yet. The native client's
-automatic input loop is disabled; an input-required response produces an
-unknown-outcome error without another tool request. Managed container and gateway
-HTTP connections also ignore environment proxies, including for gateway bearer
-headers.
+State-only multi round-trip requests require the [supported host contract](#runtime-requirements) so faults
+after execution begins remain unconfirmed across model, named and direct tool
+dispatch. Hosts must declare `supports_unconfirmed_tool_outcomes` exactly true;
+unsupported hosts are refused before connection acquisition or Apps/OAuth
+enablement. They use the SDK's public one-round session APIs. Each round keeps the original tool/arguments or resource URI, echoes only
+the latest opaque state, and checks the original connection, caller and any
+live App View. OAuth rounds check the original principal and lease; the native
+HTTP credential boundary refuses expired credentials without starting a refresh.
+Initial foreground credential admission remains separate. The one call deadline
+includes every round and backoff. A lost response, later rejection or authority
+loss never establishes that earlier rounds were effect-free.
+
+`KESTREL_MCP_STATE_ONLY_MAX_ROUNDS` defaults to 10 continuations (up to 11
+requests); zero disables them. `KESTREL_MCP_STATE_ONLY_BACKOFF_INITIAL` and
+`KESTREL_MCP_STATE_ONLY_BACKOFF_MAX` default to 0.05 and 0.25 seconds, with capped
+exponential pacing. Low-level calls without an original host authority check
+do not continue. The SDK's automatic input loop stays disabled. Nonempty input
+requests are refused without fulfillment; operator-input continuation and durable
+resumption remain unfinished. MCP SDK 2.3 rejects an empty `inputRequests` map
+without `requestState`; that response fails without retry, rather than bypassing
+the native validator. This is a documented SDK limitation, not full conformance.
+See the [MRTR specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr)
+and [public SDK manual loop](https://py.sdk.modelcontextprotocol.io/handlers/multi-round-trip/).
+Managed container and gateway HTTP connections also ignore environment proxies,
+including for gateway bearer headers.
 Tool discovery follows pagination and fails on repeated cursors. Negotiation
 uses the connection deadline, then discovery uses the whole-call deadline.
 Cancelled startup joins its transport owner before returning. Shutdown has its
@@ -368,11 +388,11 @@ done
 Update the pinned harness and lock together, rerun the profile, and review
 new required scenarios as the remaining host capabilities land.
 
-## Optional MCP Apps host (0.11)
+## Optional MCP Apps host
 
 The optional host composes native AppBridge rendering, Core-authenticated View
 routes, governed App tool calls and bounded private result retention. It requires
-Core 0.61.1 or newer and a separate credential-free sandbox origin. Apps are
+the [supported host contract](#runtime-requirements) and a separate credential-free sandbox origin. Apps are
 disabled by default. Configure the feature before loading MCP connections:
 
 ```json
@@ -417,12 +437,14 @@ every original resource and propagates failures and cancellation; settled
 maintenance failures are reported without poisoning later re-enable attempts.
 An unfinished close retains its original owner and is retried before re-enable.
 
+## Runtime requirements
+
 Version 0.8.0 introduced the native components described below; 0.9.0 added
 completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
-Base MCP connections and governed tools require Core 0.55.2 or newer. Initial
-publication and result associations require Core 0.59.0 or newer, as detailed
-below. The test profile requires Core 0.62.0 for the native Apps and OAuth host contracts.
+Version 0.13.0 requires Core 0.62.2 or newer for the native Apps, OAuth and
+unconfirmed tool outcome contracts. The test profile uses the same minimum.
+Initial publication and result associations are detailed below.
 An unsupported host is refused before connecting or saving enablement.
 When a server rejects a call with `HeaderMismatch`, Kestrel retires the original
 catalog. Reload the connection to discover and admit the new contract before
@@ -434,8 +456,7 @@ complete governed native result as unconfirmed, including native pre-execution
 errors. Consumers must not turn that uncertainty into an automatic retry.
 Construct the App executor with its actual host, for example
 `AppExecutor(host=agent, max_pending_calls=configured_limit)`. The host must
-declare `supports_deferred_tool_results` as exactly `True` (Core 0.55.2 or
-newer). App results use the SDK's deferred delivery contract: completed,
+declare `supports_deferred_tool_results` as exactly `True`. App results use the SDK's deferred delivery contract: completed,
 allowing post-tool policy on the unchanged public result is required before
 private native output can be delivered. Denial, ASK/stop, replacement,
 redaction and incomplete hooks withhold it, even if the public values did not
@@ -445,7 +466,7 @@ after admission raises `ResourceOutcomeUnknown`. An awaiting caller's own
 cancellation remains cancellation. Closing a View joins its owned calls and
 required audit finalization; it cannot undo effects already accepted remotely.
 
-Initial publication requires SDK 0.46.0 and the Core 0.59.0 host contracts
+Initial publication requires the supported host contracts
 `supports_audited_deferred_tool_results` and `supports_tool_publication_context`,
 both exactly `True`. Pass a synchronous `initial_publisher` to `AppExecutor`;
 the callback receives the original tool, actual chat destination, native result

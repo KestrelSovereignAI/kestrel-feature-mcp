@@ -133,7 +133,8 @@ class AppView:
             raise ResourceConflict("MCP App resource must match its originating tool association")
 
         async def read():
-            loaded = await read_app_resource(self.caller, uri=uri, max_html_bytes=max_html_bytes)
+            loaded = await read_app_resource(self.caller, uri=uri, max_html_bytes=max_html_bytes,
+                require_authority=self.require_current)
             self.require_current()
             return loaded
 

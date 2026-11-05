@@ -31,6 +31,8 @@ def _result(text="ok", *, is_error=False, blocks=None):
 class _FakeHost:
     """Minimal host exposing the PR2 dynamic-tool registry, recording mounts."""
 
+    supports_unconfirmed_tool_outcomes = True
+
     def __init__(self):
         self.registered: dict = {}
 

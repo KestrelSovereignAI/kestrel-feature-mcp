@@ -35,14 +35,16 @@ def test_frozen_mcp_install_uses_public_patched_security_dependencies():
         assert packages[name]["source"] == {"registry": "https://pypi.org/simple"}
 
 
-def test_host_tests_require_native_apps_and_oauth_contracts():
+def test_host_tests_require_native_apps_oauth_and_unconfirmed_outcomes():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     (core,) = [Requirement(raw) for raw in project["optional-dependencies"]["test"]
                if Requirement(raw).name == "kestrel-sovereign"]
-    floor = Version("0.62.0")
+    floor = Version("0.62.2")
     assert any(spec.operator == ">=" and Version(spec.version) >= floor
                for spec in core.specifier)
     assert not core.specifier.contains("0.61.3")
+    assert not core.specifier.contains("0.62.0")
+    assert not core.specifier.contains("0.62.1")
     assert core.specifier.contains(str(floor))
     packages = {item["name"]: item for item in tomllib.loads(
         (ROOT / "uv.lock").read_text())["package"]}
@@ -61,3 +63,18 @@ def test_production_refresh_installs_public_authlib_without_the_test_extra():
     packages = {item['name']: item for item in tomllib.loads((ROOT / 'uv.lock').read_text())['package']}
     assert Version(packages['authlib']['version']) >= Version('1.9.4')
     assert packages['authlib']['source'] == {'registry': 'https://pypi.org/simple'}
+
+
+def test_readme_has_one_canonical_supported_core_minimum():
+    import re
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    core, = [Requirement(raw) for raw in project["optional-dependencies"]["test"]
+             if Requirement(raw).name == "kestrel-sovereign"]
+    minimum = max(Version(spec.version) for spec in core.specifier if spec.operator == ">=")
+    readme = (ROOT / "README.md").read_text()
+    assert re.findall(r"\bCore ([0-9]+\.[0-9]+\.[0-9]+)", readme) == [str(minimum)], (
+        "Declare the supported Core minimum once in Runtime requirements; link other sections to it"
+    )
+    assert "## Runtime requirements\n" in readme
+    assert readme.count("(#runtime-requirements)") >= 3

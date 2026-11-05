@@ -12,10 +12,12 @@ import httpx2
 import pytest
 
 from kestrel_feature_mcp.feature import MCPAgent
-from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 
 class RegistryHost:
+    supports_unconfirmed_tool_outcomes = True
+
     def __init__(self, did="did:test:remote"):
         self.agent_id = did
         self.registered = {}
@@ -510,7 +512,7 @@ async def test_lost_tool_response_is_unknown_and_is_never_replayed(remote_peer):
 
 @pytest.mark.parametrize("mcp_http_server", [
     {"tls": True, "input_required": kind}
-    for kind in ("sampling", "roots", "elicitation", "state")
+    for kind in ("sampling", "roots", "elicitation")
 ], indirect=True)
 async def test_unsupported_input_never_continues_or_loses_the_unknown_outcome(remote_peer):
     feature = MCPAgent(RegistryHost())
@@ -662,8 +664,8 @@ async def test_restore_reads_existing_enablement_without_rewriting_it(
     feature = MCPAgent(host)
     feature.manager = SimpleNamespace(owner_did=host.agent_id, owned_containers={}, aclose=AsyncMock())
     monkeypatch.setattr("kestrel_feature_mcp.feature.check_docker_mcp_available", lambda: True)
-    feature.gateway_start = AsyncMock()
-    feature._load_via_container = AsyncMock()
+    feature.gateway_start = AsyncMock(return_value=ToolResult.ok("Gateway started"))
+    feature._load_via_container = AsyncMock(return_value=ToolResult.ok("Container loaded"))
     try:
         await feature.initialize()
         await feature.on_agent_ready()
@@ -878,6 +880,40 @@ async def test_unsupported_remote_host_is_refused_before_dns_or_persistence(remo
         assert not remote_peer.resolutions and not remote_peer.dials
         assert host.saved == saved
         assert not host.registered and not feature._remote_connections
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
+@pytest.mark.parametrize("producer", ["load", "restore"])
+@pytest.mark.parametrize("claim", ["missing", None, False, 1, "yes"])
+async def test_missing_unknown_outcome_contract_is_refused_before_dns_or_saving(
+    remote_peer, producer, claim, monkeypatch, caplog,
+):
+    from kestrel_feature_mcp.remote import remote_name_for_url
+
+    host = RegistryHost()
+    if claim == "missing":
+        monkeypatch.delattr(RegistryHost, "supports_unconfirmed_tool_outcomes")
+    else:
+        host.supports_unconfirmed_tool_outcomes = claim
+    if producer == "restore":
+        name = remote_name_for_url(remote_peer.url, host.agent_id)
+        host.saved[name] = {"name": name, "state": "enabled", "metadata": {
+            "mode": "remote", "url": remote_peer.url, "auth": "none"}}
+    saved = dict(host.saved)
+    feature = MCPAgent(host)
+    try:
+        if producer == "load":
+            result = await feature.load_tool(remote_peer.url)
+            assert result.status is ToolResultStatus.ERROR
+            assert "unconfirmed tool outcomes" in result.error
+        else:
+            await feature.on_agent_ready()
+            assert "unconfirmed tool outcomes" in caplog.text
+    finally:
+        await feature.shutdown()
+        assert not remote_peer.peer.requests and not remote_peer.peer.witness
+        assert not remote_peer.resolutions and not remote_peer.dials
+        assert host.saved == saved and not host.registered and not feature._remote_connections
 
 
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True, "apps_tools": True}], indirect=True)

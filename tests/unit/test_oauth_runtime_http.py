@@ -598,3 +598,246 @@ async def test_status_requires_the_current_original_grant_snapshot(oauth_runtime
     status = b.runtime._status(metadata, credential.budgets)
     assert status['state'] == 'authorized' and not status['connected']
     assert b.peer.resource.witness == []
+
+
+@pytest.mark.parametrize('loss', ['lease', 'expiry'])
+async def test_real_core_authority_loss_after_a_continuation_never_refreshes_or_sends_again(oauth_runtime, monkeypatch, loss):
+    from mcp import types
+    import json
+
+    b = oauth_runtime
+    name = await authorize(b)
+    await connect(b, name)
+    credential = b.runtime._credentials[name]
+    import kestrel_feature_mcp.oauth_credentials as native_credentials
+    original_clock = native_credentials.time
+    rounds = []
+
+    async def defer(ctx, call_next):
+        if ctx.method != 'tools/call':
+            return await call_next(ctx)
+        rounds.append(ctx.params.get('requestState'))
+        b.peer.resource.witness.append('effect-before-continuation')
+        if len(rounds) == 2:
+            if loss == 'lease':
+                credential.lease.revoke()
+            else:
+                import kestrel_feature_mcp.oauth_credentials as native_credentials
+                from types import SimpleNamespace
+                monkeypatch.setattr(native_credentials, 'time', SimpleNamespace(time=lambda: float('inf')))
+        return types.InputRequiredResult(request_state='opaque-pending-operation')
+
+    b.peer.resource.mcp.middleware.append(defer)
+    result = await b.client.post('/api/owned-credential-call')
+    assert result.status_code == 200, result.text
+    assert len(rounds) == 2
+    assert b.peer.resource.witness == ['effect-before-continuation'] * 2
+    assert result.json()['data']['execution_outcome'] == 'unknown'
+    calls = [json.loads(body) for _, body in b.peer.resource.requests if body
+        and json.loads(body).get('method') == 'tools/call']
+    assert len(calls) == 2 and len({c['id'] for c in calls}) == 2
+    assert b.peer.requests.count(('POST', '/token')) == 1
+    assert len(await b.host.database.fetch_all('SELECT * FROM a2a_tool_dispatches')) == 1
+    snapshot = await credential.store.read_slot(credential.principal_id, name)
+    assert snapshot.state == 'active'
+    if loss == 'expiry':
+        monkeypatch.setattr(native_credentials, 'time', original_clock)
+        await connect(b, name, refresh=True)
+        assert b.peer.requests.count(('POST', '/token')) == 2
+
+
+@pytest.mark.parametrize('claim', ['missing', False, 1, 'yes'])
+async def test_unsupported_native_host_cannot_enable_oauth_or_start_consent(
+    credential_boundary, monkeypatch, claim,
+):
+    from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
+    from kestrel_feature_mcp.feature import MCPHostCapabilityError
+
+    b = credential_boundary
+    if claim == 'missing':
+        monkeypatch.delattr(OrchestratorEngineMixin, 'supports_unconfirmed_tool_outcomes', raising=False)
+    else:
+        b.agent.supports_unconfirmed_tool_outcomes = claim
+    before = await b.feature.get_config()
+    with pytest.raises(MCPHostCapabilityError, match='unconfirmed tool outcomes'):
+        await b.feature.set_config({'oauth': {'enabled': True, 'close_seconds': 2.0}})
+    assert await b.feature.get_config() == before
+    assert b.feature._oauth_host is b.feature._oauth_runtime is None
+    assert not b.peer.requests and not b.peer.resource.requests and not b.peer.resource.witness
+    assert not b.feature._remote_connections
+
+
+async def test_native_host_reinitialization_requires_the_outcome_contract(oauth_runtime):
+    from kestrel_feature_mcp.feature import MCPHostCapabilityError
+
+    b = oauth_runtime
+    original = b.feature._oauth_host, b.feature._oauth_runtime, b.feature._oauth_maintenance
+    config = await b.feature.get_config()
+    b.agent.supports_unconfirmed_tool_outcomes = False
+    with pytest.raises(MCPHostCapabilityError, match='unconfirmed tool outcomes'):
+        await b.feature.initialize()
+    assert (b.feature._oauth_host, b.feature._oauth_runtime, b.feature._oauth_maintenance) == original
+    assert await b.feature.get_config() == config
+    assert not b.peer.requests and not b.peer.resource.requests and not b.peer.resource.witness
+
+
+async def permission_mount(b, producer, monkeypatch):
+    """Keep Core/SDK/TLS real; substitute only the Docker process/catalog."""
+    if producer == 'remote':
+        name = await authorize(b)
+        await connect(b, name)
+        return remote_owner(name)
+
+    from types import SimpleNamespace
+    from kestrel_feature_mcp.manager import MCPGatewayManager
+    from kestrel_sdk.security.outbound import assert_safe_url
+
+    endpoint = await assert_safe_url(b.peer.selection.server_url, allowed_schemes=('https',))
+    managers = []
+
+    async def start(servers):
+        assert servers == ['owned-peer']
+        return 'native-fixture-access'
+
+    async def stop():
+        return None
+
+    async def known_catalog(servers):
+        assert servers == ['owned-peer']
+        return None
+
+    def manager_factory(**kwargs):
+        manager = MCPGatewayManager(**kwargs)
+        manager.gateway = SimpleNamespace(endpoint_url=endpoint,
+            is_running=True, start=start, stop=stop)
+        managers.append(manager)
+        return manager
+
+    monkeypatch.setattr('kestrel_feature_mcp.feature.check_docker_mcp_available', lambda: True)
+    monkeypatch.setattr('kestrel_feature_mcp.manager.MCPGatewayManager', manager_factory)
+    b.feature._reject_unknown_servers = known_catalog
+    result = await b.feature.gateway_start('owned-peer')
+    assert result.status.value == 'ok', result.error
+    assert len(managers) == 1 and managers[0].connection.is_connected
+    b.handle = next(name for name, owner in b.agent._tool_to_feature.items()
+        if owner == 'mcp:gateway' and name.endswith('__echo'))
+    return 'mcp:gateway'
+
+
+@pytest.mark.parametrize('producer', ['remote', 'gateway'])
+@pytest.mark.parametrize('lane', ['chat', 'inline'])
+async def test_native_model_permission_deny_has_no_wire_effect_or_credential_refresh(oauth_runtime, lane, producer, monkeypatch):
+    import json
+
+    b = oauth_runtime
+    owner = await permission_mount(b, producer, monkeypatch)
+    await b.permissions.set_permission(owner, b.handle, PermissionLevel.DENY)
+    tokens_before = b.peer.requests.count(('POST', '/token'))
+    result = await b.client.post('/api/owned-credential-call', params={'mode': lane})
+    assert result.status_code == 200, result.text
+    assert result.json()['success'] is False
+    assert not b.peer.resource.witness
+    assert not [json.loads(body) for _, body in b.peer.resource.requests if body
+        and json.loads(body).get('method') == 'tools/call']
+    assert b.peer.requests.count(('POST', '/token')) == tokens_before
+    decisions = [row['decision'] for row in await b.permissions.get_audit_log()
+        if row['feature'] == owner and row['tool'] == b.handle]
+    assert decisions == ['auto_denied']
+    rows = await b.host.database.fetch_all('SELECT result_status FROM a2a_tool_dispatches')
+    assert len(rows) == 1 and rows[0][0] == 'policy_denied'
+
+
+@pytest.mark.parametrize('producer', ['remote', 'gateway'])
+@pytest.mark.parametrize('lane', ['chat', 'inline'])
+async def test_native_model_one_shot_approval_race_cannot_authorize_the_next_call(oauth_runtime, lane, producer, monkeypatch):
+    import json
+
+    b = oauth_runtime
+    owner = await permission_mount(b, producer, monkeypatch)
+    await b.permissions.set_permission(owner, b.handle, PermissionLevel.ASK)
+    calls = []
+    try:
+        first = asyncio.create_task(b.client.post('/api/owned-credential-call', params={'mode': lane}))
+        calls.append(first)
+        request = await asyncio.wait_for(b.approval_requests.get(), 5)
+        assert (request.feature_name, request.tool_name) == (owner, b.handle)
+        assert request.tool_args == {'text': 'owned-effect'}
+        assert not first.done() and not b.peer.resource.witness
+        assert not [json.loads(body) for _, body in b.peer.resource.requests if body
+            and json.loads(body).get('method') == 'tools/call']
+        accepted = await asyncio.gather(
+            b.approvals.submit_decision(request.id, True, scope='once'),
+            b.approvals.submit_decision(request.id, True, scope='once'),
+        )
+        assert sorted(decision.in_memory for decision in accepted) == [False, True]
+        assert all(decision.persisted and not decision.awaiter_gone
+            for decision in accepted if decision.in_memory)
+        result = await asyncio.wait_for(first, 5)
+        assert result.status_code == 200, result.text
+        assert b.peer.resource.witness == ['owned-effect']
+        assert not await b.approvals.submit_decision(request.id, True, scope='once')
+        second = asyncio.create_task(b.client.post('/api/owned-credential-call', params={'mode': lane}))
+        calls.append(second)
+        following = await asyncio.wait_for(b.approval_requests.get(), 5)
+        assert following.id != request.id and not second.done()
+        assert b.peer.resource.witness == ['owned-effect']
+        assert await b.approvals.submit_decision(following.id, False)
+        refused = await asyncio.wait_for(second, 5)
+        assert refused.status_code == 200 and refused.json()['success'] is False
+        assert b.peer.resource.witness == ['owned-effect']
+        wire = [json.loads(body) for _, body in b.peer.resource.requests if body
+            and json.loads(body).get('method') == 'tools/call']
+        assert len(wire) == 1
+        decisions = [row['decision'] for row in await b.permissions.get_audit_log()
+            if row['feature'] == owner and row['tool'] == b.handle]
+        assert decisions.count('user_approved') == decisions.count('user_denied') == 1
+        rows = await b.host.database.fetch_all('SELECT result_status FROM a2a_tool_dispatches ORDER BY id')
+        assert [row[0] for row in rows] == ['success', 'policy_denied']
+    finally:
+        b.approvals.cancel_all()
+        for call in calls:
+            if not call.done():
+                call.cancel()
+        await asyncio.gather(*calls, return_exceptions=True)
+
+
+@pytest.mark.parametrize('lane', ['chat', 'inline'])
+async def test_model_dispatch_keeps_unknown_outcome_after_unexpected_native_continuation_failure(
+    oauth_runtime, monkeypatch, lane,
+):
+    from mcp import types
+    from mcp.client.session import ClientSession
+    import json
+
+    b = oauth_runtime
+    name = await authorize(b)
+    await connect(b, name)
+    rounds = []
+    async def defer(ctx, call_next):
+        if ctx.method != 'tools/call':
+            return await call_next(ctx)
+        rounds.append(ctx.params.get('requestState'))
+        b.peer.resource.witness.append('effect-before-sdk-fault')
+        return types.InputRequiredResult(request_state='opaque-real-continuation')
+    b.peer.resource.mcp.middleware.append(defer)
+    native_call = ClientSession.call_tool
+    async def fault_after_received_native_result(session, *args, **kwargs):
+        result = await native_call(session, *args, **kwargs)
+        if isinstance(result, types.InputRequiredResult) and len(rounds) == 2:
+            # Controlled SDK fault AFTER a real second HTTP response. No wire
+            # replies, authority checks or protocol validators are fabricated.
+            raise KeyError('private-sdk-bug-detail')
+        return result
+    monkeypatch.setattr(ClientSession, 'call_tool', fault_after_received_native_result)
+    result = await b.client.post('/api/owned-credential-call', params={'mode': lane})
+    assert result.status_code == 200, result.text
+    assert result.json()['success'] is False
+    assert 'unconfirmed' in result.json()['error']
+    assert 'reconcile before retrying' in result.json()['error']
+    assert 'private-sdk-bug-detail' not in result.text
+    assert len(rounds) == 2 and b.peer.resource.witness == ['effect-before-sdk-fault'] * 2
+    calls = [json.loads(body) for _, body in b.peer.resource.requests if body
+        and json.loads(body).get('method') == 'tools/call']
+    assert len(calls) == 2 and len({c['id'] for c in calls}) == 2
+    rows = await b.host.database.fetch_all('SELECT result_status, error_class FROM a2a_tool_dispatches')
+    assert len(rows) == 1 and tuple(rows[0]) == ('error', 'ResourceOutcomeUnknown')
