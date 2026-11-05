@@ -93,7 +93,7 @@ Remote write scopes remain gated on
 
 ## Optional OAuth connectors (0.13)
 
-OAuth is disabled by default and requires Core 0.62.0 or newer. Configure the
+OAuth is disabled by default and requires Core 0.62.2 or newer. Configure the
 Console's public HTTPS origin in Core with
 `KESTREL_MCP_OAUTH_CONSOLE_ORIGIN=https://console.example.com`. That origin must
 serve the native callback page and `/js` assets. Core owns the client metadata,
@@ -287,8 +287,11 @@ The connection does not replay that call. A retry needs policy approval and an
 explicit idempotency or safe-repeat guarantee; an error is not evidence that
 nothing executed. Standard pre-execution JSON-RPC rejections retain their
 original error. Caller cancellation remains cancellation.
-State-only multi round-trip requests use the SDK's public one-round session
-APIs. Each round keeps the original tool/arguments or resource URI, echoes only
+State-only multi round-trip requests require Core 0.62.2 or newer so faults
+after execution begins remain unconfirmed across model, named and direct tool
+dispatch. Hosts must declare `supports_unconfirmed_tool_outcomes` exactly true;
+unsupported hosts are refused before connection acquisition or Apps/OAuth
+enablement. They use the SDK's public one-round session APIs. Each round keeps the original tool/arguments or resource URI, echoes only
 the latest opaque state, and checks the original connection, caller and any
 live App View. OAuth rounds check the original principal and lease; the native
 HTTP credential boundary refuses expired credentials without starting a refresh.
@@ -437,9 +440,9 @@ An unfinished close retains its original owner and is retried before re-enable.
 Version 0.8.0 introduced the native components described below; 0.9.0 added
 completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
-Base MCP connections and governed tools require Core 0.55.2 or newer. Initial
-publication and result associations require Core 0.59.0 or newer, as detailed
-below. The test profile requires Core 0.62.0 for the native Apps and OAuth host contracts.
+Version 0.13.0 requires Core 0.62.2 or newer for the native Apps, OAuth and
+unconfirmed tool outcome contracts. The test profile uses the same minimum.
+Initial publication and result associations are detailed below.
 An unsupported host is refused before connecting or saving enablement.
 When a server rejects a call with `HeaderMismatch`, Kestrel retires the original
 catalog. Reload the connection to discover and admit the new contract before
