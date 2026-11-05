@@ -97,7 +97,7 @@ def main():
     generated = set(json.loads((ASSETS / "manifest.json").read_text())["assets"])
     generated.add("manifest.json")
     assert generated == {"sandbox-entry.js", "sandbox-service.mjs", "parent-entry.js",
-                         "THIRD_PARTY_NOTICES.txt", "manifest.json"}
+                         "oauth-panel.js", "oauth-panel.css", "THIRD_PARTY_NOTICES.txt", "manifest.json"}
     with tempfile.TemporaryDirectory(prefix="mcp-sandbox-container-") as temporary, ExitStack() as cleanup:
         folder = Path(temporary)
         context = folder / "context"
@@ -173,7 +173,8 @@ def main():
             assert state["Running"], docker("logs", running)
 
         wait_until_ready(opener, origin, require_container)
-        for path in ("/proxy", "/sandbox-entry.js", "/config", "/health", "/THIRD_PARTY_NOTICES.txt"):
+        public_routes = ("/proxy", "/sandbox-entry.js", "/config", "/health", "/THIRD_PARTY_NOTICES.txt")
+        for path in public_routes:
             with opener.open(origin + path, timeout=3) as response:
                 assert response.status == 200
                 assert response.headers.get("Set-Cookie") is None
@@ -188,6 +189,16 @@ def main():
                     assert b"synthetic-secret" not in error.read()
                 else:
                     raise AssertionError("Sandbox accepted host credentials")
+        # The shared manifest verifies Core's host UI files too. They are not
+        # public sandbox routes; Core serves them through its feature UI mount.
+        for host_asset in ("/oauth-panel.js", "/oauth-panel.css"):
+            try:
+                opener.open(origin + host_asset, timeout=3)
+            except urllib.error.HTTPError as error:
+                assert error.code == 404
+                error.close()
+            else:
+                raise AssertionError("Sandbox exposed a host-only UI route")
         with opener.open(origin + "/config", timeout=3) as response:
             assert json.load(response) == configuration["sandbox"]
 
@@ -208,10 +219,10 @@ def main():
         assert b"Sandbox packaged asset failed integrity verification: sandbox-entry.js" in failure.stderr + failure.stdout
         print(json.dumps({"image": image_info["Id"], "user": "node", "context_files": len(inventory),
                           "verified_assets": {n: hashlib.sha256(b).hexdigest() for n, b in files.items()},
-                          "public_routes": 5, "credential_refusals": 15, "tamper_refused": True,
+                          "public_routes": len(public_routes), "credential_refusals": 3 * len(public_routes), "tamper_refused": True,
                           "unstartable_container_owned": True, "project_license_preserved": True,
                           "startup_reset_retried": True, "http_failure_not_retried": True,
-                          "assets_root_owned": True}))
+                          "assets_root_owned": True, "host_ui_routes_unavailable": True}))
 
 
 if __name__ == "__main__":

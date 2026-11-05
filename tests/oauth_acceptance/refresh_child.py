@@ -11,10 +11,10 @@ from urllib.parse import urlsplit
 
 import httpcore2
 import httpx2
-from authlib.integrations.httpx_client import AsyncOAuth2Client
 from kestrel_sdk.security.outbound import assert_safe_url, pinned_httpx2_async_transport
 from kestrel_feature_mcp.connection import MCPConnection
-from kestrel_feature_mcp.oauth_grants import OAuthGrantBinding, OAuthGrantStore, OAuthGrantTokens
+from kestrel_feature_mcp.oauth_grants import OAuthGrantBinding, OAuthGrantStore
+from kestrel_feature_mcp.oauth_refresh import OAuthRefresher
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 
@@ -39,7 +39,8 @@ async def with_store(config, store, binding):
     httpcore2.AnyIOBackend.connect_tcp = dial
     os.environ['SSL_CERT_FILE'] = config['certificate']
     os.environ.pop('SSL_CERT_DIR', None)
-    snapshot = await store.read(binding)
+    metadata = await store.read(binding)
+    snapshot = await store.read_tokens(metadata)
     assert snapshot is not None and snapshot.state == 'active'
     token = snapshot.tokens
     saved = dict(access_token=token.access_token, refresh_token=token.refresh_token,
@@ -50,42 +51,22 @@ async def with_store(config, store, binding):
     if config['phase'] == 'fresh':
         assert saved['refresh_token'] == config['expected_refresh_token']
     expiry = saved['expires_at']
-    # Discovery uses separate pinned origins with no credentials. The returned
-    # issuer and token endpoint must match the independently configured grant.
-    documents = []
-    for url in (config['protected_metadata'], config['authorization_metadata']):
-        endpoint = await assert_safe_url(url, allowed_schemes=('https',))
-        async with httpx2.AsyncClient(transport=pinned_httpx2_async_transport(endpoint),
-            trust_env=False, follow_redirects=False, timeout=5) as client:
-            response = await client.get(url)
-            assert response.status_code == 200
-            documents.append(response.json())
-    protected, authorization = documents
-    assert protected['resource'] == resource and protected['authorization_servers'] == [issuer]
-    assert authorization['issuer'] == issuer
-    endpoint_url = authorization['token_endpoint']
-    assert endpoint_url == issuer + '/token'
-    endpoint = await assert_safe_url(endpoint_url, allowed_schemes=('https',))
-    async with AsyncOAuth2Client(client_id=config['client_id'],
-        token_endpoint_auth_method='none', token=saved, scope='read',
-        transport=pinned_httpx2_async_transport(endpoint), trust_env=False,
-        follow_redirects=False, timeout=5) as client:
-        expired = client.token.is_expired(leeway=0)
-        preserved_expiry = client.token['expires_at'] == expiry
-        assert preserved_expiry
-        assert expired is (config['phase'] == 'expired')
-        if expired:
-            claim = await store.begin_refresh(snapshot)
-            refreshed = await client.refresh_token(endpoint_url,
-                refresh_token=saved['refresh_token'], scope='read', resource=resource)
-            assert refreshed['access_token'] == 'native-fixture-access'
-            assert frozenset(refreshed['scope'].split()) == frozenset({'read'})
-            assert refreshed['expires_at'] > time.time()
-            assert refreshed['refresh_token'] == config['expected_refresh_token']
-            saved = dict(refreshed)
-            snapshot = await store.finish_refresh(claim, OAuthGrantTokens(
-                saved['access_token'], saved['refresh_token'], saved['expires_at'],
-                frozenset(saved['scope'].split())))
+    expired = token.is_expired(time.time())
+    preserved_expiry = token.expires_at == expiry
+    assert preserved_expiry
+    assert expired is (config['phase'] == 'expired')
+    if expired:
+        owner = OAuthRefresher(store, {'network_seconds': 5, 'response_max_bytes': 65536}, close_seconds=5)
+        try:
+            refreshed = await owner.run(metadata, lambda: None)
+            current = await store.read_tokens(refreshed)
+            assert current.tokens.access_token == 'native-fixture-access'
+            assert current.tokens.scopes == frozenset({'read'})
+            assert current.tokens.expires_at > time.time()
+            assert current.tokens.refresh_token == config['expected_refresh_token']
+            saved = dict(access_token=current.tokens.access_token)
+        finally:
+            await owner.retire()
     resource_endpoint = await assert_safe_url(server_url, allowed_schemes=('https',))
     connection = MCPConnection(resource_endpoint,
         headers={'Authorization': 'Bearer ' + saved['access_token']},
@@ -106,7 +87,7 @@ async def main(config):
     assert path.is_relative_to(Path(config['owned_root']))
     binding = OAuthGrantBinding('did:test:refresh-owner', 'fixture-operator', 'fixture-connection',
         config['server_url'], config['resource'], config['issuer'], config['client_id'],
-        config['redirect_uri'], frozenset({'read'}))
+        config['redirect_uri'], frozenset({'read'}), config['protected_metadata'], config['authorization_metadata'])
     database = SQLiteBackend(str(path))
     await database.connect()
     try:

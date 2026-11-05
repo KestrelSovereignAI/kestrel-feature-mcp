@@ -25,7 +25,7 @@ from .constants import SESSION_CONNECT_TIMEOUT_DEFAULT
 from .remote import RemoteMCPServer, RemoteMCPError, connection_error_message, remote_name_for_url, remote_owner
 from .dynamic_tools import build_wrappers
 from .apps_execution import RegisteredAppTool
-from .apps_host import MCPAppsFeatureMixin
+from .host_configuration import MCPHostFeatureMixin
 from ._lifecycle import MCPFeatureClosingError, run_cleanup_steps
 from .images import normalize_image_ref
 from .registry import (
@@ -141,7 +141,7 @@ def _official_record_blocks(records: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-class MCPAgent(MCPAppsFeatureMixin, Feature):
+class MCPAgent(MCPHostFeatureMixin, Feature):
     """
     A Feature Agent that manages Model Context Protocol (MCP) tools.
     It encapsulates the complexity of Docker container management and tool discovery,
@@ -161,7 +161,7 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         self._lifecycle_generation = 0
         self._owner_did: str | None = None
         self._closing = False
-        self._init_apps()
+        self._init_hosts()
 
     @property
     def tool_description(self) -> str:
@@ -174,8 +174,8 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
     async def initialize(self):
         owner_did = require_owner_did(self.agent.agent_id)
         async with self._lifecycle_transition:
-            if (not self._closing and self._apps_maintenance is not None
-                    and self._apps_maintenance.done()):
+            if (not self._closing and any(task is not None and task.done()
+                    for task in (self._apps_maintenance, self._oauth_maintenance))):
                 self._closing = True
                 self._lifecycle_generation += 1
             if self._closing:
@@ -186,8 +186,7 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
                     self.manager = None
             self._owner_did = owner_did
             self._closing = False
-            if self._apps_settings.enabled and self._apps_host is None:
-                await self._start_apps()
+            await self._start_configured_hosts()
         logger.info("MCPAgent initialized; Docker connects only for container operations.")
 
     def _require_open(self, generation: int | None = None) -> None:
@@ -500,8 +499,12 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         record = self._remote_connections.get(name)
         if record is not None:
             record.tools = None
-            await record.connection.close()
-            del self._remote_connections[name]
+            steps = [(True, record.connection.close)]
+            if record.credential is not None:
+                steps.insert(0, (True, record.credential.retire))
+            await run_cleanup_steps(steps)
+            if self._remote_connections.get(name) is record:
+                del self._remote_connections[name]
 
     async def _read_server_delta(self, name: str) -> dict | None:
         reader = getattr(self.agent, "get_enablement_deltas", None)
@@ -515,7 +518,7 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         if saved is None or saved["state"] != state or saved.get("metadata") != metadata:
             raise RemoteMCPError("Host did not retain MCP enablement; initialize its durable store")
 
-    async def _load_remote_connection(self, url: str, expected_name: str | None) -> ToolResult:
+    async def _load_remote_connection(self, url: str, expected_name: str | None, *, credential=None) -> ToolResult:
         generation = self._lifecycle_generation
         self._require_open(generation)
         invalid = _selector_failure(url)
@@ -525,26 +528,36 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         if urlsplit(url).fragment:
             raise RemoteMCPError("Remote MCP endpoints must not contain URL fragments")
         owner_did = self._connection_owner_did()
-        if expected_name is not None and remote_name_for_url(url, owner_did) != expected_name:
+        principal_id = None if credential is None else credential.principal_id
+        if expected_name is not None and remote_name_for_url(url, owner_did, principal_id=principal_id) != expected_name:
             raise RemoteMCPError("Stored MCP connection identifier does not match this agent's ownership")
         async with asyncio.timeout(SESSION_CONNECT_TIMEOUT_DEFAULT):
             endpoint = await assert_safe_url(url, allowed_schemes=("https",))
-        name = remote_name_for_url(endpoint.url, owner_did)
+        name = remote_name_for_url(endpoint.url, owner_did, principal_id=principal_id)
+        if credential is not None and name != credential.snapshot.binding.connection_id:
+            raise RemoteMCPError("OAuth endpoint changed its original canonical connection binding")
         if expected_name is not None and name != expected_name:
             raise RemoteMCPError("Stored MCP endpoint is not canonical; reconnect it explicitly")
+        # DNS validation can outlive shutdown admission. Refuse before queuing
+        # behind the lifecycle lock held by that shutdown.
+        self._require_open(generation)
         async with self._lifecycle_transition, connection_lifecycle(self._remote_lifecycle, name):
             self._require_open(generation)
             owner = remote_owner(name)
             self._unmount_tools(owner)
             await self._retire_remote(name)
-            record = RemoteMCPServer(name, endpoint, self._new_mcp_connection(endpoint))
+            record = RemoteMCPServer(name, endpoint, self._new_mcp_connection(endpoint,
+                **({} if credential is None else {'auth': credential.bearer_auth()})), credential=credential)
             self._remote_connections[name] = record
             published = False
             persistent = False
             try:
                 discovered = await record.connection.connect()
                 self._require_open()
-                metadata = {"mode": "remote", "url": endpoint.url, "auth": "none"}
+                authentication = "none" if credential is None else "oauth"
+                metadata = {"mode": "remote", "url": endpoint.url, "auth": authentication}
+                if credential is not None:
+                    metadata['grant'] = credential.slot_id
                 # Restore reads existing desired state; it must not require a
                 # redundant write or change the saved row's audit metadata.
                 if expected_name is not None:
@@ -552,18 +565,23 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
                     persistent = True
                 else:
                     persistent = await self._persist_server(name, "enabled", metadata=metadata)
+                if credential is not None:
+                    if not persistent:
+                        raise RemoteMCPError("OAuth connections require acknowledged durable enablement")
+                    await self._require_saved_configuration(name, "enabled", metadata)
                 self._require_open()
                 record.tools = discovered
                 caller = bind_tool_caller(
                     record.connection,
                     lambda: (self._remote_connections.get(name) is record and record.tools is not None),
                     name,
+                    admit=None if credential is None else credential.admit,
                 )
                 mounted = self._mount_tools(
                     owner, f"remote_{name[-12:]}", record.tool_descriptions(), caller,
                 )
                 tools = [tool.name for tool in record.tools]
-                data = {"connection": name, "url": endpoint.url, "via": "remote", "auth": "none",
+                data = {"connection": name, "url": endpoint.url, "via": "remote", "auth": authentication,
                         "tools": tools, "mounted": mounted, "persistent": persistent,
                         "protocol_version": record.connection.protocol_version}
                 published = True
@@ -599,6 +617,10 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
     async def _unload_remote(self, name: str) -> ToolResult:
         async with connection_lifecycle(self._remote_lifecycle, name):
             record = self._remote_connections.get(name)
+            saved = await self._read_server_delta(name) if self._supports_enablement_persistence() else None
+            if (record is not None and record.credential is not None
+                    or saved is not None and (saved.get('metadata') or {}).get('auth') == 'oauth'):
+                return ToolResult.failed("Use the authenticated MCP connection panel to disconnect this OAuth grant")
             retained = False
             try:
                 if record is not None:
@@ -1412,6 +1434,16 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         containers = [d for d in enabled if _mode(d) == "container"]
         for saved in (d for d in enabled if _mode(d) == "remote"):
             metadata = saved["metadata"]
+            if metadata.get('auth') == 'oauth':
+                if (set(metadata) != {'mode', 'url', 'auth', 'grant'}
+                        or not isinstance(metadata.get('url'), str)
+                        or not isinstance(metadata.get('grant'), str)
+                        or len(metadata['grant']) != 64
+                        or any(char not in '0123456789abcdef' for char in metadata['grant'])):
+                    logger.error("Refusing unsupported saved OAuth MCP metadata: malformed grant reference")
+                # A saved grant is dormant metadata. Only its freshly
+                # authenticated principal may connect, decrypt or refresh it.
+                continue
             if (metadata.get("auth") != "none"
                     or set(metadata) - {"mode", "url", "auth"}):
                 logger.error("Refusing unsupported authentication/configuration for remote MCP %s", saved["name"])
@@ -1463,6 +1495,8 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         self._lifecycle_generation += 1
         if self._apps_host is not None:
             self._apps_host.withdraw_private_data()
+        if self._oauth_host is not None:
+            self._oauth_host.withdraw()
         async with self._lifecycle_transition:
             self._closing = True
             await self._shutdown_connections()
@@ -1472,7 +1506,7 @@ class MCPAgent(MCPAppsFeatureMixin, Feature):
         # initialization gate also joins direct manager acquisition, so no
         # client can appear after the cleanup snapshot and escape custody.
         async with self._docker_operations, self._docker_initialization:
-            await run_cleanup_steps([(True, self._close_apps), (True, self._release_connections)])
+            await run_cleanup_steps([(True, self._close_oauth), (True, self._close_apps), (True, self._release_connections)])
 
     async def _release_connections(self):
         manager = self.manager

@@ -6,8 +6,10 @@ vendor credentials are involved; actual vendor acceptance remains a manual gate.
 
 import base64
 import asyncio
+from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
+import gzip
 import json
 from pathlib import Path
 import secrets
@@ -19,7 +21,7 @@ import httpcore2
 import httpx2
 import pytest
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, RedirectResponse, StreamingResponse
+from starlette.responses import JSONResponse, RedirectResponse, StreamingResponse, Response
 from starlette.routing import Route
 from mcp.client.auth import OAuthTokenError
 from mcp.shared.exceptions import MCPError
@@ -40,6 +42,7 @@ class OAuthPeers:
     requests: list
     browser_requests: list
     release_body: asyncio.Event
+    wire: object | None = None
 
     async def browser(self, url):
         self.browser_requests.append(url)
@@ -61,7 +64,7 @@ class OAuthPeers:
 
 @pytest.fixture
 async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
-    options = getattr(request, "param", {})
+    options = deepcopy(getattr(request, "param", {}))
     resource_peer = mcp_http_server
     resource_port = urlsplit(resource_peer.url).port
     resource_url = f"https://remote.example:{resource_port}/mcp"
@@ -81,18 +84,22 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
     async def identity(_request):
         state.requests.append(("GET", "/client.json"))
         if options.get("oversized") == "identity":
-            return StreamingResponse(held_body(b"X" * 65537), media_type="application/json")
-        return JSONResponse({
+            return StreamingResponse(held_body(b"X" * 65537), media_type=options.get('oversize_media_type', 'application/json'))
+        document = {
             "client_id": state.client_id, "client_name": "Kestrel OAuth wire fixture",
-            "application_type": "native", "redirect_uris": [callback],
+            "application_type": "web" if options.get("web_identity") else "native", "redirect_uris": [state.redirect_uri],
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"], "token_endpoint_auth_method": "none",
-        })
+        }
+        if options.get('compressed') == 'identity':
+            return Response(gzip.compress(json.dumps(document).encode()),
+                media_type='application/json', headers={'Content-Encoding': 'gzip'})
+        return JSONResponse(document)
 
     async def metadata(_request):
         state.requests.append(("GET", "/.well-known/oauth-authorization-server"))
         if options.get("oversized") == "authorization":
-            return StreamingResponse(held_body(b"X" * 65537), media_type="application/json")
+            return StreamingResponse(held_body(b"X" * 65537), media_type=options.get('oversize_media_type', 'application/json'))
         document = {
             "issuer": (state.issuer.replace("issuer.example", "ISSUER.example")
                        if options.get("wrong_issuer_spelling") else state.issuer),
@@ -109,13 +116,16 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         if options.get("stall_metadata"):
             return StreamingResponse(held_body(json.dumps(document).encode()),
                                      media_type="application/json")
+        if options.get('compressed') == 'authorization':
+            return Response(gzip.compress(json.dumps(document).encode()),
+                media_type='application/json', headers={'Content-Encoding': 'gzip'})
         return JSONResponse(document)
 
     async def authorize(request):
         state.requests.append(("GET", "/authorize"))
         fields = parse_qs(request.url.query, strict_parsing=True)
         assert fields["client_id"] == [state.client_id]
-        assert fields["redirect_uri"] == [callback]
+        assert fields["redirect_uri"] == [state.redirect_uri]
         assert fields["resource"] == [resource_id]
         assert fields["code_challenge_method"] == ["S256"]
         assert fields["scope"] == ["read"]
@@ -134,14 +144,29 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         }
         if options.get("extra_callback_fields"):
             parameters.update(session_state="opaque-session", scope="read")
-        return RedirectResponse(callback + "?" + urlencode(parameters), status_code=302)
+        return RedirectResponse(state.redirect_uri + "?" + urlencode(parameters), status_code=302)
+
+    def token_response(result):
+        if options.get('token_error_status'):
+            return JSONResponse({'error': 'invalid_grant',
+                'error_description': 'owned-sensitive-AS-error-marker'}, status_code=options['token_error_status'])
+        if options.get('stall_token'):
+            return StreamingResponse(held_body(json.dumps(result).encode()), media_type='application/json')
+        if options.get('compressed') == 'token':
+            return Response(gzip.compress(json.dumps(result).encode()),
+                media_type='application/json', headers={'Content-Encoding': 'gzip'})
+        return JSONResponse(result)
 
     async def token(request):
+        if options.get("before_token") is not None:
+            await options["before_token"]()
         state.requests.append(("POST", "/token"))
         fields = parse_qs((await request.body()).decode("ascii"), strict_parsing=True)
         result = {"access_token": state.access_token, "token_type": "Bearer",
                   "expires_in": 3600,
                   "scope": "read write" if options.get("overgrant") else "read"}
+        if options.get("omit_token_scope"):
+            result.pop("scope")
         if fields["grant_type"] == ["refresh_token"] and options.get("refresh"):
             assert fields["client_id"] == [state.client_id]
             assert fields["resource"] == [resource_id]
@@ -151,10 +176,10 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             assert "authorization" not in request.headers
             if options.get("refresh_rotate"):
                 result["refresh_token"] = "native-fixture-rotated"
-            return JSONResponse(result)
+            return token_response(result)
         assert fields["grant_type"] == ["authorization_code"]
         assert fields["client_id"] == [state.client_id]
-        assert fields["redirect_uri"] == [callback]
+        assert fields["redirect_uri"] == [state.redirect_uri]
         assert fields["resource"] == [resource_id]
         assert "client_secret" not in fields and "authorization" not in request.headers
         original = state.codes.pop(fields["code"][0])
@@ -163,7 +188,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         ).rstrip(b"=").decode("ascii")
         assert original["code_challenge"] == [challenge]
         result["refresh_token"] = "native-fixture-refresh"
-        return JSONResponse(result)
+        return token_response(result)
 
     app = Starlette(routes=[Route("/client.json", identity),
                            Route("/.well-known/oauth-authorization-server", metadata),
@@ -172,6 +197,9 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         issuer_port = urlsplit(issuer_peer.url).port
         state.issuer = f"https://issuer.example:{issuer_port}"
         state.client_id = state.issuer + "/client.json"
+        if options.get("web_identity"):
+            callback = state.issuer + "/oauth/callback"
+        state.redirect_uri = callback
         resource_peer.settings["oauth"].update(
             resource=resource_id, issuer=state.issuer, access_token=state.access_token,
             metadata=resource_url.replace("/mcp", "/.well-known/oauth-protected-resource/mcp"),
@@ -190,7 +218,8 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             server_url=resource_url, resource=resource_id, issuer=state.issuer,
             protected_metadata=resource_peer.settings["oauth"]["metadata"],
             authorization_metadata=state.issuer + "/.well-known/oauth-authorization-server",
-            client_id=state.client_id, redirect_uri=callback, scopes=frozenset({"read"}),
+            client_id=state.client_id, redirect_uri=callback,
+            scopes=frozenset(options.get("approved_scopes", ["read"])),
         )
         authorities = {("remote.example", resource_port), ("issuer.example", issuer_port)}
         original_dns = socket.getaddrinfo
@@ -205,7 +234,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
 
         async def dial(backend, host, port, **kwargs):
             if host == "8.8.8.8":
-                assert port in {resource_port, issuer_port}
+                assert port in {authority[1] for authority in authorities}
             else:
                 assert host == "127.0.0.1" and port == callback_port
             return await original_dial(backend, "127.0.0.1", port, **kwargs)
@@ -222,7 +251,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         monkeypatch.setenv("NO_PROXY", "")
         try:
             yield OAuthPeers(selection, options, issuer_peer, resource_peer, state.requests, [],
-                             state.release_body)
+                state.release_body, SimpleNamespace(state=state, authorities=authorities, bundle=bundle))
         finally:
             state.release_body.set()
 
@@ -299,7 +328,9 @@ async def test_bootstrap_hands_off_without_waiting_for_event_stream_eof(oauth_pe
 
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
 @pytest.mark.parametrize("oauth_peers", [{"oversized": "identity"},
-                                         {"oversized": "authorization"}], indirect=True)
+                                         {"oversized": "authorization"},
+                                         {'oversized': 'identity', 'oversize_media_type': 'text/event-stream'},
+                                         {'oversized': 'authorization', 'oversize_media_type': 'text/event-stream'}], indirect=True)
 async def test_oversized_stream_is_refused_before_waiting_for_its_end(oauth_peers):
     async def attempt():
         with pytest.raises(GrantRejected, match="response budget"):
@@ -523,3 +554,41 @@ async def test_resource_auth_policy_stops_an_unapproved_native_request(
         # Positive control: removing only this wiring sends the refused verb
         # to the independent server. Its 405 response is not a policy refusal.
         assert len(sent) == 1 and sent[0]["method"] == "tools/list"
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
+@pytest.mark.parametrize("oauth_peers", [
+    {"omit_token_scope": True},
+    {"omit_token_scope": True, "approved_scopes": ["read", "write"]},
+], indirect=True)
+async def test_native_initial_grant_accepts_a_scope_omitted_by_the_authorization_server(oauth_peers):
+    result = await drive(oauth_peers)
+    assert result["grant_obtained"] is True and result["stage"] == "authorized_and_discovered"
+    assert result["granted_scopes"] == ["read"]
+    assert oauth_peers.requests.count(("POST", "/token")) == 1
+    assert oauth_peers.resource.witness == []
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
+@pytest.mark.parametrize("oauth_peers", [{
+    "approved_scopes": ["read", "write"], "overgrant": True,
+}], indirect=True)
+async def test_native_token_cannot_expand_consent_within_the_configured_ceiling(oauth_peers):
+    with pytest.raises(GrantRejected, match="operator-approved grant"):
+        await drive(oauth_peers)
+    assert len(oauth_peers.browser_requests) == 1
+    assert parse_qs(urlsplit(oauth_peers.browser_requests[0]).query)["scope"] == ["read"]
+    assert oauth_peers.requests.count(("POST", "/token")) == 1
+    assert all(b"authorization" not in dict(scope["headers"])
+               for scope, _ in oauth_peers.resource.requests)
+    assert oauth_peers.resource.witness == []
+
+
+@pytest.mark.parametrize('mcp_http_server', [{'tls': True, 'oauth': {}}], indirect=True)
+@pytest.mark.parametrize('oauth_peers', [{'compressed': 'identity'}, {'compressed': 'authorization'}, {'compressed': 'token'}], indirect=True)
+async def test_oauth_uses_canonical_decompression_refusal_on_real_https(oauth_peers):
+    with pytest.raises(GrantRejected, match='content encoding'):
+        await drive(oauth_peers)
+    expected = 1 if oauth_peers.options['compressed'] == 'token' else 0
+    assert oauth_peers.requests.count(('POST', '/token')) == expected
+    assert oauth_peers.resource.witness == []

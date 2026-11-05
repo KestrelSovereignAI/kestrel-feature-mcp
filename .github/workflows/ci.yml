@@ -106,6 +106,8 @@ jobs:
               'kestrel_mcp_apps_sandbox.py',
               'kestrel_feature_mcp/apps_sandbox/sandbox-entry.js',
               'kestrel_feature_mcp/apps_sandbox/sandbox-service.mjs',
+              'kestrel_feature_mcp/apps_sandbox/oauth-panel.js',
+              'kestrel_feature_mcp/apps_sandbox/oauth-panel.css',
               'kestrel_feature_mcp/apps_sandbox/THIRD_PARTY_NOTICES.txt',
               'kestrel_feature_mcp/apps_sandbox/manifest.json',
           ]
@@ -153,14 +155,17 @@ jobs:
       - name: Verify the installed public sandbox and credential boundary
         run: |
           "$RUNNER_TEMP/mcp-apps-install/bin/python" -I tests/packaging/sandbox_installed.py --node "$(command -v node)"
+      - name: Verify the feature imports with only its declared runtime dependencies
+        run: |
+          "$RUNNER_TEMP/mcp-apps-install/bin/python" -I -c "from kestrel_feature_mcp import MCPAgent, get_registry; assert get_registry().list_all()"
       - name: Verify the standalone sandbox image and filtered build context
         run: |
           "$RUNNER_TEMP/mcp-apps-install/bin/python" -I tests/packaging/sandbox_container.py
         timeout-minutes: 5
-      - name: Verify native Apps through the Core chat and governed HTTP host
+      - name: Verify native Apps and OAuth through Core and independent HTTP peers
         run: |
           uv sync --locked --extra test --python 3.14
-          uv run --no-sync python -m pytest tests/browser/test_parent_bridge.py -q --timeout=60
+          uv run --no-sync python -m pytest tests/browser/test_parent_bridge.py tests/browser/test_oauth_panel.py tests/browser/test_oauth_failure_panel.py tests/browser/test_oauth_hosted_panel.py -q --timeout=60
         timeout-minutes: 5
 
   install-check:

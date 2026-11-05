@@ -191,7 +191,8 @@ async def test_real_feature_mount_negotiates_apps_and_connection_retirement_with
     assert discovered, [json.loads(body).get("method") for _, body in mcp_http_server.requests if body]
     capabilities = discovered[0]["params"]["_meta"][CLIENT_CAPABILITIES_META_KEY]
     assert capabilities["extensions"]["io.modelcontextprotocol/ui"] == {}
-    assert b.feature.get_ui_contributions().modules == ["parent-entry.js"]
+    assert b.feature.get_ui_contributions().modules == ["parent-entry.js", "oauth-panel.js"]
+    assert b.feature.get_ui_contributions().css == ["oauth-panel.css"]
     reference, opened = await b.initial_view()
     assert opened["result"]["_meta"]["private-result"] == {"view": "only"}
     await b.connection.close()

@@ -11,13 +11,14 @@ import pytest
 from tests.unit.test_oauth_acceptance_http import oauth_peers  # noqa: F401
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from kestrel_feature_mcp.oauth_grants import OAuthGrantBinding, OAuthGrantStore, OAuthGrantTokens
+from tests.unit.test_oauth_grants import install_grant
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('mcp_http_server', [{'tls': True, 'oauth': {}}], indirect=True)
 @pytest.mark.parametrize('oauth_peers', [
-    {'refresh': True, 'refresh_rotate': True},
-    {'refresh': True, 'refresh_rotate': False},
+    {'refresh': True, 'refresh_rotate': True, 'web_identity': True},
+    {'refresh': True, 'refresh_rotate': False, 'web_identity': True},
 ], indirect=True)
 async def test_public_authlib_refresh_survives_two_fresh_processes(oauth_peers, tmp_path, owned_oauth_key):
     peers = oauth_peers
@@ -28,13 +29,13 @@ async def test_public_authlib_refresh_survives_two_fresh_processes(oauth_peers, 
         'scope': 'read'}
     binding = OAuthGrantBinding('did:test:refresh-owner', 'fixture-operator', 'fixture-connection',
         selection.server_url, selection.resource, selection.issuer, selection.client_id,
-        selection.redirect_uri, selection.scopes)
+        selection.redirect_uri, selection.scopes, selection.protected_metadata, selection.authorization_metadata)
     db = SQLiteBackend(str(path))
     await db.connect()
     try:
         store = OAuthGrantStore(db, binding.agent_did, max_token_bytes=4096)
         await store.initialize()
-        await store.install(binding, OAuthGrantTokens(expired['access_token'], expired['refresh_token'],
+        await install_grant(store, binding, OAuthGrantTokens(expired['access_token'], expired['refresh_token'],
             expired['expires_at'], frozenset({'read'})))
     finally:
         await db.close()

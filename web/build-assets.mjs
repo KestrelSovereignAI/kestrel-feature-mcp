@@ -57,6 +57,7 @@ export async function buildSandboxAssets(outputDirectory) {
         ['src/sandbox-entry.js', 'sandbox-entry.js', 'browser', 'es2022'],
         ['src/sandbox-server-entry.js', 'sandbox-service.mjs', 'node', 'node22'],
         ['src/parent-entry.js', 'parent-entry.js', 'browser', 'es2022'],
+        ['src/oauth-panel.js', 'oauth-panel.js', 'browser', 'es2022'],
     ]) {
         const result = await build({ absWorkingDir: webRoot, entryPoints: [entry],
             outfile: path.join(destination, filename), bundle: true, format: 'esm',
@@ -72,6 +73,7 @@ export async function buildSandboxAssets(outputDirectory) {
             inputs.set(input, digest(await fs.readFile(path.resolve(webRoot, input))));
         }
     }
+    outputs.set('oauth-panel.css', await fs.readFile(path.join(webRoot, 'src/oauth-panel.css')));
     const dependencies = new Map();
     for (const input of [...inputs.keys()].filter(name => name.startsWith('node_modules/')).sort()) {
         const item = await licenseFor(input);
@@ -90,7 +92,7 @@ export async function buildSandboxAssets(outputDirectory) {
     outputs.set('THIRD_PARTY_NOTICES.txt', Buffer.from(ordered.map(item =>
         `${item.name} ${item.version} (${item.license})\n` + item.licenses.map(license =>
             `--- ${license.name} ---\n${license.text.trim()}\n`).join('\n')).join('\n')));
-    const sourceFiles = ['build.mjs', 'build-assets.mjs', 'build-notices.mjs', 'package.json', 'package-lock.json',
+    const sourceFiles = ['src/oauth-panel.css', 'build.mjs', 'build-assets.mjs', 'build-notices.mjs', 'package.json', 'package-lock.json',
         ...embedded.sourceFiles,
         ...(await fs.readdir(path.join(webRoot, 'src'))).filter(name => name.endsWith('.js')).map(name => 'src/' + name)];
     const sourceHashes = {};

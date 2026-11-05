@@ -11,6 +11,7 @@ gateway.
 from __future__ import annotations
 
 import asyncio
+import errno
 import threading
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -118,7 +119,11 @@ async def failing_docker_http(request, monkeypatch):
             elif self.path == "/v1.45/_ping":
                 if request.param == "timeout":
                     release_ping.wait(5)
-                self.connection.shutdown(socket.SHUT_RDWR)
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError as error:
+                    if error.errno != errno.ENOTCONN:
+                        raise
                 self.connection.close()
             else:
                 self.send_error(404)
