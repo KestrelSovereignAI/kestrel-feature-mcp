@@ -21,6 +21,7 @@ import uuid
 from kestrel_sdk.security.aead import AEADCipher
 from kestrel_sdk.security.encryption import get_agent_key
 from kestrel_sdk.storage.database import DatabaseBackend
+from kestrel_sdk.resources import ResourceConflict
 
 from .connection import require_owner_did
 
@@ -29,7 +30,7 @@ class OAuthGrantRejected(ValueError):
     """Non-secret binding or token validation failure."""
 
 
-class OAuthGrantChanged(RuntimeError):
+class OAuthGrantChanged(ResourceConflict):
     """The exact grant revision is no longer current; do not replay HTTP."""
 
 

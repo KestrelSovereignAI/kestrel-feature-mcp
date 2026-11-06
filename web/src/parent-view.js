@@ -87,8 +87,10 @@ export function mountMCPApp({ root, reference, sessionId, request, isCurrentChat
             if (!params || Object.keys(params).some(key => !['name', 'arguments', '_meta'].includes(key))) {
                 throw new TypeError('This App host supports ordinary governed tool calls; Tasks require separate host support');
             }
+            const operationId = eventWindow.crypto.randomUUID();
             const result = await request(viewPath() + '/tools/call' + query, {
-                method: 'POST', body: JSON.stringify({ name: params.name, arguments: params.arguments ?? {} }),
+                method: 'POST', body: JSON.stringify({ name: params.name,
+                    arguments: params.arguments ?? {}, operation_id: operationId }),
                 signal: AbortSignal.any([calls.signal, extra.mcpReq.signal]),
             });
             current();

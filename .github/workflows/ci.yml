@@ -34,10 +34,7 @@ jobs:
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }}
       - name: Install package + test extras
-        run: |
-          uv venv --python ${{ env.PYTHON_VERSION }} .venv
-          . .venv/bin/activate
-          uv pip install -e '.[test]'
+        run: uv sync --locked --extra test --python ${{ env.PYTHON_VERSION }}
       - name: Validate package imports
         run: |
           . .venv/bin/activate
@@ -187,9 +184,8 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
       - name: Clean install + smoke test
         run: |
-          uv venv --python ${{ matrix.python-version }} .venv-test
+          UV_PROJECT_ENVIRONMENT=.venv-test uv sync --locked --extra test --no-editable --python ${{ matrix.python-version }}
           . .venv-test/bin/activate
-          uv pip install '.[test]'
           python -c "
           from kestrel_feature_mcp import MCPAgent, get_registry
           import importlib.metadata as md
@@ -290,8 +286,6 @@ jobs:
         run: uv python install ${{ env.PYTHON_VERSION }}
       - name: Install + run pytest
         run: |
-          uv venv --python ${{ env.PYTHON_VERSION }} .venv
-          . .venv/bin/activate
-          uv pip install -e '.[test]'
+          uv sync --locked --extra test --python ${{ env.PYTHON_VERSION }}
           uv run --no-sync pytest tests/ -v --tb=short -m "not docker and not docker_mcp and not apps_browser"
         timeout-minutes: 10

@@ -1,5 +1,7 @@
 """Optional host composition against actual Core, HTTP MCP and SQLite."""
 
+from uuid import uuid4
+
 import asyncio
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -16,12 +18,11 @@ from kestrel_sovereign import server
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
 from kestrel_sovereign.agent.parts import part_collector
 from kestrel_sovereign.auth import caller_context_scope
-from kestrel_sovereign.features.privacy import PrivacyAgent
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
 from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.llm.service import LLMService
+from kestrel_sovereign.testing.fixtures import native_tool_effect_agent
 from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
 from kestrel_sovereign.security.request_auth import (
     AuthenticatedSessionMiddleware, InteractiveAuthenticationLifetimeMiddleware, RequestAuthenticationService,
@@ -91,17 +92,13 @@ async def test_apps_are_explicitly_disabled_and_unsupported_host_fails_clearly()
 
 
 @pytest_asyncio.fixture
-async def native_apps_host(request, mcp_http_server, tmp_path, monkeypatch, apps_sandbox_url, apps_host_origin):
+async def native_apps_host(request, mcp_http_server, tmp_path, monkeypatch, apps_sandbox_url, apps_host_origin, native_tool_effect_agent):
     key = "owned-mcp-composition-api-key"
     monkeypatch.setenv("KESTREL_API_KEY", key)
     monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     async with AsyncExitStack() as owned:
-        agent = KestrelAgent(did="did:test:mcp-apps-composition", storage_path=str(tmp_path / "agent.db"),
-                             allowed_features=set(), sync_enabled=False,
-                             llm_service=LLMService(agent_data_dir=tmp_path))
-        owned.push_async_callback(agent.llm_service.close)
-        agent.privacy_agent = PrivacyAgent(agent._raw_storage, agent.privacy_mode)
+        agent = await native_tool_effect_agent(did='did:test:mcp-apps-composition')
         backend = SQLiteBackend(str(tmp_path / "audit.db"))
         await backend.connect()
         owned.push_async_callback(backend.close)
@@ -138,7 +135,7 @@ async def native_apps_host(request, mcp_http_server, tmp_path, monkeypatch, apps
         @app.post("/api/owned-turn")
         async def initial(request: Request):
             with caller_context_scope(request.state.caller), part_collector(host=agent, session_id="original-chat"):
-                return await source.binding.invoke({"text": "initial-once"}, session_id="original-chat", source="chat")
+                return await source.binding.invoke({"text": "initial-once"}, session_id="original-chat", source="chat", operation_id=uuid4().hex)
 
         client = await owned.enter_async_context(httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app),
             base_url="https://composition.test", headers={"X-API-Key": key}))
@@ -231,7 +228,7 @@ async def test_unmount_and_connection_close_cancel_pending_approval_without_nati
                   if item.tool.native_tool.name == "app_mutate")
     await b.permissions.set_permission("mcp:composition", source.binding.name, PermissionLevel.ASK)
     call = asyncio.create_task(b.client.post(f'/api/mcp/apps/views/{opened["view_id"]}/tools/call?session_id=original-chat',
-        json={"name": "app_mutate", "arguments": {"text": "must-not-execute"}}))
+        json={"name": "app_mutate", "arguments": {"text": "must-not-execute"}, "operation_id": uuid4().hex}))
     try:
         approval = await asyncio.wait_for(b.requests.get(), 5)
         assert not call.done()
@@ -322,7 +319,7 @@ async def test_native_cookie_owner_and_csrf_cover_private_app_mutations(native_a
     assert opened.status_code == 200, opened.text
     view = f'/api/mcp/apps/views/{opened.json()["view_id"]}'
     call = view + "/tools/call?session_id=original-chat"
-    body = {"name": "app_mutate", "arguments": {"text": "cookie-app-once"}}
+    body = {"name": "app_mutate", "arguments": {"text": "cookie-app-once"}, "operation_id": uuid4().hex}
     assert (await b.client.post(call, json=body,
         headers={**headers, "Origin": "https://foreign.test"})).status_code == 403
     assert mcp_http_server.witness == ["initial-once"]

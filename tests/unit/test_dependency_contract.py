@@ -23,33 +23,62 @@ def test_remote_mcp_requires_the_shared_sdk_trust_bundle_policy():
     assert not sdk.specifier.contains("0.45.0")
     assert not sdk.specifier.contains("0.46.0")
     assert not sdk.specifier.contains("0.47.0")
-    assert sdk.specifier.contains("0.48.0")
+    assert not sdk.specifier.contains("0.48.0")
+    assert not sdk.specifier.contains("0.51.0")
+    assert sdk.specifier.contains("0.51.1")
 
 
 def test_frozen_mcp_install_uses_public_patched_security_dependencies():
     packages = {item["name"]: item for item in tomllib.loads(
         (ROOT / "uv.lock").read_text())["package"]}
-    for name, floor in [("kestrel-sovereign-sdk", "0.48.0"), ("certifi", "2026.10.23"),
+    for name, floor in [("kestrel-sovereign-sdk", "0.51.1"), ("certifi", "2026.10.23"),
                         ("pyasn1", "0.6.5")]:
         assert Version(packages[name]["version"]) >= Version(floor)
         assert packages[name]["source"] == {"registry": "https://pypi.org/simple"}
 
 
 def test_host_tests_require_native_apps_oauth_and_unconfirmed_outcomes():
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    metadata = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    project = metadata["project"]
     (core,) = [Requirement(raw) for raw in project["optional-dependencies"]["test"]
                if Requirement(raw).name == "kestrel-sovereign"]
-    floor = Version("0.62.2")
+    floor = Version("0.64.0")
     assert any(spec.operator == ">=" and Version(spec.version) >= floor
                for spec in core.specifier)
     assert not core.specifier.contains("0.61.3")
     assert not core.specifier.contains("0.62.0")
     assert not core.specifier.contains("0.62.1")
+    assert not core.specifier.contains("0.63.1")
     assert core.specifier.contains(str(floor))
     packages = {item["name"]: item for item in tomllib.loads(
         (ROOT / "uv.lock").read_text())["package"]}
     assert Version(packages["kestrel-sovereign"]["version"]) >= floor
-    assert packages["kestrel-sovereign"]["source"] == {"registry": "https://pypi.org/simple"}
+    from urllib.parse import parse_qs, urlsplit
+    import re
+
+    sources = metadata["tool"]["uv"]["sources"]
+    assert set(sources) == {"kestrel-sovereign"}
+    declared, = sources["kestrel-sovereign"]
+    assert set(declared) == {"git", "rev", "extra"}
+    assert declared["git"] == "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+    assert declared["extra"] == "test"
+    assert re.fullmatch(r"[0-9a-f]{40}", declared["rev"])
+    assert all(Requirement(raw).name != core.name for raw in project["dependencies"])
+    locked = packages["kestrel-sovereign"]["source"]
+    assert set(locked) == {"git"}
+    location = urlsplit(locked["git"])
+    assert location._replace(query="", fragment="").geturl() == declared["git"]
+    assert parse_qs(location.query) == {"rev": [declared["rev"]]}
+    assert location.fragment == declared["rev"]
+
+
+def test_ci_uses_the_same_locked_native_host_profile_for_all_test_installs():
+    workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+    assert "uv pip install -e '.[test]'" not in workflow
+    assert "uv pip install '.[test]'" not in workflow
+    assert workflow.count('uv sync --locked --extra test --python ${{ env.PYTHON_VERSION }}') == 3
+    assert ('UV_PROJECT_ENVIRONMENT=.venv-test uv sync --locked --extra test --no-editable '
+            '--python ${{ matrix.python-version }}') in workflow
 
 
 def test_production_refresh_installs_public_authlib_without_the_test_extra():

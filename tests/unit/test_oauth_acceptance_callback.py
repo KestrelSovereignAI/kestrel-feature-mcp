@@ -160,8 +160,13 @@ async def test_missing_callback_times_out_and_physically_closes_the_listener(red
         callback.arm(STATE)
         with pytest.raises(TimeoutError):
             await callback.result()
-    with pytest.raises(ConnectionError):
-        await asyncio.open_connection("127.0.0.1", urlsplit(redirect_uri).port)
+    # Exclusive rebinding is a kernel proof that the original listener
+    # retired, without dialing an unrelated service that reused its port.
+    with socket.socket() as retired_port:
+        retired_port.bind(("127.0.0.1", urlsplit(redirect_uri).port))
+        assert retired_port.getsockname()[1] == urlsplit(redirect_uri).port
+    assert not callback._server.sockets
+    assert all(task.done() for task in callback._tasks)
 
 
 async def test_connection_budget_is_finite_and_fails_the_attempt(redirect_uri):

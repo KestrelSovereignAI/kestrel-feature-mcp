@@ -19,6 +19,7 @@ from kestrel_feature_mcp.feature import MCPAgent, _GATEWAY_OWNER
 
 class _FakeHost:
     supports_unconfirmed_tool_outcomes = True
+    supports_durable_tool_effects = True
 
     def __init__(self):
         self.registered: dict = {}

@@ -1,8 +1,8 @@
 """
 Kestrel Feature: MCP (Model Context Protocol)
 
-MCP server management and tool bridging. Provides gateway mode
-for 311+ Docker MCP servers and direct container management.
+Native remote MCP connections with OAuth and Apps, official MCP Registry
+discovery, Docker MCP Gateway and direct container management.
 
 Install: pip install kestrel-feature-mcp
 """

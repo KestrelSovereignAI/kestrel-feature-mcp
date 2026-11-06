@@ -1,5 +1,7 @@
 """The first native App result stays private until real Core policy and SQL."""
 
+from uuid import uuid4
+
 import asyncio
 import json
 
@@ -39,7 +41,7 @@ async def test_first_private_result_waits_for_audited_destination(app_boundary, 
     tool = await allow(peer, "app_mutate")
     peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
     with part_collector(host=peer.host, session_id="initial-chat"):
-        call = asyncio.create_task(tool.binding.invoke({"text": "once"}, session_id="initial-chat", source="chat"))
+        call = asyncio.create_task(tool.binding.invoke({"text": "once"}, session_id="initial-chat", source="chat", operation_id=uuid4().hex))
         try:
             await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
             assert mcp_http_server.witness == ["once"]
@@ -69,7 +71,7 @@ async def test_first_private_result_waits_for_audited_destination(app_boundary, 
 async def test_headless_results_do_not_create_private_views(app_boundary, mcp_http_server, initial_publisher):
     peer = app_boundary
     tool = await allow(peer, "app_mutate")
-    result = await tool.binding.invoke({"text": "headless"}, session_id="headless", source="scheduled")
+    result = await tool.binding.invoke({"text": "headless"}, session_id="headless", source="scheduled", operation_id=uuid4().hex)
     assert not initial_publisher.publications and mcp_http_server.witness == ["headless"]
     assert "mcp_app" not in json.dumps(result) and "private-result" not in json.dumps(result)
 
@@ -88,7 +90,7 @@ async def test_initial_publication_honors_completed_post_policy(app_boundary, mc
     peer.host.hooks_manager.register(Redact())
     tool = await allow(peer, "app_mutate")
     with part_collector(host=peer.host, session_id="initial-chat"):
-        result = await tool.binding.invoke({"text": "redacted"}, session_id="initial-chat", source="chat")
+        result = await tool.binding.invoke({"text": "redacted"}, session_id="initial-chat", source="chat", operation_id=uuid4().hex)
     assert not initial_publisher.publications and mcp_http_server.witness == ["redacted"]
     assert result["confirmation"] == "Reviewed replacement"
 
@@ -100,7 +102,7 @@ async def test_missing_real_dispatch_table_withholds_initial_private_data(app_bo
     await peer.backend.execute("DROP TABLE a2a_tool_dispatches")
     with part_collector(host=peer.host, session_id="initial-chat"):
         with pytest.raises(ResourceOutcomeUnknown):
-            await tool.binding.invoke({"text": "executed"}, session_id="initial-chat", source="chat")
+            await tool.binding.invoke({"text": "executed"}, session_id="initial-chat", source="chat", operation_id=uuid4().hex)
     assert not initial_publisher.publications and mcp_http_server.witness == ["executed"]
 
 
@@ -109,8 +111,8 @@ async def test_view_tool_calls_do_not_publish_another_initial_result(app_boundar
     peer = app_boundary
     tool = await allow(peer, "app_mutate")
     with part_collector(host=peer.host, session_id="initial-chat"):
-        await tool.binding.invoke({"text": "initial"}, session_id="initial-chat", source="chat")
-    result = await peer.executor.invoke(peer.view, "app_mutate", {"text": "view-call"})
+        await tool.binding.invoke({"text": "initial"}, session_id="initial-chat", source="chat", operation_id=uuid4().hex)
+    result = await peer.executor.invoke(peer.view, "app_mutate", {"text": "view-call"}, operation_id=uuid4().hex)
     assert result.meta["private-result"] == {"view": "only"}
     assert len(initial_publisher.publications) == 1
     assert mcp_http_server.witness == ["initial", "view-call"]
@@ -122,7 +124,7 @@ async def test_closed_connection_cannot_publish_a_staged_initial_result(app_boun
     tool = await allow(peer, "app_mutate")
     peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
     with part_collector(host=peer.host, session_id="initial-chat"):
-        call = asyncio.create_task(tool.binding.invoke({"text": "once"}, session_id="initial-chat", source="chat"))
+        call = asyncio.create_task(tool.binding.invoke({"text": "once"}, session_id="initial-chat", source="chat", operation_id=uuid4().hex))
         try:
             await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
             await peer.connection.close()
@@ -145,7 +147,7 @@ async def test_a_closed_chat_cannot_gain_a_late_initial_view(app_boundary, mcp_h
     tool = await allow(peer, "app_mutate")
     peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
     with part_collector(host=peer.host, session_id="initial-chat"):
-        call = asyncio.create_task(tool.binding.invoke({"text": "once"}, session_id="initial-chat", source="chat"))
+        call = asyncio.create_task(tool.binding.invoke({"text": "once"}, session_id="initial-chat", source="chat", operation_id=uuid4().hex))
         await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
     try:
         peer.store.release_dispatch.set()

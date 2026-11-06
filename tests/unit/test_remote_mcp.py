@@ -18,6 +18,7 @@ from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 class RegistryHost:
     supports_unconfirmed_tool_outcomes = True
+    supports_durable_tool_effects = True
 
     def __init__(self, did="did:test:remote"):
         self.agent_id = did
@@ -884,16 +885,20 @@ async def test_unsupported_remote_host_is_refused_before_dns_or_persistence(remo
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
 @pytest.mark.parametrize("producer", ["load", "restore"])
 @pytest.mark.parametrize("claim", ["missing", None, False, 1, "yes"])
+@pytest.mark.parametrize('contract,description', [
+    ('supports_unconfirmed_tool_outcomes', 'unconfirmed tool outcomes'),
+    ('supports_durable_tool_effects', 'durable tool-effect journal'),
+])
 async def test_missing_unknown_outcome_contract_is_refused_before_dns_or_saving(
-    remote_peer, producer, claim, monkeypatch, caplog,
+    remote_peer, producer, claim, monkeypatch, caplog, contract, description,
 ):
     from kestrel_feature_mcp.remote import remote_name_for_url
 
     host = RegistryHost()
     if claim == "missing":
-        monkeypatch.delattr(RegistryHost, "supports_unconfirmed_tool_outcomes")
+        monkeypatch.delattr(RegistryHost, contract)
     else:
-        host.supports_unconfirmed_tool_outcomes = claim
+        setattr(host, contract, claim)
     if producer == "restore":
         name = remote_name_for_url(remote_peer.url, host.agent_id)
         host.saved[name] = {"name": name, "state": "enabled", "metadata": {
@@ -904,10 +909,10 @@ async def test_missing_unknown_outcome_contract_is_refused_before_dns_or_saving(
         if producer == "load":
             result = await feature.load_tool(remote_peer.url)
             assert result.status is ToolResultStatus.ERROR
-            assert "unconfirmed tool outcomes" in result.error
+            assert description in result.error
         else:
             await feature.on_agent_ready()
-            assert "unconfirmed tool outcomes" in caplog.text
+            assert description in caplog.text
     finally:
         await feature.shutdown()
         assert not remote_peer.peer.requests and not remote_peer.peer.witness

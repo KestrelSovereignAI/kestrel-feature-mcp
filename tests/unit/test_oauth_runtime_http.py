@@ -516,7 +516,10 @@ async def test_recent_resource_rejection_survives_original_close_without_retaini
     await connect(b, name)
     credential = b.runtime._credentials[name]
     b.peer.resource.settings['http_status'] = status
-    await b.client.post('/api/owned-credential-call')
+    failed = await b.client.post('/api/owned-credential-call')
+    assert failed.status_code == 502 and failed.json()['error']['code'] == 'tool_effect_outcome_unconfirmed'
+    assert await b.agent.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)
     assert credential.withdrawal_reason == 'resource_rejected'
     assert b.peer.resource.witness == []
     await b.runtime.maintain()
@@ -551,7 +554,8 @@ async def test_recent_rejection_history_is_bounded_and_excluded_from_connection_
         names.append(name)
         await connect(b, name, headers=headers)
         b.peer.resource.settings['http_status'] = 401
-        await b.client.post('/api/owned-credential-call', headers=headers)
+        failed = await b.client.post('/api/owned-credential-call', headers=headers)
+        assert failed.status_code == 502 and failed.json()['error']['code'] == 'tool_effect_outcome_unconfirmed'
         await b.runtime.maintain()
         assert not b.runtime.has_owners and not b.feature._remote_connections
         assert len(b.runtime._resource_rejections) == 1
@@ -572,7 +576,8 @@ async def test_resource_rejection_projection_defers_to_durable_state_and_revisio
     credential = b.runtime._credentials[name]
     snapshot = credential.snapshot
     b.peer.resource.settings['http_status'] = 401
-    await b.client.post('/api/owned-credential-call')
+    failed = await b.client.post('/api/owned-credential-call')
+    assert failed.status_code == 502 and failed.json()['error']['code'] == 'tool_effect_outcome_unconfirmed'
     await b.runtime.maintain()
     assert (await b.client.get('/api/mcp/oauth/connections')).json()['connections'][0]['state'] == 'resource_rejected'
     # Pure metadata projections: a diagnostic grants no authority and cannot
@@ -629,15 +634,20 @@ async def test_real_core_authority_loss_after_a_continuation_never_refreshes_or_
 
     b.peer.resource.mcp.middleware.append(defer)
     result = await b.client.post('/api/owned-credential-call')
-    assert result.status_code == 200, result.text
+    assert result.status_code == 502, result.text
     assert len(rounds) == 2
     assert b.peer.resource.witness == ['effect-before-continuation'] * 2
-    assert result.json()['data']['execution_outcome'] == 'unknown'
+    assert result.json()['error']['code'] == 'tool_effect_outcome_unconfirmed'
+    assert await b.agent.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)
     calls = [json.loads(body) for _, body in b.peer.resource.requests if body
         and json.loads(body).get('method') == 'tools/call']
     assert len(calls) == 2 and len({c['id'] for c in calls}) == 2
     assert b.peer.requests.count(('POST', '/token')) == 1
-    assert len(await b.host.database.fetch_all('SELECT * FROM a2a_tool_dispatches')) == 1
+    # The original unknown carrier reaches HTTP without becoming a returned
+    # tool-error dictionary. Its durable receipt is the UNCONFIRMED claim
+    # above; there is no ordinary returned-result observability row.
+    assert await b.host.database.fetch_all('SELECT * FROM a2a_tool_dispatches') == []
     snapshot = await credential.store.read_slot(credential.principal_id, name)
     assert snapshot.state == 'active'
     if loss == 'expiry':
@@ -647,19 +657,23 @@ async def test_real_core_authority_loss_after_a_continuation_never_refreshes_or_
 
 
 @pytest.mark.parametrize('claim', ['missing', False, 1, 'yes'])
+@pytest.mark.parametrize('contract,description', [
+    ('supports_unconfirmed_tool_outcomes', 'unconfirmed tool outcomes'),
+    ('supports_durable_tool_effects', 'durable tool-effect journal'),
+])
 async def test_unsupported_native_host_cannot_enable_oauth_or_start_consent(
-    credential_boundary, monkeypatch, claim,
+    credential_boundary, monkeypatch, claim, contract, description,
 ):
     from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
     from kestrel_feature_mcp.feature import MCPHostCapabilityError
 
     b = credential_boundary
     if claim == 'missing':
-        monkeypatch.delattr(OrchestratorEngineMixin, 'supports_unconfirmed_tool_outcomes', raising=False)
+        monkeypatch.delattr(OrchestratorEngineMixin, contract, raising=False)
     else:
-        b.agent.supports_unconfirmed_tool_outcomes = claim
+        setattr(b.agent, contract, claim)
     before = await b.feature.get_config()
-    with pytest.raises(MCPHostCapabilityError, match='unconfirmed tool outcomes'):
+    with pytest.raises(MCPHostCapabilityError, match=description):
         await b.feature.set_config({'oauth': {'enabled': True, 'close_seconds': 2.0}})
     assert await b.feature.get_config() == before
     assert b.feature._oauth_host is b.feature._oauth_runtime is None
@@ -830,10 +844,8 @@ async def test_model_dispatch_keeps_unknown_outcome_after_unexpected_native_cont
         return result
     monkeypatch.setattr(ClientSession, 'call_tool', fault_after_received_native_result)
     result = await b.client.post('/api/owned-credential-call', params={'mode': lane})
-    assert result.status_code == 200, result.text
-    assert result.json()['success'] is False
-    assert 'unconfirmed' in result.json()['error']
-    assert 'reconcile before retrying' in result.json()['error']
+    assert result.status_code == 502, result.text
+    assert result.json()['error']['code'] == 'tool_effect_outcome_unconfirmed'
     assert 'private-sdk-bug-detail' not in result.text
     assert len(rounds) == 2 and b.peer.resource.witness == ['effect-before-sdk-fault'] * 2
     calls = [json.loads(body) for _, body in b.peer.resource.requests if body
@@ -841,3 +853,5 @@ async def test_model_dispatch_keeps_unknown_outcome_after_unexpected_native_cont
     assert len(calls) == 2 and len({c['id'] for c in calls}) == 2
     rows = await b.host.database.fetch_all('SELECT result_status, error_class FROM a2a_tool_dispatches')
     assert len(rows) == 1 and tuple(rows[0]) == ('error', 'ResourceOutcomeUnknown')
+    assert await b.agent.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)

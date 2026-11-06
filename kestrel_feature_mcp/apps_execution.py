@@ -391,7 +391,8 @@ class AppExecutor:
 
         return DeferredToolResult(projection, publish=approve_delivery)
 
-    async def invoke(self, view: AppView, name: str, arguments: dict) -> types.CallToolResult:
+    async def invoke(self, view: AppView, name: str, arguments: dict,
+                     *, operation_id: str) -> types.CallToolResult:
         if view.executor is not self:
             raise ResourceConflict("MCP App View belongs to another host")
         view.require_current()
@@ -421,7 +422,7 @@ class AppExecutor:
                 # one-shot approvals, registry identity, cancellation and SQL audit.
                 try:
                     projected = await registered.binding.invoke(
-                        arguments, session_id=view.session_id, source="mcp-app",
+                        arguments, session_id=view.session_id, operation_id=operation_id, source="mcp-app",
                     )
                 except ResourceConflict as error:
                     if invocation.started:
