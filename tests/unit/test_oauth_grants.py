@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 import uuid
 
 import pytest
+from kestrel_sdk.resources import ResourceConflict
 
 from kestrel_sdk.security.exceptions import DecryptionError
 from kestrel_sdk.storage.database import TransactionError
@@ -237,8 +238,9 @@ async def test_revision_cas_rejects_refresh_completed_between_read_and_update(
                           refresh_token='race-rotated-refresh')
         completed = await second.finish_refresh(current_claim, rotated)
         release.set()
-        with pytest.raises(OAuthGrantChanged, match='changed before durable custody'):
+        with pytest.raises(ResourceConflict, match='changed before durable custody') as changed:
             await pending
+        assert type(changed.value) is OAuthGrantChanged
         assert await read_payload(second, binding) == completed
     finally:
         release.set()
