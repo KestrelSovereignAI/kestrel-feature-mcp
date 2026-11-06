@@ -30,9 +30,9 @@ async def test_call_timeout_uses_the_real_connection(kind, mcp_http_server):
             manager.connection = connection
             manager.tools = {"echo": SimpleNamespace()}
             call = manager.call_tool("echo", {"text": "slow"})
-        with pytest.raises(ResourceOutcomeUnknown, match="execution outcome is unknown") as caught:
+        with pytest.raises(MCPCallOutcomeUnknownError, match="execution outcome is unknown") as caught:
             await call
-        assert type(caught.value) is MCPCallOutcomeUnknownError
+        assert isinstance(caught.value, ResourceOutcomeUnknown), 'Native MCP unknown outcome must honor the public SDK contract'
         assert isinstance(caught.value.__cause__, TimeoutError)
         assert connection.is_connected
     finally:

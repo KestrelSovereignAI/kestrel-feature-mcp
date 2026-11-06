@@ -20,12 +20,13 @@ from typing import Callable, Mapping, TYPE_CHECKING
 from weakref import WeakSet
 
 from mcp import types
-from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
+from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, observed_outcome_unknown
 from kestrel_sdk.tools import (
     DeferredToolResult, DeferredToolResultHost, GovernedToolBinding, ToolPublicationContext,
 )
 
-from .connection import BoundMCPCaller
+from .connection import BoundMCPCaller, _rejected_before_execution
+from .oauth_grants import OAuthGrantChanged
 from .apps_resources import AppResource, read_app_resource
 
 if TYPE_CHECKING:
@@ -72,6 +73,7 @@ class _Invocation:
     delivery_approved: bool = False
     started: bool = False
     finished: bool = False
+    refusal: BaseException | None = None
 
 
 @dataclass(eq=False, frozen=True)
@@ -370,10 +372,19 @@ class AppExecutor:
         invocation.started = True
         return invocation
 
-    def capture(self, invocation: _Invocation, native: types.CallToolResult,
-                projection: dict) -> DeferredToolResult:
+    def _require_capture(self, invocation: _Invocation) -> None:
         if self._invocation.get() is not invocation or invocation.finished or not invocation.started:
             raise ResourceOutcomeUnknown("MCP App invocation context changed after execution; do not replay")
+
+    def capture_refusal(self, invocation: _Invocation, error: BaseException) -> None:
+        """Retain the connection's canonical rejection separately from admission."""
+        self._require_capture(invocation)
+        if (_rejected_before_execution(error) or issubclass(type(error), OAuthGrantChanged)) and not observed_outcome_unknown(error):
+            invocation.refusal = error
+
+    def capture(self, invocation: _Invocation, native: types.CallToolResult,
+                projection: dict) -> DeferredToolResult:
+        self._require_capture(invocation)
         if not isinstance(native, types.CallToolResult) or native.result_type != "complete":
             raise ResourceOutcomeUnknown("MCP App tool returned no complete native result; do not replay")
         invocation.native = native.model_copy(deep=True)
@@ -425,12 +436,15 @@ class AppExecutor:
                         arguments, session_id=view.session_id, operation_id=operation_id, source="mcp-app",
                     )
                 except ResourceConflict as error:
-                    if invocation.started:
+                    if invocation.started and (invocation.refusal is None or observed_outcome_unknown(error)):
                         raise ResourceOutcomeUnknown(
                             "MCP App call may have executed; reconcile before retrying",
                         ) from error
                     raise
                 if invocation.native is None:
+                    if invocation.refusal is not None:
+                        view.require_current()
+                        raise ResourceConflict("Native MCP request was rejected before tool execution") from invocation.refusal
                     # Hooks can redact the serialized result. Admission and the
                     # native capture are private execution facts, so missing
                     # output after admission stays unknown regardless of hooks.

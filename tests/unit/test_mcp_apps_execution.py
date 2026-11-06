@@ -906,3 +906,34 @@ async def test_live_view_authority_is_checked_after_each_native_intermediate(
     assert len(rows) == (1 if kind == 'tool' else 0)
     if rows:
         assert rows[0][0] == 'error'
+
+
+@pytest.mark.asyncio
+async def test_original_app_intent_cannot_be_replayed_after_a_confirmed_native_effect(app_boundary, mcp_http_server):
+    peer = app_boundary
+    await allow(peer, 'app_mutate')
+    operation_id = uuid4().hex
+    result = await peer.executor.invoke(peer.view, 'app_mutate', {'text': 'original-confirmed-effect'},
+        operation_id=operation_id)
+    assert not result.is_error
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await peer.executor.invoke(peer.view, 'app_mutate', {'text': 'original-confirmed-effect'},
+            operation_id=operation_id)
+    assert mcp_http_server.witness == ['original-confirmed-effect']
+    requests = [json.loads(body) for _, body in mcp_http_server.requests if body]
+    assert sum(message.get('method') == 'tools/call' for message in requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_known_native_app_argument_rejection_retains_a_definite_error(app_boundary, mcp_http_server):
+    peer = app_boundary
+    await allow(peer, 'app_mutate')
+    mcp_http_server.settings['reject_call'] = True
+    with pytest.raises(ResourceConflict, match='rejected before tool execution'):
+        await peer.executor.invoke(peer.view, 'app_mutate', {'text': 'must-not-execute'},
+            operation_id=uuid4().hex)
+    assert mcp_http_server.witness == []
+    assert await peer.host.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('RETURNED_ERROR',)
+    assert await peer.host.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_operations') == ('CLOSED',)

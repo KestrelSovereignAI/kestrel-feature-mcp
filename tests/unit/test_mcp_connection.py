@@ -17,6 +17,22 @@ from mcp_types.version import LATEST_PROTOCOL_VERSION
 from kestrel_feature_mcp.manager import DockerMCPGatewayError, MCPGatewayManager, MCPToolManager
 
 
+@pytest.mark.parametrize('carrier', ['cause', 'group-cause', 'group-member'])
+def test_native_rejection_cannot_erase_an_original_unknown_outcome(carrier):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_feature_mcp.connection import _rejected_before_execution
+
+    rejected = MCPError(types.INVALID_PARAMS, 'Native arguments rejected')
+    original = ResourceOutcomeUnknown('An earlier original outcome needs reconciliation')
+    if carrier == 'group-member':
+        error = ExceptionGroup('Original outcomes', [rejected, original])
+    else:
+        rejected.__cause__ = (ExceptionGroup('Original outcomes', [original])
+                              if carrier == 'group-cause' else original)
+        error = rejected
+    assert not _rejected_before_execution(error), 'Native rejection erased an original unknown outcome'
+
+
 @pytest.mark.asyncio
 async def test_changed_native_header_contract_is_not_refreshed_and_resent_without_readmission(mcp_http_server):
     connection = MCPConnection(mcp_http_server.url)
