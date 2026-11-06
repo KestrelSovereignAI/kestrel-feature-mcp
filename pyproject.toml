@@ -44,7 +44,7 @@ allow-direct-references = true
 # Runtime dependencies remain normal public-index requirements.
 [tool.uv.sources]
 kestrel-sovereign = [
-    { git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git", rev = "e0184e31cf6b3adcceb0909eda2240fe970227da", extra = "test" },
+    { git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git", rev = "c2a3cdebe549cd3191d01737442b603a9c8c67b7", extra = "test" },
 ]
 
 [tool.hatch.build.targets.wheel]
