@@ -8,7 +8,7 @@ requires-python = ">=3.11,<3.15"
 dependencies = [
     # Public native cancellation checkpoint for original cleanup owners.
     "anyio>=4.7,<5",
-    "kestrel-sovereign-sdk[crypto,httpx2]>=0.51.1,<1",
+    "kestrel-sovereign-sdk[crypto,httpx2]>=0.51.2,<1",
     "Authlib>=1.9.4,<2",
     "docker>=7.1.0",
     "requests>=2.34.2",
