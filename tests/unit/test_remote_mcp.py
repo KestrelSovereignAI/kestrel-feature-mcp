@@ -13,6 +13,7 @@ import pytest
 
 from kestrel_feature_mcp.feature import MCPAgent
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 
 class RegistryHost:
@@ -491,11 +492,10 @@ async def test_lost_tool_response_is_unknown_and_is_never_replayed(remote_peer):
     try:
         assert (await feature.load_tool(remote_peer.url)).status is ToolResultStatus.OK
         wrapper = next(t for ts in feature.agent.registered.values() for t in ts if t._real_name == "echo")
-        result = await wrapper.execute(text="executed-but-response-lost")
+        with pytest.raises(ResourceOutcomeUnknown, match="(?i)do not replay") as error:
+            await wrapper.execute(text="executed-but-response-lost")
         assert remote_peer.peer.witness == ["executed-but-response-lost"]
-        assert result["status"] == "error"
-        assert result["data"]["execution_outcome"] == "unknown"
-        assert "do not replay" in result["error"].lower()
+        assert error.value.__cause__ is not None
         calls = [json.loads(body) for scope, body in remote_peer.peer.requests
                  if body and json.loads(body)["method"] == "tools/call"]
         assert len(calls) == 1
@@ -519,14 +519,13 @@ async def test_unsupported_input_never_continues_or_loses_the_unknown_outcome(re
     try:
         assert (await feature.load_tool(remote_peer.url)).status is ToolResultStatus.OK
         wrapper = next(t for ts in feature.agent.registered.values() for t in ts if t._real_name == "echo")
-        result = await wrapper.execute(text="work-before-input")
+        with pytest.raises(ResourceOutcomeUnknown, match="Do not replay") as error:
+            await wrapper.execute(text="work-before-input")
         assert remote_peer.peer.settings["input_witness_file"].read_text().splitlines() == ["executed-before-input"]
         calls = [json.loads(body) for scope, body in remote_peer.peer.requests
                  if body and json.loads(body)["method"] == "tools/call"]
         assert len(calls) == 1
-        assert result["status"] == "error"
-        assert result["data"]["execution_outcome"] == "unknown"
-        assert "Do not replay" in result["error"]
+        assert error.value.__cause__ is not None
     finally:
         await feature.shutdown()
 

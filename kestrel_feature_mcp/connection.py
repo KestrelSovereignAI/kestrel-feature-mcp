@@ -47,7 +47,7 @@ class _RequestProgress:
     intermediate: bool = False
 
 
-class MCPCallOutcomeUnknownError(RuntimeError):
+class MCPCallOutcomeUnknownError(ResourceOutcomeUnknown):
     """A call returned no valid result; its external effects are unconfirmed."""
 
 

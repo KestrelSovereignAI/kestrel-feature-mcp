@@ -8,6 +8,7 @@ import httpx2
 from mcp.shared.exceptions import MCPError
 
 from kestrel_feature_mcp.connection import MCPConnection
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 
 @pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True,
@@ -57,11 +58,10 @@ async def test_a_bounded_reply_after_real_tool_effects_is_reported_unknown(mcp_h
         tools = await connection.connect()
         native = next(tool for tool in tools if tool.name == "echo")
         wrapper = build_wrappers("wire", [native.model_dump(by_alias=True)], connection.call_tool)[0]
-        result = await wrapper.execute(text="performed once")
+        with pytest.raises(ResourceOutcomeUnknown, match="Do not replay") as error:
+            await wrapper.execute(text="performed once")
         assert mcp_http_server.witness == ["performed once"]
-        assert result["status"] == "error"
-        assert result.get("data", {}).get("execution_outcome") == "unknown"
-        assert "Do not replay" in result["error"]
+        assert error.value.__cause__ is not None
     finally:
         mcp_http_server.settings["release_resource_wire"].set()
         await connection.close()
@@ -161,10 +161,9 @@ async def test_native_sdk_output_schema_error_after_effects_is_unknown_without_r
         tools = await connection.connect()
         native = next(tool for tool in tools if tool.name == "echo")
         wrapper = build_wrappers("schema", [native.model_dump(by_alias=True)], connection.call_tool)[0]
-        result = await wrapper.execute(text="effect before output validation")
+        with pytest.raises(ResourceOutcomeUnknown, match="Do not replay") as error:
+            await wrapper.execute(text="effect before output validation")
         assert mcp_http_server.witness == ["effect before output validation"]
-        assert result["status"] == "error"
-        assert result.get("data", {}).get("execution_outcome") == "unknown"
-        assert "Do not replay" in result["error"]
+        assert error.value.__cause__ is not None
     finally:
         await connection.close()

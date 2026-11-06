@@ -145,9 +145,9 @@ class MCPToolWrapper:
         except MCPCallOutcomeUnknownError as error:
             logger.error("MCP tool %r has an unconfirmed outcome (%s)", self._real_name,
                 type(error.__cause__).__name__)
-            return ToolResult.failed(
-                str(error), data={"mcp_tool": self._real_name, "execution_outcome": "unknown"},
-            ).to_dict()
+            # The host must settle its admitted effect before any model-visible
+            # error projection. Preserve the SDK outcome type and native cause.
+            raise
         except (ExceptionGroup, ValueError, *MCP_CONNECTION_ERRORS) as e:
             if isinstance(e, ExceptionGroup):
                 _, unexpected = e.split((*MCP_CONNECTION_ERRORS, ValueError))
