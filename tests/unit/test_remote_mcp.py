@@ -13,10 +13,12 @@ import pytest
 
 from kestrel_feature_mcp.feature import MCPAgent
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 
 class RegistryHost:
     supports_unconfirmed_tool_outcomes = True
+    supports_durable_tool_effects = True
 
     def __init__(self, did="did:test:remote"):
         self.agent_id = did
@@ -491,11 +493,10 @@ async def test_lost_tool_response_is_unknown_and_is_never_replayed(remote_peer):
     try:
         assert (await feature.load_tool(remote_peer.url)).status is ToolResultStatus.OK
         wrapper = next(t for ts in feature.agent.registered.values() for t in ts if t._real_name == "echo")
-        result = await wrapper.execute(text="executed-but-response-lost")
+        with pytest.raises(ResourceOutcomeUnknown, match="(?i)do not replay") as error:
+            await wrapper.execute(text="executed-but-response-lost")
         assert remote_peer.peer.witness == ["executed-but-response-lost"]
-        assert result["status"] == "error"
-        assert result["data"]["execution_outcome"] == "unknown"
-        assert "do not replay" in result["error"].lower()
+        assert error.value.__cause__ is not None
         calls = [json.loads(body) for scope, body in remote_peer.peer.requests
                  if body and json.loads(body)["method"] == "tools/call"]
         assert len(calls) == 1
@@ -519,14 +520,13 @@ async def test_unsupported_input_never_continues_or_loses_the_unknown_outcome(re
     try:
         assert (await feature.load_tool(remote_peer.url)).status is ToolResultStatus.OK
         wrapper = next(t for ts in feature.agent.registered.values() for t in ts if t._real_name == "echo")
-        result = await wrapper.execute(text="work-before-input")
+        with pytest.raises(ResourceOutcomeUnknown, match="Do not replay") as error:
+            await wrapper.execute(text="work-before-input")
         assert remote_peer.peer.settings["input_witness_file"].read_text().splitlines() == ["executed-before-input"]
         calls = [json.loads(body) for scope, body in remote_peer.peer.requests
                  if body and json.loads(body)["method"] == "tools/call"]
         assert len(calls) == 1
-        assert result["status"] == "error"
-        assert result["data"]["execution_outcome"] == "unknown"
-        assert "Do not replay" in result["error"]
+        assert error.value.__cause__ is not None
     finally:
         await feature.shutdown()
 
@@ -885,16 +885,20 @@ async def test_unsupported_remote_host_is_refused_before_dns_or_persistence(remo
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True}], indirect=True)
 @pytest.mark.parametrize("producer", ["load", "restore"])
 @pytest.mark.parametrize("claim", ["missing", None, False, 1, "yes"])
+@pytest.mark.parametrize('contract,description', [
+    ('supports_unconfirmed_tool_outcomes', 'unconfirmed tool outcomes'),
+    ('supports_durable_tool_effects', 'durable tool-effect journal'),
+])
 async def test_missing_unknown_outcome_contract_is_refused_before_dns_or_saving(
-    remote_peer, producer, claim, monkeypatch, caplog,
+    remote_peer, producer, claim, monkeypatch, caplog, contract, description,
 ):
     from kestrel_feature_mcp.remote import remote_name_for_url
 
     host = RegistryHost()
     if claim == "missing":
-        monkeypatch.delattr(RegistryHost, "supports_unconfirmed_tool_outcomes")
+        monkeypatch.delattr(RegistryHost, contract)
     else:
-        host.supports_unconfirmed_tool_outcomes = claim
+        setattr(host, contract, claim)
     if producer == "restore":
         name = remote_name_for_url(remote_peer.url, host.agent_id)
         host.saved[name] = {"name": name, "state": "enabled", "metadata": {
@@ -905,10 +909,10 @@ async def test_missing_unknown_outcome_contract_is_refused_before_dns_or_saving(
         if producer == "load":
             result = await feature.load_tool(remote_peer.url)
             assert result.status is ToolResultStatus.ERROR
-            assert "unconfirmed tool outcomes" in result.error
+            assert description in result.error
         else:
             await feature.on_agent_ready()
-            assert "unconfirmed tool outcomes" in caplog.text
+            assert description in caplog.text
     finally:
         await feature.shutdown()
         assert not remote_peer.peer.requests and not remote_peer.peer.witness

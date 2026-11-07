@@ -4,6 +4,8 @@ CallerContext scopes below exercise the host callback contract. They are not
 HTTP authentication tests; no route advertises this in-process component yet.
 """
 
+from uuid import uuid4
+
 import asyncio
 import inspect
 import json
@@ -86,7 +88,7 @@ BOB = CallerContext.authenticated("bob")
 async def execute_initial(peer, *, text="once", chat="original-chat", caller=ALICE):
     tool = await allow(peer, "app_mutate")
     with caller_context_scope(caller), part_collector(host=peer.host, session_id=chat):
-        result = await tool.binding.invoke({"text": text}, session_id=chat, source="chat")
+        result = await tool.binding.invoke({"text": text}, session_id=chat, source="chat", operation_id=uuid4().hex)
     return result
 
 
@@ -439,7 +441,7 @@ async def test_retirement_joins_real_pending_core_approval_before_connection_cle
     await allow(peer, "app_mutate", PermissionLevel.ASK)
     with caller_context_scope(ALICE):
         view = registry.open_view(reference)
-        call = asyncio.create_task(registry.executor.invoke(view, "app_mutate", {"text": "not-approved"}))
+        call = asyncio.create_task(registry.executor.invoke(view, "app_mutate", {"text": "not-approved"}, operation_id=uuid4().hex))
         try:
             await asyncio.wait_for(peer.approval_requests.get(), 5)
             registry.retire("mcp:original")
@@ -465,7 +467,7 @@ async def test_physical_close_and_feature_shutdown_join_the_same_required_audit(
     closers = []
     with caller_context_scope(ALICE):
         view = registry.open_view(reference)
-        call = asyncio.create_task(registry.executor.invoke(view, "app_mutate", {"text": "shutdown-once"}))
+        call = asyncio.create_task(registry.executor.invoke(view, "app_mutate", {"text": "shutdown-once"}, operation_id=uuid4().hex))
         try:
             await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
             closers = [asyncio.create_task(registry.close_view(view)), asyncio.create_task(registry.close())]
@@ -505,7 +507,7 @@ async def test_source_retirement_drains_a_real_inflight_native_http_call(app_bou
     mcp_http_server.settings["app_tool_delay"] = 0.2
     with caller_context_scope(ALICE):
         view = registry.open_view(reference)
-        call = asyncio.create_task(peer.executor.invoke(view, "app_mutate", {"text": "native-inflight"}))
+        call = asyncio.create_task(peer.executor.invoke(view, "app_mutate", {"text": "native-inflight"}, operation_id=uuid4().hex))
         try:
             async with asyncio.timeout(5):
                 while "native-inflight" not in mcp_http_server.witness:
@@ -533,7 +535,7 @@ async def test_reader_failure_after_native_effect_preserves_no_replay_outcome(ap
     error = error_type("private-reader-diagnostic")
     with caller_context_scope(ALICE):
         view = registry.open_view(reference)
-        call = asyncio.create_task(registry.executor.invoke(view, "app_mutate", {"text": "reader-withdrawn"}))
+        call = asyncio.create_task(registry.executor.invoke(view, "app_mutate", {"text": "reader-withdrawn"}, operation_id=uuid4().hex))
         try:
             await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
             def refuse(owner, context):
@@ -748,7 +750,7 @@ async def test_non_view_initial_tool_stale_after_construction_is_definite_failur
     tool = await allow(peer, "app_mutate")
     await peer.connection.close()
     with caller_context_scope(ALICE), part_collector(host=peer.host, session_id="original-chat"):
-        result = await tool.binding.invoke({"text": "never-sent"}, session_id="original-chat", source="chat")
+        result = await tool.binding.invoke({"text": "never-sent"}, session_id="original-chat", source="chat", operation_id=uuid4().hex)
     assert result["status"] == "error" and "rediscover" in result["error"]
     assert not mcp_http_server.witness
     rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
@@ -763,7 +765,7 @@ async def test_refused_reader_does_not_cancel_the_original_owners_pending_call(a
     peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
     with caller_context_scope(ALICE):
         view = registry.open_view(reference)
-        call = asyncio.create_task(peer.executor.invoke(view, "app_mutate", {"text": "authorized-owner"}))
+        call = asyncio.create_task(peer.executor.invoke(view, "app_mutate", {"text": "authorized-owner"}, operation_id=uuid4().hex))
         try:
             await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
             with caller_context_scope(BOB), pytest.raises(ResourceConflict):
@@ -812,7 +814,7 @@ async def test_faulty_source_is_isolated_and_drain_joins_its_required_audit(app_
     tool = next(item for item in isolated if item.tool.native_tool.name == "app_mutate")
     await peer.permissions.set_permission("mcp:isolated", tool.binding.name, PermissionLevel.ALLOW)
     with caller_context_scope(BOB), part_collector(host=peer.host, session_id="isolated-chat"):
-        result = await tool.binding.invoke({"text": "isolated-source"}, session_id="isolated-chat", source="chat")
+        result = await tool.binding.invoke({"text": "isolated-source"}, session_id="isolated-chat", source="chat", operation_id=uuid4().hex)
     reference = next(part for part in result["parts"] if part["type"] == "mcp_app")["data"]["reference"]
     reader_chat[1] = "isolated-chat"
     fault[0] = True
@@ -822,7 +824,7 @@ async def test_faulty_source_is_isolated_and_drain_joins_its_required_audit(app_
     draining = None
     with caller_context_scope(BOB):
         bad_view = registry.open_view(reference)
-        call = asyncio.create_task(peer.executor.invoke(bad_view, "app_mutate", {"text": "effect-before-source-fault"}))
+        call = asyncio.create_task(peer.executor.invoke(bad_view, "app_mutate", {"text": "effect-before-source-fault"}, operation_id=uuid4().hex))
         try:
             await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
             fault[0] = True
@@ -887,7 +889,7 @@ async def test_unbound_interactive_publisher_retains_no_private_result(app_bound
     registry, _, _ = publications
     tool = await allow(app_boundary, "app_mutate")
     with caller_context_scope(caller), part_collector(host=app_boundary.host, session_id="original-chat"):
-        result = await tool.binding.invoke({"text": "unbound"}, session_id="original-chat", source="chat")
+        result = await tool.binding.invoke({"text": "unbound"}, session_id="original-chat", source="chat", operation_id=uuid4().hex)
     assert not registry._publications and '"mcp_app"' not in json.dumps(result)
     assert mcp_http_server.witness == ["unbound"]
 

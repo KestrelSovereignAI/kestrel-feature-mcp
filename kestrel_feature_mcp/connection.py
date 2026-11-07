@@ -22,7 +22,7 @@ from mcp.client import InputRequiredRoundsExceededError
 from mcp import Client, types
 from mcp.client.streamable_http import streamable_http_client
 from kestrel_sdk.security.outbound import ValidatedOutboundURL, pinned_httpx2_async_transport
-from kestrel_sdk.resources import ResourceError, ResourceOutcomeUnknown, ResourceUnsupported
+from kestrel_sdk.resources import ResourceError, ResourceOutcomeUnknown, ResourceUnsupported, observed_outcome_unknown
 
 from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSION_CLOSE_TIMEOUT_DEFAULT, RESPONSE_MAX_BYTES_DEFAULT
 from .constants import STATE_ONLY_MAX_ROUNDS_DEFAULT, STATE_ONLY_BACKOFF_INITIAL_DEFAULT, STATE_ONLY_BACKOFF_MAX_DEFAULT
@@ -47,11 +47,13 @@ class _RequestProgress:
     intermediate: bool = False
 
 
-class MCPCallOutcomeUnknownError(RuntimeError):
+class MCPCallOutcomeUnknownError(ResourceOutcomeUnknown):
     """A call returned no valid result; its external effects are unconfirmed."""
 
 
 def _rejected_before_execution(error: BaseException) -> bool:
+    if observed_outcome_unknown(error):
+        return False
     if isinstance(error, BaseExceptionGroup):
         return all(_rejected_before_execution(child) for child in error.exceptions)
     # The SDK also emits PARSE_ERROR and INVALID_REQUEST locally when a

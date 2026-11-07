@@ -1,5 +1,7 @@
 """Native HTTP calls through actual Core hooks, approvals and SQLite audit."""
 
+from uuid import uuid4
+
 import asyncio
 from contextlib import AsyncExitStack
 from contextvars import copy_context
@@ -17,20 +19,14 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import Observabili
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
-from kestrel_sovereign.hooks.manager import HooksManager
+from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+from kestrel_sovereign.testing.fixtures import native_tool_effect_agent as native_tool_effect_agent
+from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
 
 from kestrel_feature_mcp.apps_execution import AppExecutor, MCPAppResultWithheld, RegisteredAppTool
 from kestrel_feature_mcp.connection import MCPConnection, bind_tool_caller
 from kestrel_feature_mcp.dynamic_tools import MCPToolWrapper
-from tests.unit.test_mcp_core_registry import CoreRegistryHost
-
-
-class GovernedMCPHost(CoreRegistryHost):
-    def __init__(self, store):
-        super().__init__()
-        self.observability_store = store
-        self.hooks_manager = HooksManager()
 
 
 class SchedulingStore(ObservabilityStore):
@@ -42,15 +38,18 @@ class SchedulingStore(ObservabilityStore):
         return await super().log_tool_call(*args, **kwargs)
 
     async def log_tool_dispatch(self, entry, *, required=False):
+        self.dispatch_attempts += 1
         if self.dispatch_started is not None:
             self.dispatch_started.set()
             await self.release_dispatch.wait()
-        return await super().log_tool_dispatch(entry, required=required)
+        result = await super().log_tool_dispatch(entry, required=required)
+        self.dispatch_acks += 1
+        return result
 
 
 @dataclass
 class AppBoundary:
-    host: GovernedMCPHost
+    host: KestrelAgent
     backend: SQLiteBackend
     store: SchedulingStore
     permissions: PermissionStore
@@ -72,15 +71,18 @@ def initial_publisher():
 
 
 @pytest_asyncio.fixture
-async def app_boundary(mcp_http_server, tmp_path, initial_publisher, app_executor_factory):
+async def app_boundary(mcp_http_server, tmp_path, initial_publisher, app_executor_factory, native_tool_effect_agent):
     async with AsyncExitStack() as cleanup:
         backend = SQLiteBackend(str(tmp_path / "apps-audit.db"))
         await backend.connect()
         store = SchedulingStore(backend)
         store.admitted_sources = []
+        store.dispatch_attempts = 0
+        store.dispatch_acks = 0
         await store.initialize()
         cleanup.push_async_callback(store.close)
-        host = GovernedMCPHost(store)
+        host = await native_tool_effect_agent(did='did:test:registry-catalog')
+        host.observability_store = store
         permissions = PermissionStore(str(tmp_path / "apps-permissions.db"))
         await permissions.initialize()
         requests = asyncio.Queue()
@@ -124,10 +126,10 @@ async def test_app_only_native_tool_is_governed_and_private_result_follows_requi
     peer = app_boundary
     tool = await allow(peer, "app_mutate")
     assert all(item["function"]["name"] != tool.binding.name for item in peer.host._build_all_tools())
-    outside = await tool.binding.invoke({"text": "outside"}, session_id="untrusted-source", source="mcp-app")
+    outside = await tool.binding.invoke({"text": "outside"}, session_id="untrusted-source", source="mcp-app", operation_id=uuid4().hex)
     assert outside["status"] == "error" and not mcp_http_server.witness
     peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
-    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "once"}))
+    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "once"}, operation_id=uuid4().hex))
     try:
         await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
         assert mcp_http_server.witness == ["once"]
@@ -154,12 +156,12 @@ async def test_app_only_native_tool_is_governed_and_private_result_follows_requi
 async def test_native_app_call_waits_for_real_one_shot_approval(app_boundary, mcp_http_server):
     peer = app_boundary
     await allow(peer, "app_mutate", PermissionLevel.ASK)
-    first = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "approved"}))
+    first = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "approved"}, operation_id=uuid4().hex))
     request = await asyncio.wait_for(peer.approval_requests.get(), 5)
     assert not first.done() and not mcp_http_server.witness
     assert await peer.approvals.submit_decision(request.id, True, scope="once")
     assert (await first).structured_content == {"text": "approved"}
-    second = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "denied"}))
+    second = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "denied"}, operation_id=uuid4().hex))
     request2 = await asyncio.wait_for(peer.approval_requests.get(), 5)
     assert request2.id != request.id
     assert await peer.approvals.submit_decision(request2.id, False)
@@ -172,7 +174,7 @@ async def test_native_app_call_waits_for_real_one_shot_approval(app_boundary, mc
 async def test_original_view_authority_is_rechecked_after_approval(app_boundary, mcp_http_server, withdraw):
     peer = app_boundary
     await allow(peer, "app_mutate", PermissionLevel.ASK)
-    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "stale"}))
+    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "stale"}, operation_id=uuid4().hex))
     request = await asyncio.wait_for(peer.approval_requests.get(), 5)
     if withdraw == "view":
         await peer.view.close()
@@ -200,7 +202,7 @@ async def test_failed_actual_sql_audit_withholds_native_result_and_never_reissue
     await allow(peer, "app_mutate")
     await peer.backend.execute("DROP TABLE a2a_tool_dispatches")
     with pytest.raises(ResourceOutcomeUnknown, match="audit"):
-        await peer.executor.invoke(peer.view, "app_mutate", {"text": "effect-before-audit-failure"})
+        await peer.executor.invoke(peer.view, "app_mutate", {"text": "effect-before-audit-failure"}, operation_id=uuid4().hex)
     assert mcp_http_server.witness == ["effect-before-audit-failure"]
 
 
@@ -212,10 +214,10 @@ async def test_app_cannot_call_model_only_or_foreign_tools(app_boundary, mcp_htt
     assert "echo" not in {tool.name for tool in peer.view.list_tools()}
     for name in ["echo", "not-advertised", "app__app_mutate"]:
         with pytest.raises(ResourceConflict, match="not available"):
-            await peer.executor.invoke(peer.view, name, {})
+            await peer.executor.invoke(peer.view, name, {}, operation_id=uuid4().hex)
     foreign = AppExecutor(host=peer.host, max_pending_calls=2)
     with pytest.raises(ResourceConflict, match="another host"):
-        await foreign.invoke(peer.view, "app_mutate", {"text": "foreign"})
+        await foreign.invoke(peer.view, "app_mutate", {"text": "foreign"}, operation_id=uuid4().hex)
     assert not mcp_http_server.witness
 
 
@@ -224,7 +226,7 @@ async def test_view_close_joins_required_sql_finalization_through_repeated_cance
     peer = app_boundary
     await allow(peer, "app_mutate")
     peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
-    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "before-close"}))
+    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "before-close"}, operation_id=uuid4().hex))
     closing = None
     try:
         await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
@@ -245,7 +247,12 @@ async def test_view_close_joins_required_sql_finalization_through_repeated_cance
             await call
         assert not call.cancelled()
         row = await peer.backend.fetch_one("SELECT result_status, error_class FROM a2a_tool_dispatches")
-        assert tuple(row) == ("error", "ResourceOutcomeUnknown")
+        # The tool returned before closing; its original audit acknowledged
+        # that known effect. Closing still withholds the private result.
+        assert tuple(row) == ("success", None)
+        assert peer.store.dispatch_attempts == peer.store.dispatch_acks == 1
+        assert await peer.host.tool_effect_store.database.fetchone(
+            "SELECT state FROM tool_effect_claims") == ("RETURNED_OK",)
         assert mcp_http_server.witness == ["before-close"]
         assert not peer.view._calls
     finally:
@@ -274,10 +281,15 @@ async def test_timed_out_native_call_after_effects_is_unknown_and_not_replayed(a
         peer.host.hooks_manager.register(RedactOutcomeData())
     peer.connection._call_timeout = 0.05
     mcp_http_server.settings["app_tool_delay"] = 0.2
-    with pytest.raises(ResourceOutcomeUnknown, match="unknown"):
-        await peer.executor.invoke(peer.view, "app_mutate", {"text": "effect-before-timeout"})
+    operation_id = uuid4().hex
+    with pytest.raises(ResourceOutcomeUnknown):
+        await peer.executor.invoke(peer.view, "app_mutate", {"text": "effect-before-timeout"}, operation_id=operation_id)
     assert mcp_http_server.witness == ["effect-before-timeout"]
     await asyncio.wait_for(mcp_http_server.settings["app_reply_recorded"].wait(), 5)
+    assert await peer.host.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await peer.executor.invoke(peer.view, "app_mutate", {"text": "effect-before-timeout"}, operation_id=operation_id)
     requests = [json.loads(body) for _, body in mcp_http_server.requests if body]
     assert sum(message.get("method") == "tools/call" for message in requests) == 1
     row = await peer.backend.fetch_one("SELECT result_status FROM a2a_tool_dispatches")
@@ -314,12 +326,12 @@ async def test_view_catalog_keeps_native_names_and_cannot_be_widened_by_exports(
 async def test_pending_app_calls_are_bounded_before_more_approval_or_execution_work(app_boundary, mcp_http_server):
     peer = app_boundary
     await allow(peer, "app_mutate", PermissionLevel.ASK)
-    calls = [asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": str(index)}))
+    calls = [asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": str(index)}, operation_id=uuid4().hex))
              for index in range(2)]
     try:
         for _ in calls:
             await asyncio.wait_for(peer.approval_requests.get(), 5)
-        excess = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "excess"}))
+        excess = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "excess"}, operation_id=uuid4().hex))
         extra_approval = asyncio.create_task(peer.approval_requests.get())
         try:
             done, _ = await asyncio.wait({excess, extra_approval}, return_when=asyncio.FIRST_COMPLETED)
@@ -345,7 +357,7 @@ async def test_pending_app_calls_are_bounded_before_more_approval_or_execution_w
 async def test_actual_app_caller_cancellation_remains_cancellation(app_boundary, mcp_http_server, revoke_view):
     peer = app_boundary
     await allow(peer, "app_mutate", PermissionLevel.ASK)
-    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "cancelled"}))
+    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "cancelled"}, operation_id=uuid4().hex))
     await asyncio.wait_for(peer.approval_requests.get(), 5)
     if revoke_view:
         peer.view.revoke()
@@ -378,7 +390,7 @@ async def test_view_withdrawal_at_the_owned_result_handoff_withholds_delivery(ap
     try:
         if operation == "tool":
             with pytest.raises(ResourceOutcomeUnknown):
-                await peer.executor.invoke(view, "app_mutate", {"text": "handoff-once"})
+                await peer.executor.invoke(view, "app_mutate", {"text": "handoff-once"}, operation_id=uuid4().hex)
             assert mcp_http_server.witness == ["handoff-once"]
         else:
             with pytest.raises(ResourceConflict):
@@ -404,7 +416,7 @@ async def test_inherited_context_cannot_reuse_an_admitted_app_invocation(app_bou
             return HookOutput.allow()
 
     peer.host.hooks_manager.register(CaptureContext())
-    await peer.executor.invoke(peer.view, "app_mutate", {"text": "original"})
+    await peer.executor.invoke(peer.view, "app_mutate", {"text": "original"}, operation_id=uuid4().hex)
     assert len(captured) == 1
     inherited = asyncio.create_task(tool.tool.execute(text="reused-context"), context=captured[0])
     with pytest.raises(ResourceConflict, match="cannot be reused"):
@@ -427,7 +439,7 @@ async def test_changed_governed_projection_cannot_reveal_the_unmodified_private_
 
     peer.host.hooks_manager.register(RedactBusinessData())
     with pytest.raises(ResourceOutcomeUnknown, match="governed result changed"):
-        await peer.executor.invoke(peer.view, "app_mutate", {"text": "original-private-data"})
+        await peer.executor.invoke(peer.view, "app_mutate", {"text": "original-private-data"}, operation_id=uuid4().hex)
     assert mcp_http_server.witness == ["original-private-data"]
 
 
@@ -462,7 +474,7 @@ async def test_native_app_delivery_requires_completed_post_policy_even_without_p
 
     peer.host.hooks_manager.register(WithholdNativeDelivery())
     with pytest.raises(MCPAppResultWithheld, match="Post-tool policy did not approve"):
-        await peer.executor.invoke(peer.view, "app_mutate", {"text": "effect-before-post-policy"})
+        await peer.executor.invoke(peer.view, "app_mutate", {"text": "effect-before-post-policy"}, operation_id=uuid4().hex)
     assert mcp_http_server.witness == ["effect-before-post-policy"]
     rows = await peer.backend.fetch_all("SELECT session_id, tool_name, result_status FROM a2a_tool_dispatches")
     assert len(rows) == 1 and tuple(rows[0]) == (peer.view.session_id, tool.binding.name, "success")
@@ -489,7 +501,7 @@ async def test_in_process_hook_cannot_bypass_host_completion_by_consuming_the_fa
 
     peer.host.hooks_manager.register(PrematureCompletion())
     with pytest.raises(MCPAppResultWithheld, match="governed result changed"):
-        await peer.executor.invoke(peer.view, "app_mutate", {"text": "host-completion-required"})
+        await peer.executor.invoke(peer.view, "app_mutate", {"text": "host-completion-required"}, operation_id=uuid4().hex)
     assert mcp_http_server.witness == ["host-completion-required"]
     row = await peer.backend.fetch_one("SELECT result_status FROM a2a_tool_dispatches")
     assert row[0] == "success"
@@ -514,7 +526,7 @@ async def test_native_app_result_waits_for_post_policy_then_required_sql(app_bou
             return HookOutput.allow()
 
     peer.host.hooks_manager.register(CompletePostPolicy())
-    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "policy-first"}))
+    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "policy-first"}, operation_id=uuid4().hex))
     try:
         await asyncio.wait_for(policy_started.wait(), 5)
         assert len(policy_results) == 1 and isinstance(policy_results[0], DeferredToolResult)
@@ -549,7 +561,7 @@ async def test_currency_loss_after_native_effect_is_never_reported_as_nothing_ra
         peer.connection._call_timeout = 0.05
         mcp_http_server.settings["app_tool_delay"] = 0.2
     peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
-    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "confirmed-effect"}))
+    call = asyncio.create_task(peer.executor.invoke(peer.view, "app_mutate", {"text": "confirmed-effect"}, operation_id=uuid4().hex))
     try:
         await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
         assert mcp_http_server.witness == ["confirmed-effect"]
@@ -592,15 +604,15 @@ async def test_actual_core_binding_is_usable_through_only_its_public_sdk_contrac
         def is_current(self):
             return self._binding.is_current
 
-        async def invoke(self, arguments, *, session_id, source="external"):
-            return await self._binding.invoke(arguments, session_id=session_id, source=source)
+        async def invoke(self, arguments, *, session_id, operation_id, source="external"):
+            return await self._binding.invoke(arguments, session_id=session_id, operation_id=operation_id, source=source)
 
     registered = [RegisteredAppTool(item.tool, PublicBinding(item.binding)) for item in peer.registered]
     source = next(item for item in registered if item.tool is peer.view.source.tool)
     view = peer.executor.open_view(source, registered, session_id="mcp-app:public-sdk-only",
         owner_is_current=lambda: peer.owner_current[0])
     try:
-        result = await peer.executor.invoke(view, "app_mutate", {"text": "public-contract"})
+        result = await peer.executor.invoke(view, "app_mutate", {"text": "public-contract"}, operation_id=uuid4().hex)
         assert result.structured_content == {"text": "public-contract"}
         assert mcp_http_server.witness == ["public-contract"]
         row = await peer.backend.fetch_one("SELECT session_id, result_status FROM a2a_tool_dispatches")
@@ -665,7 +677,7 @@ async def test_invalid_view_configuration_is_refused_before_native_io(app_bounda
         with pytest.raises(error, match=message):
             peer.executor.open_view(**(original | changes))
     with pytest.raises(TypeError, match="arguments must be an object"):
-        await peer.executor.invoke(peer.view, "app_mutate", [])
+        await peer.executor.invoke(peer.view, "app_mutate", [], operation_id=uuid4().hex)
     assert not mcp_http_server.witness
     assert peer.approval_requests.empty()
     assert mcp_http_server.settings.get("resource_reads", []) == []
@@ -701,7 +713,7 @@ async def test_physical_delivery_retains_native_result_until_original_transport_
 
     async def delivery():
         # The real governed call and SQL finish before transport owns the data.
-        result = await peer.executor.invoke(peer.view, "app_mutate", {"text": "private-delivery"})
+        result = await peer.executor.invoke(peer.view, "app_mutate", {"text": "private-delivery"}, operation_id=uuid4().hex)
         assert result.meta["private-result"] == {"view": "only"}
         async with peer.view.borrow_delivery() as current:
             guards.append(current)
@@ -892,7 +904,7 @@ async def test_live_view_authority_is_checked_after_each_native_intermediate(
     mcp_http_server.mcp.middleware.append(defer)
     with pytest.raises(ResourceOutcomeUnknown):
         if kind == 'tool':
-            await b.executor.invoke(b.view, 'app_mutate', {'text': 'same-approved-call'})
+            await b.executor.invoke(b.view, 'app_mutate', {'text': 'same-approved-call'}, operation_id=uuid4().hex)
         else:
             await b.view.read_resource('ui://status/view.html', max_html_bytes=4096)
     assert len(rounds) == expire_after
@@ -904,3 +916,34 @@ async def test_live_view_authority_is_checked_after_each_native_intermediate(
     assert len(rows) == (1 if kind == 'tool' else 0)
     if rows:
         assert rows[0][0] == 'error'
+
+
+@pytest.mark.asyncio
+async def test_original_app_intent_cannot_be_replayed_after_a_confirmed_native_effect(app_boundary, mcp_http_server):
+    peer = app_boundary
+    await allow(peer, 'app_mutate')
+    operation_id = uuid4().hex
+    result = await peer.executor.invoke(peer.view, 'app_mutate', {'text': 'original-confirmed-effect'},
+        operation_id=operation_id)
+    assert not result.is_error
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await peer.executor.invoke(peer.view, 'app_mutate', {'text': 'original-confirmed-effect'},
+            operation_id=operation_id)
+    assert mcp_http_server.witness == ['original-confirmed-effect']
+    requests = [json.loads(body) for _, body in mcp_http_server.requests if body]
+    assert sum(message.get('method') == 'tools/call' for message in requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_known_native_app_argument_rejection_retains_a_definite_error(app_boundary, mcp_http_server):
+    peer = app_boundary
+    await allow(peer, 'app_mutate')
+    mcp_http_server.settings['reject_call'] = True
+    with pytest.raises(ResourceConflict, match='rejected before tool execution'):
+        await peer.executor.invoke(peer.view, 'app_mutate', {'text': 'must-not-execute'},
+            operation_id=uuid4().hex)
+    assert mcp_http_server.witness == []
+    assert await peer.host.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('RETURNED_ERROR',)
+    assert await peer.host.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_operations') == ('CLOSED',)

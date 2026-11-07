@@ -25,6 +25,7 @@ from mcp import types
 
 from kestrel_sdk.tools.result import ToolResult
 from .connection import MCPCallOutcomeUnknownError, MCP_CONNECTION_ERRORS
+from .oauth_grants import OAuthGrantChanged
 from .tool_contract import validate_tool_contract
 
 if TYPE_CHECKING:
@@ -134,6 +135,7 @@ class MCPToolWrapper:
         the ``ToolResult.failed`` *classmethod* (always truthy) and record every
         call as an error. (Caught by the #1979 DB-grounded dogfood.)
         """
+        invocation = None
         try:
             invocation = self.app_executor.admit(self) if self.app_executor is not None else None
             if invocation is None and not self.schema.model_visible:
@@ -142,17 +144,23 @@ class MCPToolWrapper:
                 ).to_dict()
             options = {} if invocation is None else {"require_authority": invocation.view.require_current}
             result = await self._caller(self._real_name, kwargs, **options)
+        except OAuthGrantChanged as error:
+            if invocation is not None:
+                self.app_executor.capture_refusal(invocation, error)
+            raise
         except MCPCallOutcomeUnknownError as error:
             logger.error("MCP tool %r has an unconfirmed outcome (%s)", self._real_name,
                 type(error.__cause__).__name__)
-            return ToolResult.failed(
-                str(error), data={"mcp_tool": self._real_name, "execution_outcome": "unknown"},
-            ).to_dict()
+            # The host must settle its admitted effect before any model-visible
+            # error projection. Preserve the SDK outcome type and native cause.
+            raise
         except (ExceptionGroup, ValueError, *MCP_CONNECTION_ERRORS) as e:
             if isinstance(e, ExceptionGroup):
                 _, unexpected = e.split((*MCP_CONNECTION_ERRORS, ValueError))
                 if unexpected is not None:
                     raise
+            if invocation is not None:
+                self.app_executor.capture_refusal(invocation, e)
             logger.error(
                 "MCP tool '%s' execution failed: %s", self._real_name, e, exc_info=True
             )

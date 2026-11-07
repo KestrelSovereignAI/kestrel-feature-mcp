@@ -91,7 +91,7 @@ three-vendor OAuth acceptance experiment in
 Remote write scopes remain gated on
 [#596](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/596).
 
-## Optional OAuth connectors (0.13)
+## Optional OAuth connectors (0.14)
 
 OAuth is disabled by default and requires the [supported host contract](#runtime-requirements). Configure the
 Console's public HTTPS origin in Core with
@@ -442,18 +442,28 @@ An unfinished close retains its original owner and is retried before re-enable.
 Version 0.8.0 introduced the native components described below; 0.9.0 added
 completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
-Version 0.13.0 requires Core 0.62.2 or newer for the native Apps, OAuth and
-unconfirmed tool outcome contracts. The test profile uses the same minimum.
+Version 0.14.0 requires Core 0.64.0 or newer and SDK 0.51.2 or newer for native
+Apps, OAuth and durable tool outcome contracts. The test profile uses the same
+minimums. Until that host release is public, `uv sync --locked --extra test`
+uses the exact Git commit declared for the test extra in `pyproject.toml`.
+The feature's runtime dependencies use the public package index.
 Initial publication and result associations are detailed below.
 An unsupported host is refused before connecting or saving enablement.
+The host must declare `supports_durable_tool_effects` as exactly `True`.
+Every App tool call carries an `operation_id` for its original intent: a
+redelivery retains that ID, while a new user action receives a fresh ID.
+The host records durable admission before dispatch. An unconfirmed outcome
+requires reconciliation; neither a reconnect nor a repeated delivery may
+silently dispatch the same effect again.
 When a server rejects a call with `HeaderMismatch`, Kestrel retires the original
 catalog. Reload the connection to discover and admit the new contract before
 calling again. The [transport specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#client-behavior)
 recommends refreshing and retrying; Kestrel requires that recovery to pass through
 fresh host admission instead of resending under the previous approval.
-The App execution component conservatively treats a call admitted without a
-complete governed native result as unconfirmed, including native pre-execution
-errors. Consumers must not turn that uncertainty into an automatic retry.
+The App execution component preserves known native refusals before an effect
+starts, including withdrawal of the original OAuth grant. After native
+admission, a missing complete governed result is unconfirmed. Consumers must
+not turn that uncertainty into an automatic retry.
 Construct the App executor with its actual host, for example
 `AppExecutor(host=agent, max_pending_calls=configured_limit)`. The host must
 declare `supports_deferred_tool_results` as exactly `True`. App results use the SDK's deferred delivery contract: completed,

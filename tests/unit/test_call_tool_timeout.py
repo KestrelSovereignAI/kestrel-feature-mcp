@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 from kestrel_feature_mcp.connection import MCPConnection, MCPCallOutcomeUnknownError
 from kestrel_feature_mcp.manager import MCPGatewayManager, MCPToolManager
@@ -31,6 +32,7 @@ async def test_call_timeout_uses_the_real_connection(kind, mcp_http_server):
             call = manager.call_tool("echo", {"text": "slow"})
         with pytest.raises(MCPCallOutcomeUnknownError, match="execution outcome is unknown") as caught:
             await call
+        assert isinstance(caught.value, ResourceOutcomeUnknown), 'Native MCP unknown outcome must honor the public SDK contract'
         assert isinstance(caught.value.__cause__, TimeoutError)
         assert connection.is_connected
     finally:

@@ -65,9 +65,9 @@ async def test_core_chat_renders_native_apps_and_retires_their_original_views(
         async with asyncio.timeout(5):
             while b.feature._apps_host._views:
                 await asyncio.sleep(0.01)
-        assert mcp_http_server.witness == ["initial-once", "browser-app-once"]
+        assert mcp_http_server.witness == ["initial-once", "browser-app-once", "browser-app-once"]
         rows = await b.backend.fetch_all("SELECT session_id,result_status FROM a2a_tool_dispatches")
-        assert [tuple(row) for row in rows] == [("original-chat", "success"), ("original-chat", "success")]
+        assert [tuple(row) for row in rows] == [("original-chat", "success")] * 3
     finally:
         server.should_exit = True
         await asyncio.wait_for(task, 5)

@@ -8,6 +8,8 @@ import asyncio
 from contextlib import AsyncExitStack
 import time
 from types import SimpleNamespace
+from pathlib import Path
+from uuid import uuid4
 
 from fastapi import FastAPI, Request
 import httpx2
@@ -18,13 +20,14 @@ from kestrel_sovereign import server
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
 from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import FeatureEnablementStore
 from kestrel_sovereign.auth import caller_context_scope
+from kestrel_sovereign.agent.invocation import bind_async_invocation
+from kestrel_sovereign.tools.effect_invocation import journal_async_invocation
+from kestrel_sovereign.api_errors import register_api_error_handlers, tool_effect_api_error
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 from kestrel_sovereign.endpoints.auth_oauth import _create_jwt
-from kestrel_sovereign.features.privacy import PrivacyAgent
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
-from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import ToolCall
 from kestrel_sovereign.mcp_oauth import MCPOAuthAction, MCPOAuthHostPolicy
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
@@ -33,7 +36,6 @@ from kestrel_sovereign.security.request_auth import (
     AuthenticatedSessionMiddleware, InteractiveAuthenticationLifetimeMiddleware, RequestAuthenticationService,
 )
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sdk.security.outbound import assert_safe_url
 
 from kestrel_feature_mcp.connection import bind_tool_caller
@@ -41,14 +43,14 @@ from kestrel_feature_mcp.feature import MCPAgent
 from kestrel_feature_mcp.oauth_credentials import OAuthConnectionCredential
 from kestrel_feature_mcp.oauth_grants import OAuthGrantBinding, OAuthGrantChanged, OAuthGrantStore, OAuthGrantTokens
 from tests.unit.test_oauth_grants import install_grant
-from tests.unit.test_oauth_acceptance_http import oauth_peers
+from tests.unit.test_oauth_acceptance_http import oauth_peers as oauth_peers
 
 pytestmark = [pytest.mark.parametrize('mcp_http_server', [{'tls': True, 'oauth': {}}], indirect=True),
     pytest.mark.parametrize('oauth_peers', [{'web_identity': True, 'refresh': True}], indirect=True)]
 
 
 @pytest.fixture
-async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_key):
+async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_key, native_tool_effect_agent):
     key, alice = 'owned-credential-operator-key', 'alice@credential.test'
     monkeypatch.setenv('KESTREL_API_KEY', key)
     monkeypatch.setenv('JWT_SECRET_KEY', 'owned-credential-jwt-signing-key-with-entropy')
@@ -57,20 +59,15 @@ async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_ke
     monkeypatch.setenv('KESTREL_HOME', str(tmp_path))
     monkeypatch.setenv('AWS_EC2_METADATA_DISABLED', 'true')
     async with AsyncExitStack() as owned:
-        agent = KestrelAgent(did='did:test:credential-owner', storage_path=str(tmp_path / 'agent.db'),
-            allowed_features=set(), sync_enabled=False, llm_service=LLMService(agent_data_dir=tmp_path))
-        owned.push_async_callback(agent.llm_service.close)
-        path = tmp_path / 'native-credentials.db'
-        agent._raw_storage = AsyncStorage(str(path), agent_id=agent.did,
-            semantic_capabilities=agent.semantic_capabilities)
-        owned.push_async_callback(agent._raw_storage.close)
-        await agent._raw_storage.initialize()
+        agent = await native_tool_effect_agent(did='did:test:credential-owner')
         database = agent._raw_storage.db.backend
-        agent.privacy_agent = PrivacyAgent(agent._raw_storage, agent.privacy_mode)
-        agent.observability_store = ObservabilityStore(database)
+        path = Path(database.db_path)
+        agent.observability_store = ObservabilityStore(database, owns_backend=False)
         await agent.observability_store.initialize()
-        agent._feature_enablement_store = FeatureEnablementStore(database)
+        owned.push_async_callback(agent.observability_store.close)
+        agent._feature_enablement_store = FeatureEnablementStore(database, owns_backend=False)
         await agent._feature_enablement_store.initialize()
+        owned.push_async_callback(agent._feature_enablement_store.close)
         permissions = PermissionStore(str(tmp_path / 'permissions.db'))
         await permissions.initialize()
         requests = asyncio.Queue()
@@ -90,6 +87,7 @@ async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_ke
             withdrawals=[], callers=[], permissions=permissions, approvals=queue,
             approval_requests=requests, key=key, alice=alice, peer=oauth_peers)
         app = FastAPI()
+        register_api_error_handlers(app)
         b.app = app
         app.state.agent = agent
         app.state.mcp_oauth_policy = MCPOAuthHostPolicy(console_origin='https://console.example')
@@ -139,27 +137,35 @@ async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_ke
                 await b.credential.admit(force_refresh=True)
                 return {'refreshed': True}
 
+        @bind_async_invocation('invocation_id', track_request_lifecycle=True)
+        @journal_async_invocation
+        async def governed_dispatch(agent, user_input, *, invocation_id, caller, inline):
+            if inline:
+                executor = agent._make_inline_tool_executor('credential-chat')
+                effective_args, result = await executor(b.handle, {'text': user_input})
+                await agent._append_executed_tool_breadcrumbs([], [{
+                    'id': 'owned-native-inline-call', 'name': b.handle,
+                    'arguments': effective_args, 'result': result,
+                }], session_id='credential-chat')
+                return result
+            return await agent._dispatch_tool_call(
+                ToolCall(id='owned-native-tool-call', name=b.handle, arguments={'text': user_input}),
+                {}, {b.handle}, [], 0, 'Owned synthetic MCP call',
+                session_id='credential-chat', source='model')
+
         @app.post('/api/owned-credential-call')
         async def call(request: Request):
             with service.bind(request) as authentication, caller_context_scope(authentication.caller):
                 try:
                     b.callers.append(authentication.caller)
-                    if request.query_params.get('mode') == 'inline':
-                        executor = agent._make_inline_tool_executor('credential-chat')
-                        effective_args, result = await executor(b.handle, {'text': 'owned-effect'})
-                        await agent._append_executed_tool_breadcrumbs([], [{
-                            'id': 'owned-native-inline-call', 'name': b.handle,
-                            'arguments': effective_args, 'result': result,
-                        }], session_id='credential-chat')
-                        return result
-                    return await agent._dispatch_tool_call(
-                        ToolCall(id='owned-native-tool-call', name=b.handle, arguments={'text': 'owned-effect'}),
-                        {}, {b.handle}, [], 0, 'Owned synthetic MCP call',
-                        session_id='credential-chat', source='model')
+                    return await governed_dispatch(agent, 'owned-effect', invocation_id=uuid4().hex,
+                        caller=authentication.caller, inline=request.query_params.get('mode') == 'inline')
                 except HostCapabilityAccessDenied:
                     return JSONResponse({'error': 'original_principal_required'}, status_code=403)
                 except OAuthGrantChanged:
                     return JSONResponse({'error': 'original_revision_changed'}, status_code=409)
+                except ResourceOutcomeUnknown as error:
+                    raise tool_effect_api_error(error)
         b.client = await owned.enter_async_context(httpx2.AsyncClient(
             transport=httpx2.ASGITransport(app=app), base_url='https://console.example',
             headers={'X-API-Key': key}))
@@ -239,6 +245,10 @@ async def test_another_native_database_owner_revocation_blocks_before_dispatch(c
     assert result.status_code in {200, 409}, result.text
     assert b.peer.resource.witness == []
     assert b.withdrawals == ['reauthorization_required']
+    assert await b.agent.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('RETURNED_ERROR',)
+    assert await b.agent.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_operations') == ('CLOSED',)
 
 
 async def test_native_permission_deny_prevents_resource_dispatch_and_refresh(credential_boundary):

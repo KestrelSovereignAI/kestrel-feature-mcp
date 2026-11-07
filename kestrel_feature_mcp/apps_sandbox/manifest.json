@@ -21,7 +21,7 @@
     "src/oauth-panel.js": "24dec056217773a985e413b95602394239eb04e0c37296ec9d95d39eac1442f8",
     "src/origin-transport.js": "7df4d94e870edd9a73ba34f5ce0773e07709aa6809a4111c6534eccb7f459689",
     "src/parent-entry.js": "99baa8d1679c944d345915893db6993da9186265d6a4841c7cde73fa4a89bee6",
-    "src/parent-view.js": "39929b1a5c4d68d3cc2c150a4c155c01486a6c5e006cd75b4b3c6b0d260f8887",
+    "src/parent-view.js": "4905eb049c1e46bfedb1726f0a22590c3bc8d417c73e78f18b271d663a4a7c13",
     "src/sandbox-assets.js": "cccb90507dea3bf93a3b0754b81878ee57c90db3e32a159d30d37e9313cefd1c",
     "src/sandbox-cli.js": "fd5040123976a121a34a8e8349f8d8ddb8f33cb942992da81156488058f46050",
     "src/sandbox-config.js": "05cb572ecdd4675f089279a77dd6b8abd038c6bb5ec4143b03fa34bc8c03040d",
@@ -196,7 +196,7 @@
     "src/oauth-panel.js": "24dec056217773a985e413b95602394239eb04e0c37296ec9d95d39eac1442f8",
     "src/origin-transport.js": "7df4d94e870edd9a73ba34f5ce0773e07709aa6809a4111c6534eccb7f459689",
     "src/parent-entry.js": "99baa8d1679c944d345915893db6993da9186265d6a4841c7cde73fa4a89bee6",
-    "src/parent-view.js": "39929b1a5c4d68d3cc2c150a4c155c01486a6c5e006cd75b4b3c6b0d260f8887",
+    "src/parent-view.js": "4905eb049c1e46bfedb1726f0a22590c3bc8d417c73e78f18b271d663a4a7c13",
     "src/sandbox-assets.js": "cccb90507dea3bf93a3b0754b81878ee57c90db3e32a159d30d37e9313cefd1c",
     "src/sandbox-cli.js": "fd5040123976a121a34a8e8349f8d8ddb8f33cb942992da81156488058f46050",
     "src/sandbox-config.js": "05cb572ecdd4675f089279a77dd6b8abd038c6bb5ec4143b03fa34bc8c03040d",
@@ -356,7 +356,7 @@
   "assets": {
     "oauth-panel.css": "f927cdfefa34ff25d936603370e04d99cc019357949dd5600befbee450d692c5",
     "oauth-panel.js": "699d27d30c927591fe50c4c576951cfd110b1f0828249c657c88465d687fc1c5",
-    "parent-entry.js": "6ff93d0af01b7f7fdd0d09a6a040354dbbcad417dca916fb5ee5a72f8a94934c",
+    "parent-entry.js": "5cccc54f1ebb2dad9efe3cb0ad37f0025a4f6009ee277e6ac8ec441fb253a729",
     "sandbox-entry.js": "9d10d2cc095a19b63e907f5e73871fb9d18e12809bc23e1742842778ec40fcf1",
     "sandbox-service.mjs": "41e0a24d9c0e38bb1e7478f4fdaab260fcdbafa6365441896e3ef2af824498b8",
     "THIRD_PARTY_NOTICES.txt": "5176f1d103deea45d829e91f31e0d683425bd7eee067c37c135130f20829863f"

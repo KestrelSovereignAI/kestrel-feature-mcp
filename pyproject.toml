@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-mcp"
-version = "0.13.0"
+version = "0.14.0"
 description = "Model Context Protocol (MCP) server management for Kestrel Sovereign agents"
 readme = "README.md"
 license = "Apache-2.0"
@@ -8,7 +8,7 @@ requires-python = ">=3.11,<3.15"
 dependencies = [
     # Public native cancellation checkpoint for original cleanup owners.
     "anyio>=4.7,<5",
-    "kestrel-sovereign-sdk[crypto,httpx2]>=0.48.0,<1",
+    "kestrel-sovereign-sdk[crypto,httpx2]>=0.51.2,<1",
     "Authlib>=1.9.4,<2",
     "docker>=7.1.0",
     "requests>=2.34.2",
@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "kestrel-sovereign>=0.62.2,<1",
+    "kestrel-sovereign>=0.64.0,<1",
     "packaging",
     "pytest>=8.0.0",
     "pytest-asyncio>=1.4.0",
@@ -39,6 +39,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+# Test-only bootstrap until the host's matching public release is available.
+# Runtime dependencies remain normal public-index requirements.
+[tool.uv.sources]
+kestrel-sovereign = [
+    { git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git", rev = "50a893cd227af05a66e14506c659b2a2a4780ccd", extra = "test" },
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["kestrel_feature_mcp"]

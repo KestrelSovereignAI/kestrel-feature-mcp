@@ -1,15 +1,27 @@
 """Full native agent boot discovers OAuth and retains its original storage owner."""
 import asyncio
 import socket
+import traceback
+import aiosqlite
 import pytest
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 @pytest.mark.timeout(60)
 async def test_native_full_boot_loads_actual_oauth_feature_and_resolves_original_storage(tmp_path, monkeypatch, owned_oauth_key):
+    connections = []
+    native_connect = aiosqlite.connect
+
+    def observe_connection(*args, **kwargs):
+        connection = native_connect(*args, **kwargs)
+        connections.append((connection, ''.join(traceback.format_stack(limit=10))))
+        return connection
+
+    monkeypatch.setattr(aiosqlite, 'connect', observe_connection)
     network_attempts = []
     def refuse_network(*args, **kwargs):
         network_attempts.append(True)
@@ -41,6 +53,16 @@ async def test_native_full_boot_loads_actual_oauth_feature_and_resolves_original
         assert not host.retired and not feature._oauth_maintenance.done()
         assert feature.get_router() is not None
     finally:
-        await asyncio.wait_for(agent.shutdown(), 30)
+        await asyncio.wait_for(shutdown_fixture_agent(agent), 30)
         await service.close()
+    unretired = [(connection, stack) for connection, stack in connections if connection._thread.is_alive()]
+    try:
+        assert not unretired, 'Native boot left SQLite workers unretired:\n' + '\n'.join(
+            connection._thread.name + '\n' + stack for connection, stack in unretired)
+    finally:
+        # Failing lifecycle assertions still physically retire this fixture's
+        # owned connections; cleanup cannot make the assertion pass.
+        for connection, _ in unretired:
+            await connection.close()
+            connection._thread.join(timeout=2)
     assert network_attempts == []

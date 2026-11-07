@@ -250,6 +250,10 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
             raise MCPHostCapabilityError(
                 "MCP execution requires host support for unconfirmed tool outcomes (Core 0.62.2 or newer)",
             )
+        if getattr(self.agent, "supports_durable_tool_effects", None) is not True:
+            raise MCPHostCapabilityError(
+                "MCP execution requires the host's durable tool-effect journal and explicit intent binding (Core 0.64.0 or newer)",
+            )
 
     def _mount_tools(self, owner: str, handle_prefix: str, tool_dicts, caller) -> int:
         """Mount a set of MCP tools into the host registry under ``owner``.
