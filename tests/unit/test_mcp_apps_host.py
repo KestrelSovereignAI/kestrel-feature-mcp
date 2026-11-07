@@ -22,7 +22,7 @@ from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
 from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.testing.fixtures import native_tool_effect_agent
+from kestrel_sovereign.testing.fixtures import native_tool_effect_agent as native_tool_effect_agent
 from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
 from kestrel_sovereign.security.request_auth import (
     AuthenticatedSessionMiddleware, InteractiveAuthenticationLifetimeMiddleware, RequestAuthenticationService,

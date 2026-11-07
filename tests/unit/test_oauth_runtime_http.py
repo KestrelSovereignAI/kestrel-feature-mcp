@@ -644,10 +644,11 @@ async def test_real_core_authority_loss_after_a_continuation_never_refreshes_or_
         and json.loads(body).get('method') == 'tools/call']
     assert len(calls) == 2 and len({c['id'] for c in calls}) == 2
     assert b.peer.requests.count(('POST', '/token')) == 1
-    # The original unknown carrier reaches HTTP without becoming a returned
-    # tool-error dictionary. Its durable receipt is the UNCONFIRMED claim
-    # above; there is no ordinary returned-result observability row.
-    assert await b.host.database.fetch_all('SELECT * FROM a2a_tool_dispatches') == []
+    # The original uncertainty reaches HTTP without becoming a model result.
+    # Its UNCONFIRMED claim and one required error audit both survive delivery.
+    rows = await b.host.database.fetch_all(
+        'SELECT result_status, error_class FROM a2a_tool_dispatches')
+    assert [tuple(row) for row in rows] == [('error', 'ResourceOutcomeUnknown')]
     snapshot = await credential.store.read_slot(credential.principal_id, name)
     assert snapshot.state == 'active'
     if loss == 'expiry':

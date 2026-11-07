@@ -21,7 +21,7 @@ from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-from kestrel_sovereign.testing.fixtures import native_tool_effect_agent
+from kestrel_sovereign.testing.fixtures import native_tool_effect_agent as native_tool_effect_agent
 from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
 
 from kestrel_feature_mcp.apps_execution import AppExecutor, MCPAppResultWithheld, RegisteredAppTool
@@ -38,10 +38,13 @@ class SchedulingStore(ObservabilityStore):
         return await super().log_tool_call(*args, **kwargs)
 
     async def log_tool_dispatch(self, entry, *, required=False):
+        self.dispatch_attempts += 1
         if self.dispatch_started is not None:
             self.dispatch_started.set()
             await self.release_dispatch.wait()
-        return await super().log_tool_dispatch(entry, required=required)
+        result = await super().log_tool_dispatch(entry, required=required)
+        self.dispatch_acks += 1
+        return result
 
 
 @dataclass
@@ -74,6 +77,8 @@ async def app_boundary(mcp_http_server, tmp_path, initial_publisher, app_executo
         await backend.connect()
         store = SchedulingStore(backend)
         store.admitted_sources = []
+        store.dispatch_attempts = 0
+        store.dispatch_acks = 0
         await store.initialize()
         cleanup.push_async_callback(store.close)
         host = await native_tool_effect_agent(did='did:test:registry-catalog')
@@ -242,7 +247,12 @@ async def test_view_close_joins_required_sql_finalization_through_repeated_cance
             await call
         assert not call.cancelled()
         row = await peer.backend.fetch_one("SELECT result_status, error_class FROM a2a_tool_dispatches")
-        assert tuple(row) == ("error", "ResourceOutcomeUnknown")
+        # The tool returned before closing; its original audit acknowledged
+        # that known effect. Closing still withholds the private result.
+        assert tuple(row) == ("success", None)
+        assert peer.store.dispatch_attempts == peer.store.dispatch_acks == 1
+        assert await peer.host.tool_effect_store.database.fetchone(
+            "SELECT state FROM tool_effect_claims") == ("RETURNED_OK",)
         assert mcp_http_server.witness == ["before-close"]
         assert not peer.view._calls
     finally:

@@ -43,7 +43,7 @@ from kestrel_feature_mcp.feature import MCPAgent
 from kestrel_feature_mcp.oauth_credentials import OAuthConnectionCredential
 from kestrel_feature_mcp.oauth_grants import OAuthGrantBinding, OAuthGrantChanged, OAuthGrantStore, OAuthGrantTokens
 from tests.unit.test_oauth_grants import install_grant
-from tests.unit.test_oauth_acceptance_http import oauth_peers
+from tests.unit.test_oauth_acceptance_http import oauth_peers as oauth_peers
 
 pytestmark = [pytest.mark.parametrize('mcp_http_server', [{'tls': True, 'oauth': {}}], indirect=True),
     pytest.mark.parametrize('oauth_peers', [{'web_identity': True, 'refresh': True}], indirect=True)]
