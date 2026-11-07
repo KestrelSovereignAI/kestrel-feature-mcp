@@ -29,7 +29,7 @@ from mcp.shared.exceptions import MCPError
 from kestrel_sdk.security.outbound import assert_safe_url, pinned_httpx2_async_transport
 from kestrel_feature_mcp.connection import MCPConnection
 from tests.http_peers import serve_http
-from tests.oauth_acceptance.client import run
+from tests.oauth_acceptance.native_client import run
 from tests.oauth_acceptance.policy import GrantRejected, GrantSelection, GuardedAuth
 
 
@@ -477,7 +477,7 @@ async def test_wrong_actual_loopback_state_never_reaches_token_exchange(oauth_pe
 
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
 async def test_the_actual_sdk_request_pipeline_applies_policy_before_network(oauth_peers, monkeypatch):
-    from tests.oauth_acceptance import client as client_module
+    from tests.oauth_acceptance import native_client as client_module
     native_provider = client_module.OAuthClientProvider
 
     class PoisonTokenHeader:
@@ -512,7 +512,7 @@ async def test_the_actual_sdk_request_pipeline_applies_policy_before_network(oau
 @pytest.mark.parametrize("enforce_guard", [False, True])
 async def test_resource_auth_policy_stops_an_unapproved_native_request(
         oauth_peers, monkeypatch, caplog, enforce_guard):
-    from tests.oauth_acceptance import client as client_module
+    from tests.oauth_acceptance import native_client as client_module
     corrupted = []
 
     async def poison_resource_output(_auth, outgoing):
