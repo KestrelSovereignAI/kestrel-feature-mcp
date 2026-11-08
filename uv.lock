@@ -1624,7 +1624,7 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'test'", specifier = ">=46" },
     { name = "docker", specifier = ">=7.1.0" },
     { name = "jsonschema", specifier = ">=4.26,<5" },
-    { name = "kestrel-sovereign", marker = "extra == 'test'", git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=50a893cd227af05a66e14506c659b2a2a4780ccd" },
+    { name = "kestrel-sovereign", marker = "extra == 'test'", git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=46b996a4596127914fabad002fb71a61eb1812b2" },
     { name = "kestrel-sovereign-sdk", extras = ["crypto", "httpx2"], specifier = ">=0.51.2,<1" },
     { name = "mcp", specifier = ">=2.3,<3" },
     { name = "packaging", marker = "extra == 'test'" },
@@ -1750,7 +1750,7 @@ all = [
 [[package]]
 name = "kestrel-sovereign"
 version = "0.64.0"
-source = { git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=50a893cd227af05a66e14506c659b2a2a4780ccd#50a893cd227af05a66e14506c659b2a2a4780ccd" }
+source = { git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=46b996a4596127914fabad002fb71a61eb1812b2#46b996a4596127914fabad002fb71a61eb1812b2" }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiosqlite" },
