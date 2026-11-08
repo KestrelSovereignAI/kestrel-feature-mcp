@@ -314,7 +314,9 @@ Managed container and gateway HTTP connections also ignore environment proxies,
 including for gateway bearer headers.
 Tool discovery follows pagination and fails on repeated cursors. Negotiation
 uses the connection deadline, then discovery uses the whole-call deadline.
-Cancelled startup joins its transport owner before returning. Shutdown has its
+Cancelled startup waits on its original transport owner within the shutdown
+budget. A later caller cancellation or outer timeout retains the original
+startup deadline in its explicit cause/group evidence. Shutdown has its
 own graceful deadline (`KESTREL_MCP_CLOSE_TIMEOUT`, default 15 seconds), including
 session termination and partially completed SDK entry. Forced cleanup gets one
 further budget of the same length. The owner timer survives caller cancellation;
