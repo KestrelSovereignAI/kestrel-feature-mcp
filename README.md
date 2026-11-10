@@ -444,7 +444,7 @@ An unfinished close retains its original owner and is retried before re-enable.
 Version 0.8.0 introduced the native components described below; 0.9.0 added
 completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
-Version 0.14.0 requires Core 0.64.0 or newer and SDK 0.51.2 or newer for native
+Version 0.14.1 requires Core 0.64.0 or newer and SDK 0.51.2 or newer for native
 Apps, OAuth and durable tool outcome contracts. The test profile uses the same
 minimums. Until that host release is public, `uv sync --locked --extra test`
 uses the exact Git commit declared for the test extra in `pyproject.toml`.

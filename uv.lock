@@ -298,15 +298,15 @@ wheels = [
 
 [[package]]
 name = "authlib"
-version = "1.9.4"
+version = "1.9.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "joserfc" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b6/1c/4ed575b9e44da3f5ea2c325f50bb3b2016312efffc2b6a62eaf46845bb52/authlib-1.9.4.tar.gz", hash = "sha256:f55a25f561f1f157ceca64da9df776f469f23715ac89ee338aa2f83dc9774e13", size = 183479, upload-time = "2026-11-04T09:00:05.532Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/04/96/6e7ed72bb49762a9b65d51c4cb235d793f0485cd8d6f7e9404ce955a4808/authlib-1.9.5.tar.gz", hash = "sha256:3f031d5e9b6486089e91e8f7f1b68f36275f3151c66460d650fc90d420545fd7", size = 183564, upload-time = "2026-11-05T16:13:18.409Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7b/f4/a13df57945062943b4240007b921fe318623da709a7db68b7f944e857333/authlib-1.9.4-py2.py3-none-any.whl", hash = "sha256:1b092ea87ba11cf3bd06d38ec993d82bc6255995fcd85ee436cbbba1d050b2fc", size = 266875, upload-time = "2026-11-04T09:00:03.573Z" },
+    { url = "https://files.pythonhosted.org/packages/58/d7/d384e7a639dd1d018767ba0fe39601b61cded066bb7af38db31ec998252d/authlib-1.9.5-py2.py3-none-any.whl", hash = "sha256:e32a63e3d869196b61816b2602231862179a2ffc29358c009d1f022c8b86a8b2", size = 267074, upload-time = "2026-11-05T16:13:16.766Z" },
 ]
 
 [[package]]
@@ -1594,7 +1594,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-mcp"
-version = "0.14.0"
+version = "0.14.1"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -1624,7 +1624,7 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'test'", specifier = ">=46" },
     { name = "docker", specifier = ">=7.1.0" },
     { name = "jsonschema", specifier = ">=4.26,<5" },
-    { name = "kestrel-sovereign", marker = "extra == 'test'", git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=50a893cd227af05a66e14506c659b2a2a4780ccd" },
+    { name = "kestrel-sovereign", marker = "extra == 'test'", specifier = ">=0.64.0,<1" },
     { name = "kestrel-sovereign-sdk", extras = ["crypto", "httpx2"], specifier = ">=0.51.2,<1" },
     { name = "mcp", specifier = ">=2.3,<3" },
     { name = "packaging", marker = "extra == 'test'" },
@@ -1750,7 +1750,7 @@ all = [
 [[package]]
 name = "kestrel-sovereign"
 version = "0.64.0"
-source = { git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=50a893cd227af05a66e14506c659b2a2a4780ccd#50a893cd227af05a66e14506c659b2a2a4780ccd" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiosqlite" },
@@ -1818,6 +1818,10 @@ dependencies = [
     { name = "tzdata", marker = "sys_platform == 'win32'" },
     { name = "urllib3" },
     { name = "uvicorn" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c4/2b/4d77ad093723eab36407ba6fb870efb4f6a7d70b2cdecf1a2ed58e3211c4/kestrel_sovereign-0.64.0.tar.gz", hash = "sha256:24d17f3a92a1b3f1027d8dc1b42d7953a4c9fb3cb0f9acdba0a9061714d30bd7", size = 6855086, upload-time = "2026-11-09T08:23:16.595Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ac/a1/5a0a68e8a0ec51972b5ba2278377c224213413655a420576641c77b255b4/kestrel_sovereign-0.64.0-py3-none-any.whl", hash = "sha256:b52af78ace7c12d180beffcb31d64c8188b15fe361da7a94c8c2480c8104a129", size = 7488332, upload-time = "2026-11-09T08:23:13.56Z" },
 ]
 
 [[package]]

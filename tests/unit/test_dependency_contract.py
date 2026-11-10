@@ -54,23 +54,9 @@ def test_host_tests_require_native_apps_oauth_and_unconfirmed_outcomes():
     packages = {item["name"]: item for item in tomllib.loads(
         (ROOT / "uv.lock").read_text())["package"]}
     assert Version(packages["kestrel-sovereign"]["version"]) >= floor
-    from urllib.parse import parse_qs, urlsplit
-    import re
-
-    sources = metadata["tool"]["uv"]["sources"]
-    assert set(sources) == {"kestrel-sovereign"}
-    declared, = sources["kestrel-sovereign"]
-    assert set(declared) == {"git", "rev", "extra"}
-    assert declared["git"] == "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
-    assert declared["extra"] == "test"
-    assert re.fullmatch(r"[0-9a-f]{40}", declared["rev"])
+    assert metadata.get("tool", {}).get("uv", {}).get("sources", {}) == {}
     assert all(Requirement(raw).name != core.name for raw in project["dependencies"])
-    locked = packages["kestrel-sovereign"]["source"]
-    assert set(locked) == {"git"}
-    location = urlsplit(locked["git"])
-    assert location._replace(query="", fragment="").geturl() == declared["git"]
-    assert parse_qs(location.query) == {"rev": [declared["rev"]]}
-    assert location.fragment == declared["rev"]
+    assert packages["kestrel-sovereign"]["source"] == {"registry": "https://pypi.org/simple"}
 
 
 def test_ci_uses_the_same_locked_native_host_profile_for_all_test_installs():
