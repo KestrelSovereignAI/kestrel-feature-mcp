@@ -19,6 +19,7 @@ Usage:
 
 import asyncio
 import contextlib
+import copy
 import logging
 import json
 import os
@@ -242,10 +243,12 @@ class DockerMCPGateway:
                 "Please install Docker Desktop 29+ with MCP Toolkit enabled."
             )
 
-        reference, servers = await self.validate_servers(servers)
+        reference, servers, source_profile = await self.validate_servers(servers)
+        if source_profile is None:
+            source_profile = await self._read_source_profile()
         await self.stop()
         self._prepare_gateway_configuration()
-        await self._create_profile(reference, sorted(set(servers)))
+        await self._create_profile(reference, sorted(set(servers)), source_profile=source_profile)
         self.requested_servers = set(servers)
 
         # Resolve the port at bind time: an explicit port is honoured, otherwise
@@ -270,7 +273,7 @@ class DockerMCPGateway:
 
         logger.info(f"Starting Docker MCP Gateway: {' '.join(cmd)}")
 
-        self._containers_retired = False
+        self._containers_retired = not self._container_server_names
         self.process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -430,7 +433,7 @@ class DockerMCPGateway:
         # mcp-exec/code-mode dispatchers that could bypass a mounted-tool denial.
         # Scope that native CLI setting to this process; preserve the operator's
         # config and context store rather than rewriting their feature settings.
-        source = Path(os.environ.get("DOCKER_CONFIG", str(Path.home() / ".docker"))).resolve()
+        source = Path(os.environ.get("DOCKER_CONFIG") or str(Path.home() / ".docker")).resolve()
         try:
             configuration = json.loads((source / "config.json").read_text())
         except FileNotFoundError:
@@ -475,10 +478,14 @@ class DockerMCPGateway:
             self._process_env = None
 
     async def _docker_command(self, arguments, label, *, acknowledged=None):
+        return await self._run_docker_command(arguments, label, self._process_env, acknowledged=acknowledged)
+
+    @staticmethod
+    async def _run_docker_command(arguments, label, environment, *, acknowledged=None):
         async def command():
             result = await asyncio.to_thread(subprocess.run,
                 ["docker", *arguments], capture_output=True, text=True,
-                timeout=SSH_COMMAND_TIMEOUT_DEFAULT, env=self._process_env)
+                timeout=SSH_COMMAND_TIMEOUT_DEFAULT, env=environment)
             if result.returncode != 0:
                 raise DockerMCPGatewayError("Docker MCP " + label + " operation failed: " + result.stderr.strip())
             if acknowledged is not None:
@@ -505,9 +512,35 @@ class DockerMCPGateway:
         missing = set(servers) - available
         if missing:
             raise DockerMCPGatewayError("Servers absent from the configured Docker MCP catalog: " + ", ".join(sorted(missing)))
-        return reference, sorted(set(servers))
+        # An explicitly selected configuration is input, so reject a missing
+        # profile before any public replacement path withdraws working handles.
+        source = await DockerMCPGateway._read_source_profile() if "KESTREL_MCP_DOCKER_PROFILE" in os.environ else None
+        return reference, sorted(set(servers)), source
 
-    async def _create_profile(self, reference, servers):
+    @staticmethod
+    async def _read_source_profile():
+        source_id = os.environ.get("KESTREL_MCP_DOCKER_PROFILE", "default")
+        if not source_id or source_id != source_id.strip():
+            raise DockerMCPGatewayError("Docker MCP source profile needs a non-empty exact ID")
+        result = await DockerMCPGateway._run_docker_command(
+            ["mcp", "profile", "list", "--format", "json"], "profile configuration", None)
+        profiles = json.loads(result.stdout)
+        if not isinstance(profiles, list) or any(not isinstance(profile, dict) for profile in profiles):
+            raise DockerMCPGatewayError("Docker MCP profile listing must contain native profile objects")
+        matches = [profile for profile in profiles if profile.get("id") == source_id]
+        if len(matches) > 1:
+            raise DockerMCPGatewayError("Docker MCP source profile identity is ambiguous")
+        if matches:
+            if matches[0].get("version") != 1:
+                raise DockerMCPGatewayError("Docker MCP source profile has an unsupported native version")
+            return matches[0]
+        if "KESTREL_MCP_DOCKER_PROFILE" in os.environ:
+            raise DockerMCPGatewayError("Configured Docker MCP source profile is absent: " + source_id)
+        # An unconfigured native installation has no default profile yet.
+        # This is absence of optional settings, not a substitute configuration.
+        return None
+
+    async def _create_profile(self, reference, servers, *, source_profile=None):
         profile = "kestrel-" + secrets.token_hex(16)
         self._profile_pending = profile
 
@@ -520,10 +553,9 @@ class DockerMCPGateway:
             *[item for server in servers for item in ("--server", f"catalog://{reference}/{server}")],
         ], acknowledged=acknowledged)
 
-        # Native profiles contain editable server snapshots. Give this owned
-        # instance unique native server names, which Docker itself writes into
-        # container labels; ordinary catalog names cannot identify one Gateway
-        # among concurrent users of the same server. Keep public tool prefixes.
+        # Preserve native server identities: configuration templates and OAuth
+        # credentials both use those names. Native profile settings are copied
+        # as data through the CLI's own export/import format, never translated.
         document = self._config_directory / "profile.json"
         descriptor = os.open(document, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(descriptor)
@@ -535,13 +567,29 @@ class DockerMCPGateway:
         actual_names = [entry["snapshot"]["server"]["name"] for entry in entries]
         if sorted(actual_names) != servers:
             raise DockerMCPGatewayError("Native Docker profile export does not retain the requested servers")
-        prefix_names = json.loads((self._config_directory / "config.json").read_text())["features"].get("tool-name-prefix") == "enabled"
-        self._container_server_names = tuple(profile + "-" + name for name in actual_names)
-        for entry, owned_name in zip(entries, self._container_server_names, strict=True):
+        source_entries = {} if source_profile is None else {
+            entry["snapshot"]["server"]["name"]: entry for entry in source_profile.get("servers", [])}
+        container_names = set()
+        for entry in entries:
             snapshot = entry["snapshot"]["server"]
-            if prefix_names and not snapshot.get("prefix"):
-                snapshot["prefix"] = snapshot["name"]
-            snapshot["name"] = owned_name
+            name = snapshot["name"]
+            configured = source_entries.get(name)
+            if configured is not None:
+                previous = configured["snapshot"]["server"]
+                if any(previous.get(field) != snapshot.get(field) for field in ("type", "image", "remote")):
+                    raise DockerMCPGatewayError("Configured Docker MCP server has a different execution identity: " + name)
+                for field in ("config", "tools", "secrets"):
+                    if field in configured:
+                        entry[field] = copy.deepcopy(configured[field])
+                secret_binding = configured.get("secrets")
+                if secret_binding:
+                    configuration.setdefault("secrets", {})[secret_binding] = copy.deepcopy(source_profile["secrets"][secret_binding])
+            if snapshot.get("image") and not (snapshot.get("remote", {}).get("url") or snapshot.get("sseEndpoint")):
+                container_names.add(name)
+            for tool in snapshot.get("tools", []):
+                if tool.get("container", {}).get("image"):
+                    container_names.add(tool["name"])
+        self._container_server_names = tuple(sorted(container_names))
         document.write_text(json.dumps(configuration))
         self._profile_pending = profile
         await self._profile_command(["import", str(document)], acknowledged=acknowledged)
@@ -564,7 +612,7 @@ class DockerMCPGateway:
         await self._profile_command(["remove", profile], acknowledged=acknowledged)
 
     async def _retire_containers(self):
-        """Physically retire only daemon resources bearing this native profile's unique names."""
+        """A CLI exit cannot acknowledge retirement while matching native containers remain."""
         if self._containers_retired:
             return
         if self.process is not None or not self._container_server_names:
@@ -576,11 +624,12 @@ class DockerMCPGateway:
             identities = result.stdout.splitlines()
             if any(not re.fullmatch(r"[0-9a-f]{64}", identity) for identity in identities):
                 raise DockerMCPGatewayError("Native Docker container inventory returned an invalid identity")
-            for identity in identities:
-                await self._docker_command(["container", "rm", "--force", identity], "container retirement")
-            confirmed = await self._docker_command(command, "container retirement confirmation")
-            if confirmed.stdout.strip():
-                raise DockerMCPGatewayError("Native MCP containers remain; retain their profile for reconciliation")
+            if identities:
+                # Docker exposes catalog names, not a profile/process ownership
+                # receipt. Never remove a possibly shared or foreign container.
+                raise DockerMCPGatewayError(
+                    "Native MCP container retirement is unconfirmed for profile " + str(self._profile_id)
+                    + ": containers matching " + name + " remain; Docker supplies no per-profile owner receipt")
         self._containers_retired = True
 
     async def _stop_process(self):
@@ -590,13 +639,20 @@ class DockerMCPGateway:
                 try:
                     os.killpg(process.pid, kind)
                 except ProcessLookupError:
-                    pass  # The original private process group already retired.
+                    return None  # The original private group already retired.
+                except PermissionError as error:
+                    return error  # Retain denial unless physical absence is later proved.
+                return None
 
             def group_alive():
                 try:
                     os.killpg(process.pid, 0)
                 except ProcessLookupError:
                     return False
+                except PermissionError:
+                    # Darwin can retain an unsignalable group during reaping.
+                    # Denial is never evidence of absence; keep observing it.
+                    return True
                 return True
 
             async def await_group():
@@ -605,16 +661,16 @@ class DockerMCPGateway:
                     await asyncio.sleep(0.01)
                 return not group_alive()
 
-            signal_group(signal.SIGTERM)
+            signal_failure = signal_group(signal.SIGTERM)
             try:
                 await asyncio.to_thread(process.wait, timeout=HTTP_TIMEOUT_SHORT)
             except subprocess.TimeoutExpired:
-                signal_group(signal.SIGKILL)
+                signal_failure = signal_group(signal.SIGKILL) or signal_failure
                 await asyncio.to_thread(process.wait, timeout=HTTP_TIMEOUT_SHORT)
             if not await await_group():
-                signal_group(signal.SIGKILL)
+                signal_failure = signal_group(signal.SIGKILL) or signal_failure
                 if not await await_group():
-                    raise DockerMCPGatewayError("Original MCP gateway process group did not physically retire")
+                    raise DockerMCPGatewayError("Original MCP gateway process group did not physically retire") from signal_failure
             self._feed_startup_queue = False
             if self._stdout_thread is not None:
                 await asyncio.to_thread(self._stdout_thread.join, HTTP_TIMEOUT_SHORT)

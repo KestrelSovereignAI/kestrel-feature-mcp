@@ -83,3 +83,31 @@ async def test_private_configuration_preserves_native_docker_tls_certificate_loo
         assert actual == (certificate_path or str(source))
     finally:
         await gateway.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("docker_config", [None, ""])
+async def test_empty_docker_config_uses_the_native_home_directory(tmp_path, monkeypatch, docker_config):
+    home, working = tmp_path / "home", tmp_path / "working"
+    source = home / ".docker"
+    source.mkdir(parents=True)
+    working.mkdir()
+    original = source / "config.json"
+    original.write_text('{"features":{"preserved":"enabled"}}')
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(working)
+    monkeypatch.delenv("DOCKER_CERT_PATH", raising=False)
+    if docker_config is None:
+        monkeypatch.delenv("DOCKER_CONFIG", raising=False)
+    else:
+        monkeypatch.setenv("DOCKER_CONFIG", docker_config)
+    gateway = DockerMCPGateway()
+    try:
+        gateway._prepare_gateway_configuration()
+        assert gateway._config_directory.is_relative_to(source)
+        assert json.loads((gateway._config_directory / "config.json").read_text())["features"]["preserved"] == "enabled"
+        actual_certificate_path = gateway._process_env["DOCKER_CERT_PATH"]
+        assert actual_certificate_path == str(source)
+        assert not (working / "mcp").exists()
+    finally:
+        await gateway.stop()

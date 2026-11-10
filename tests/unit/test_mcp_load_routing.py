@@ -166,9 +166,11 @@ async def test_unload_routes_gateway_server_to_gateway_disable():
     feat = _feature(manager=MagicMock(), gateway=gw)
     feat._mount_gateway_tools = MagicMock(return_value=3)
     feat._forget_server = AsyncMock()
+    feat._reject_unknown_servers = AsyncMock(return_value=None)
 
     res = await feat.unload_tool("time")
     assert res.status is ToolResultStatus.OK
+    feat._reject_unknown_servers.assert_awaited_once_with(["fetch"])
     gw.disable_server.assert_awaited_once_with("time")
     feat._forget_server.assert_awaited_once_with("time")
 
@@ -184,9 +186,11 @@ async def test_unload_accepts_image_alias_for_gateway_server():
     feat = _feature(manager=MagicMock(), gateway=gw)
     feat._mount_gateway_tools = MagicMock(return_value=2)
     feat._forget_server = AsyncMock()
+    feat._reject_unknown_servers = AsyncMock(return_value=None)
 
     res = await feat.unload_tool("mcp/time")
     assert res.status is ToolResultStatus.OK
+    feat._reject_unknown_servers.assert_awaited_once_with(["fetch"])
     gw.disable_server.assert_awaited_once_with("time")
     feat._forget_server.assert_awaited_once_with("time")
 
