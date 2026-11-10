@@ -51,15 +51,20 @@ async def run_cleanup_steps(steps: list[tuple[bool, Callable]], *, failure: Base
         if primary is None:
             primary = asyncio.CancelledError()
     if primary is not None:
+        # A previous maintenance/rollback layer may already have attached its
+        # independent failures. Preserve those original objects across layers.
+        previous_cause = primary.__cause__
         others = []
-        for error in failures:
-            if error is primary:
+        for error in [previous_cause, *failures]:
+            if error is None or error is primary:
                 continue
             if isinstance(error, BaseExceptionGroup):
-                _, error = error.split(lambda item: item is primary)
-            if error is not None:
+                matched, remainder = error.split(lambda item: item is primary)
+                if matched is not None:
+                    error = remainder
+            if error is not None and not any(error is previous for previous in others):
                 others.append(error)
-        if others:
+        if others and not (len(others) == 1 and others[0] is previous_cause):
             raise primary from BaseExceptionGroup('Independent MCP cleanup failures', others)
         raise primary
     if len(failures) == 1:

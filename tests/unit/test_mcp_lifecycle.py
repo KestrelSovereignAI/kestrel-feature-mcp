@@ -158,3 +158,55 @@ async def test_maintenance_join_keeps_original_cancellation_primary_when_retirem
         assert scope.cancelled_caught
         await releaser
     assert maintenance.done() and maintenance.exception() is failure
+
+
+
+@pytest.mark.parametrize('layers', [0, 1, 2])
+async def test_nested_maintenance_cleanup_preserves_every_original_failure(layers):
+    from kestrel_feature_mcp._lifecycle import join_maintenance
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = PermissionError('original native profile command failed')
+    subsequent = [RuntimeError('profile creation was not acknowledged'),
+                  ValueError('private configuration still retains its profile')]
+
+    async def retire():
+        entered.set()
+        await release.wait()
+        raise original
+
+    maintenance = asyncio.create_task(retire())
+
+    async def caller():
+        try:
+            await join_maintenance(maintenance, 'original profile command')
+        except asyncio.CancelledError as cancellation:
+            for failure in subsequent[:layers]:
+                async def rollback():
+                    raise failure
+                with pytest.raises(asyncio.CancelledError) as propagated:
+                    await run_cleanup_steps([(True, rollback)], failure=cancellation)
+                assert propagated.value is cancellation
+                previous_cause = cancellation.__cause__
+                with pytest.raises(asyncio.CancelledError):
+                    await run_cleanup_steps([], failure=cancellation)
+                assert cancellation.__cause__ is previous_cause
+                async def observe_same_failure_again():
+                    raise previous_cause
+                with pytest.raises(asyncio.CancelledError):
+                    await run_cleanup_steps([(True, observe_same_failure_again)], failure=cancellation)
+                assert cancellation.__cause__ is previous_cause
+            raise cancellation
+
+    task = asyncio.create_task(caller())
+    await entered.wait()
+    task.cancel('original native request cancellation')
+    release.set()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+    assert task.cancelled() and str(caught.value) == 'original native request cancellation'
+    cause = caught.value.__cause__
+    assert isinstance(cause, BaseExceptionGroup)
+    assert cause.subgroup(lambda error: error is caught.value) is None
+    for failure in [original, *subsequent[:layers]]:
+        assert cause.subgroup(lambda error: error is failure) is not None, 'An original independent failure was erased: ' + str(failure)
