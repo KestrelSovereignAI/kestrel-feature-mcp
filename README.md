@@ -446,9 +446,8 @@ completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
 Version 0.14.1 requires Core 0.64.0 or newer and SDK 0.51.2 or newer for native
 Apps, OAuth and durable tool outcome contracts. The test profile uses the same
-minimums. Until that host release is public, `uv sync --locked --extra test`
-uses the exact Git commit declared for the test extra in `pyproject.toml`.
-The feature's runtime dependencies use the public package index.
+minimums. `uv sync --locked --extra test` resolves the host and the feature's
+runtime dependencies from the public package index.
 Initial publication and result associations are detailed below.
 An unsupported host is refused before connecting or saving enablement.
 The host must declare `supports_durable_tool_effects` as exactly `True`.
