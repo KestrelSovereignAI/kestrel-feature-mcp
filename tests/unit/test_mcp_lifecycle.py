@@ -118,3 +118,43 @@ async def test_interrupt_has_native_priority_over_cancellation():
         await run_cleanup_steps([(True, first), (True, second)])
     assert caught.value is interrupt
     assert caught.value.__cause__.exceptions == (cancellation,)
+
+
+@pytest.mark.parametrize('control', ['asyncio', 'anyio'])
+async def test_maintenance_join_keeps_original_cancellation_primary_when_retirement_fails(control):
+    from kestrel_feature_mcp._lifecycle import join_maintenance
+    import anyio
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    failure = PermissionError('native retirement inventory was not acknowledged')
+
+    async def retire():
+        entered.set()
+        await release.wait()
+        raise failure
+
+    maintenance = asyncio.create_task(retire())
+    await entered.wait()
+    if control == 'asyncio':
+        caller = asyncio.create_task(join_maintenance(maintenance, 'owned retirement'))
+        await asyncio.sleep(0)
+        caller.cancel('original caller cancellation')
+        await asyncio.sleep(0)
+        caller.cancel('later caller withdrawal')
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await caller
+        assert caller.cancelled()
+        assert str(caught.value) == 'original caller cancellation'
+        assert caught.value.__cause__.subgroup(lambda error: error is failure) is not None
+    else:
+        async def release_after_deadline():
+            await asyncio.sleep(0.05)
+            release.set()
+        releaser = asyncio.create_task(release_after_deadline())
+        with pytest.raises(TimeoutError):
+            with anyio.fail_after(0.025) as scope:
+                await join_maintenance(maintenance, 'owned retirement')
+        assert scope.cancelled_caught
+        await releaser
+    assert maintenance.done() and maintenance.exception() is failure

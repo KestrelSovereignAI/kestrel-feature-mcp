@@ -247,110 +247,112 @@ class DockerMCPGateway:
         if source_profile is None:
             source_profile = await self._read_source_profile()
         await self.stop()
-        self._prepare_gateway_configuration()
-        await self._create_profile(reference, sorted(set(servers)), source_profile=source_profile)
-        self.requested_servers = set(servers)
+        try:
+            self._prepare_gateway_configuration()
+            await self._create_profile(reference, sorted(set(servers)), source_profile=source_profile)
+            self.requested_servers = set(servers)
 
-        # Resolve the port at bind time: an explicit port is honoured, otherwise
-        # pick a fresh ephemeral one so two gateways never fight over :9000 (#12).
-        self.port = self._requested_port or self._find_free_port()
+            # Resolve the port at bind time: an explicit port is honoured, otherwise
+            # pick a fresh ephemeral one so two gateways never fight over :9000 (#12).
+            self.port = self._requested_port or self._find_free_port()
 
-        cmd = [
-            "docker", "mcp", "gateway", "run",
-            f"--transport={self.transport}",
-            f"--port={self.port}",
-            "--host=127.0.0.1",
-            f"--profile={self._profile_id}",
-        ]
-        if self.long_lived:
-            # Keep server containers alive across calls so stateful servers
-            # retain in-process state (#12 follow-up); reaped on gateway stop.
-            cmd.append("--long-lived")
+            cmd = [
+                "docker", "mcp", "gateway", "run",
+                f"--transport={self.transport}",
+                f"--port={self.port}",
+                "--host=127.0.0.1",
+                f"--profile={self._profile_id}",
+            ]
+            if self.long_lived:
+                # Keep server containers alive across calls so stateful servers
+                # retain in-process state (#12 follow-up); reaped on gateway stop.
+                cmd.append("--long-lived")
 
-        env = dict(self._process_env)
-        self.auth_token = secrets.token_hex(24)
-        env["MCP_GATEWAY_AUTH_TOKEN"] = self.auth_token
+            env = dict(self._process_env)
+            self.auth_token = secrets.token_hex(24)
+            env["MCP_GATEWAY_AUTH_TOKEN"] = self.auth_token
 
-        logger.info(f"Starting Docker MCP Gateway: {' '.join(cmd)}")
+            logger.info(f"Starting Docker MCP Gateway: {' '.join(cmd)}")
 
-        self._containers_retired = not self._container_server_names
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            env=env,
-            start_new_session=True,
-        )
+            self._containers_retired = not self._container_server_names
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+                start_new_session=True,
+            )
 
-        # Hand stdout to a single lifelong drainer thread (F398). It keeps the
-        # pipe drained after startup so it never fills and wedges the long-lived
-        # gateway, and it removes the per-poll ``to_thread(readline)`` that was
-        # abandoned on every ``wait_for`` timeout (leaking threads / losing
-        # lines). The startup loop below consumes from the queue it feeds.
-        self._stdout_history.clear()
-        self._startup_queue = asyncio.Queue()
-        self._feed_startup_queue = True
-        loop = asyncio.get_running_loop()
-        self._stdout_thread = threading.Thread(
-            target=self._drain_stdout,
-            args=(self.process, loop, self._startup_queue),
-            name="mcp-gateway-stdout-drain",
-            daemon=True,
-        )
-        self._stdout_thread.start()
+            # Hand stdout to a single lifelong drainer thread (F398). It keeps the
+            # pipe drained after startup so it never fills and wedges the long-lived
+            # gateway, and it removes the per-poll ``to_thread(readline)`` that was
+            # abandoned on every ``wait_for`` timeout (leaking threads / losing
+            # lines). The startup loop below consumes from the queue it feeds.
+            self._stdout_history.clear()
+            self._startup_queue = asyncio.Queue()
+            self._feed_startup_queue = True
+            loop = asyncio.get_running_loop()
+            self._stdout_thread = threading.Thread(
+                target=self._drain_stdout,
+                args=(self.process, loop, self._startup_queue),
+                name="mcp-gateway-stdout-drain",
+                daemon=True,
+            )
+            self._stdout_thread.start()
 
-        start_time = time.monotonic()
+            start_time = time.monotonic()
 
-        while True:
-            elapsed = time.monotonic() - start_time
-            if elapsed >= GATEWAY_STARTUP_TIMEOUT:
-                await self.stop()
-                raise DockerMCPGatewayError(
-                    f"Gateway startup timeout after {GATEWAY_STARTUP_TIMEOUT}s. "
-                    f"Output:\n{self._recent_output(20)}"
-                )
-
-            try:
-                line = await asyncio.wait_for(
-                    self._startup_queue.get(),
-                    timeout=GATEWAY_STARTUP_POLL_INTERVAL
-                )
-            except asyncio.TimeoutError:
-                # No output this interval — surface a premature exit promptly
-                # rather than waiting out the whole startup timeout.
-                if self.process.poll() is not None:
+            while True:
+                elapsed = time.monotonic() - start_time
+                if elapsed >= GATEWAY_STARTUP_TIMEOUT:
                     raise DockerMCPGatewayError(
-                        f"Gateway process exited with code "
-                        f"{self.process.returncode}. "
+                        f"Gateway startup timeout after {GATEWAY_STARTUP_TIMEOUT}s. "
+                        f"Output:\n{self._recent_output(20)}"
+                    )
+
+                try:
+                    line = await asyncio.wait_for(
+                        self._startup_queue.get(),
+                        timeout=GATEWAY_STARTUP_POLL_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    # No output this interval — surface a premature exit promptly
+                    # rather than waiting out the whole startup timeout.
+                    if self.process.poll() is not None:
+                        raise DockerMCPGatewayError(
+                            f"Gateway process exited with code "
+                            f"{self.process.returncode}. "
+                            f"Output:\n{self._recent_output()}"
+                        )
+                    continue
+
+                if line is None:
+                    # EOF sentinel: the drainer saw stdout close (process ended).
+                    raise DockerMCPGatewayError(
+                        f"Gateway process exited with code {self.process.returncode}. "
                         f"Output:\n{self._recent_output()}"
                     )
-                continue
 
-            if line is None:
-                # EOF sentinel: the drainer saw stdout close (process ended).
-                raise DockerMCPGatewayError(
-                    f"Gateway process exited with code {self.process.returncode}. "
-                    f"Output:\n{self._recent_output()}"
-                )
+                logger.debug(f"Gateway: {line.rstrip()}")
 
-            logger.debug(f"Gateway: {line.rstrip()}")
-
-            if self._is_ready_line(line):
-                # Stop queueing before waiting for the port. The stdout drainer
-                # remains active for the process lifetime, with bounded history.
-                self._feed_startup_queue = False
-                if not await self._wait_port_listening():
-                    await self.stop()
-                    raise DockerMCPGatewayError(
-                        f"Gateway reported ready but port {self.port} never accepted connections"
-                    )
-                self._start_time = time.monotonic()
-                logger.info("Gateway ready at %s", self.endpoint_url)
-                if self.session_timeout:
-                    self._start_timeout_task()
-                return self.auth_token
+                if self._is_ready_line(line):
+                    # Stop queueing before waiting for the port. The stdout drainer
+                    # remains active for the process lifetime, with bounded history.
+                    self._feed_startup_queue = False
+                    if not await self._wait_port_listening():
+                        raise DockerMCPGatewayError(
+                            f"Gateway reported ready but port {self.port} never accepted connections"
+                        )
+                    self._start_time = time.monotonic()
+                    logger.info("Gateway ready at %s", self.endpoint_url)
+                    if self.session_timeout:
+                        self._start_timeout_task()
+                    return self.auth_token
+        except BaseException as failure:
+            await run_cleanup_steps([(True, self.stop)], failure=failure)
+            raise AssertionError("Failed native Gateway startup unexpectedly returned")
 
     def _drain_stdout(self, proc, loop, startup_queue) -> None:
         """Single lifelong owner of the gateway's stdout (F398).
@@ -576,7 +578,7 @@ class DockerMCPGateway:
             configured = source_entries.get(name)
             if configured is not None:
                 previous = configured["snapshot"]["server"]
-                if any(previous.get(field) != snapshot.get(field) for field in ("type", "image", "remote")):
+                if previous != snapshot:
                     raise DockerMCPGatewayError("Configured Docker MCP server has a different execution identity: " + name)
                 for field in ("config", "tools", "secrets"):
                     if field in configured:

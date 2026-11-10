@@ -77,10 +77,11 @@ async def join_maintenance(maintenance, label):
         try:
             await asyncio.wait({maintenance})
         except asyncio.CancelledError as error:
-            cancellation = error
+            if cancellation is None:
+                cancellation = error
     failure = None if maintenance.cancelled() else maintenance.exception()
     if failure is not None and cancellation is not None:
-        raise BaseExceptionGroup(label + " retention cleanup failed", [cancellation, failure])
+        await run_cleanup_steps([], failure=BaseExceptionGroup(label + " retention cleanup failed", [cancellation, failure]))
     if failure is not None:
         raise failure
     if cancellation is not None:
