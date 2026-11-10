@@ -333,11 +333,15 @@ class MCPConnection:
     async def _close_failed_startup(self, exc_type, exc_value, traceback):
         if exc_type is not None and issubclass(exc_type, (TimeoutError, asyncio.CancelledError)):
             try:
-                await self.close()
+                # Register the original interruption with the same cleanup
+                # owner before a later caller withdrawal can interrupt its
+                # join. Cancellation must retain that original deadline in
+                # its explicit evidence, not only implicit handling context.
+                await self.close(failure=exc_value)
             except* MCP_CONNECTION_ERRORS as cleanup_error:
                 # Preserve the operation deadline/caller cancellation. A late
                 # SDK write into a closed transport is secondary cleanup evidence.
-                logger.warning("MCP startup cleanup also failed", exc_info=cleanup_error)
+                logger.warning("MCP startup interrupted; original deadline and cleanup evidence retained", exc_info=cleanup_error)
         else:
             await self.close()
         return False
@@ -488,12 +492,12 @@ class MCPConnection:
                 and error.subgroup(mismatch) is not None):
             self._incarnation = None
 
-    async def close(self) -> None:
+    async def close(self, *, failure: BaseException | None = None) -> None:
         steps = []
         if self._before_close is not None:
             steps.append((True, partial(self._before_close, self)))
         steps.append((True, self._close_transport))
-        await run_cleanup_steps(steps)
+        await run_cleanup_steps(steps, failure=failure)
 
     async def _close_transport(self) -> None:
         task = self._task

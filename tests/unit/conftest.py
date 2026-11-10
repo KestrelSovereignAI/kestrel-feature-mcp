@@ -81,6 +81,8 @@ async def mcp_http_server(request, tmp_path, app_resource_html):
     settings["resource_read_started"] = asyncio.Event()
     settings["app_reply_recorded"] = asyncio.Event()
     settings["resource_wire_closed"] = asyncio.Event()
+    settings["delete_started"] = asyncio.Event()
+    settings["release_delete"] = asyncio.Event()
     if settings.get("resource_wire_mode") == "gzip":
         # Construct the adversarial fixture before client allocation tracing.
         settings["compressed_resource_wire"] = gzip.compress(b"x" * (16 * 1024 * 1024))
@@ -271,6 +273,9 @@ async def mcp_http_server(request, tmp_path, app_resource_html):
         body = bytearray()
         if scope["method"] == "DELETE":
             requests.append((scope, b""))
+            settings["delete_started"].set()
+            if settings.get("hold_delete"):
+                await settings["release_delete"].wait()
             await asyncio.sleep(settings.get("delete_delay", 0))
 
         async def read():
@@ -370,4 +375,3 @@ def official_tasks_schema():
     def validate(definition, value):
         Draft202012Validator({**schema, "$ref": "#/$defs/" + definition}).validate(value)
     return validate
-

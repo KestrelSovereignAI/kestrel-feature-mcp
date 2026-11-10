@@ -11,7 +11,7 @@ import sys
 import httpx2
 import pytest
 
-from tests.oauth_acceptance.client import RefuseUnselectedOrigin, load_selection, open_authorization
+from tests.oauth_acceptance.native_client import RefuseUnselectedOrigin, load_selection, open_authorization
 from tests.oauth_acceptance.policy import GrantRejected
 
 
@@ -82,6 +82,57 @@ def test_existing_output_is_refused_before_any_attempt(tmp_path):
     assert result.returncode != 0 and result.stdout == ""
     assert json.loads(result.stderr)["error_type"] == "FileExistsError"
     assert output.read_text() == "previous-result-sentinel"
+
+
+def run_cli_with_import_barrier(tmp_path, output, blocked_modules):
+    witness = tmp_path / "native-import-attempted"
+    command = (
+        "import importlib.abc, pathlib, runpy, sys\n"
+        f"blocked = {blocked_modules!r}\n"
+        "class RefuseNativeImports(importlib.abc.MetaPathFinder):\n"
+        "    def find_spec(self, fullname, path=None, target=None):\n"
+        "        if any(fullname == name or fullname.startswith(name + '.') for name in blocked):\n"
+        f"            pathlib.Path({str(witness)!r}).write_text(fullname)\n"
+        "            raise ImportError('synthetic-token-marker')\n"
+        "sys.meta_path.insert(0, RefuseNativeImports())\n"
+        "sys.argv = ['tests.oauth_acceptance.client', *sys.argv[1:]]\n"
+        "runpy.run_module('tests.oauth_acceptance.client', run_name='__main__')\n"
+    )
+    result = subprocess.run([
+        sys.executable, "-B", "-c", command,
+        "--config", str(tmp_path / "missing-config.json"), "--vendor", "notion",
+        "--output", str(output),
+    ], cwd=Path(__file__).parents[2], capture_output=True, text=True, timeout=5)
+    return result, witness
+
+
+def test_existing_output_refusal_does_not_import_native_dependencies(tmp_path):
+    output = tmp_path / "existing.json"
+    output.write_text("previous-result-sentinel")
+    result, witness = run_cli_with_import_barrier(tmp_path, output, (
+        "tests.oauth_acceptance.native_client", "tests.oauth_acceptance.policy",
+        "tests.oauth_acceptance.callback", "kestrel_feature_mcp", "kestrel_sdk",
+        "kestrel_sovereign", "mcp", "httpx2",
+    ))
+    assert not witness.exists(), "Existing output must be refused before native dependencies import"
+    assert result.returncode != 0 and result.stdout == ""
+    assert json.loads(result.stderr)["error_type"] == "FileExistsError"
+    assert output.read_text() == "previous-result-sentinel"
+
+
+def test_native_import_failure_records_private_failed_report_without_credentials(tmp_path):
+    output = tmp_path / "failed.json"
+    result, witness = run_cli_with_import_barrier(
+        tmp_path, output, ("tests.oauth_acceptance.native_client",))
+    assert witness.read_text() == "tests.oauth_acceptance.native_client"
+    assert result.returncode != 0 and result.stdout == ""
+    assert "synthetic-token-marker" not in result.stderr
+    assert json.loads(result.stderr) == {
+        "stage": "failed", "error_type": "ImportError",
+        "detail": "Native operation failed; credential and response details withheld",
+    }
+    assert json.loads(output.read_text()) == {"stage": "failed", "acceptance_verified": False}
+    assert output.stat().st_mode & 0o777 == 0o600
 
 
 async def test_browser_launcher_ignores_imports_from_the_working_directory(tmp_path, monkeypatch):

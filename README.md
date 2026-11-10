@@ -314,7 +314,9 @@ Managed container and gateway HTTP connections also ignore environment proxies,
 including for gateway bearer headers.
 Tool discovery follows pagination and fails on repeated cursors. Negotiation
 uses the connection deadline, then discovery uses the whole-call deadline.
-Cancelled startup joins its transport owner before returning. Shutdown has its
+Cancelled startup waits on its original transport owner within the shutdown
+budget. A later caller cancellation or outer timeout retains the original
+startup deadline in its explicit cause/group evidence. Shutdown has its
 own graceful deadline (`KESTREL_MCP_CLOSE_TIMEOUT`, default 15 seconds), including
 session termination and partially completed SDK entry. Forced cleanup gets one
 further budget of the same length. The owner timer survives caller cancellation;
@@ -442,11 +444,10 @@ An unfinished close retains its original owner and is retried before re-enable.
 Version 0.8.0 introduced the native components described below; 0.9.0 added
 completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
-Version 0.14.0 requires Core 0.64.0 or newer and SDK 0.51.2 or newer for native
+Version 0.14.1 requires Core 0.64.0 or newer and SDK 0.51.2 or newer for native
 Apps, OAuth and durable tool outcome contracts. The test profile uses the same
-minimums. Until that host release is public, `uv sync --locked --extra test`
-uses the exact Git commit declared for the test extra in `pyproject.toml`.
-The feature's runtime dependencies use the public package index.
+minimums. `uv sync --locked --extra test` resolves the host and the feature's
+runtime dependencies from the public package index.
 Initial publication and result associations are detailed below.
 An unsupported host is refused before connecting or saving enablement.
 The host must declare `supports_durable_tool_effects` as exactly `True`.

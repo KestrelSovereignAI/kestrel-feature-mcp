@@ -17,6 +17,20 @@ from mcp_types.version import LATEST_PROTOCOL_VERSION
 from kestrel_feature_mcp.manager import DockerMCPGatewayError, MCPGatewayManager, MCPToolManager
 
 
+def explicit_errors(error):
+    seen, pending = set(), [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+
+
 @pytest.mark.parametrize('carrier', ['cause', 'group-cause', 'group-member'])
 def test_native_rejection_cannot_erase_an_original_unknown_outcome(carrier):
     from kestrel_sdk.resources import ResourceOutcomeUnknown
@@ -757,8 +771,10 @@ async def test_readiness_cleanup_uses_its_own_budget_and_reports_failure(mcp_htt
 async def test_shutdown_deadline_covers_cleanup_of_a_partial_sdk_entry(mcp_http_server, close_timeout):
     connection = MCPConnection(mcp_http_server.url, connect_timeout=0.5, close_timeout=close_timeout)
     try:
-        with pytest.raises(TimeoutError, match="MCP connection deadline"):
+        with pytest.raises(TimeoutError) as deadline:
             await asyncio.wait_for(connection.connect(), 3.5)
+        assert any(isinstance(error, TimeoutError) and str(error) == 'MCP connection deadline exceeded'
+            for error in explicit_errors(deadline.value)), 'startup lost its original MCP connection deadline'
     finally:
         owner = connection._task
         if owner is not None:
@@ -791,6 +807,54 @@ async def test_abandoned_partial_entry_still_has_an_owned_shutdown_deadline(mcp_
             await asyncio.wait({retained}, timeout=3)
         await connection.close()
     assert connection._task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{
+    "legacy": True, "initialize_body_delay": 2, "hold_delete": True,
+}], indirect=True)
+@pytest.mark.parametrize('observation', ['cancel', 'timeout'])
+async def test_original_startup_deadline_survives_later_caller_cancellation(mcp_http_server, observation):
+    connection = MCPConnection(mcp_http_server.url, connect_timeout=0.5, close_timeout=5)
+    outer_deadlines = []
+
+    async def connect():
+        async with asyncio.timeout(None) as deadline:
+            outer_deadlines.append(deadline)
+            return await connection.connect()
+
+    caller = asyncio.create_task(connect())
+    cancelled, original_owner = None, None
+    try:
+        await asyncio.wait_for(mcp_http_server.settings['delete_started'].wait(), 2)
+        original_owner = connection._task
+        assert original_owner is not None and not original_owner.done()
+        if observation == 'cancel':
+            caller.cancel('caller withdrew after original MCP startup deadline')
+        else:
+            outer_deadlines[0].reschedule(asyncio.get_running_loop().time())
+        try:
+            await caller
+        except (asyncio.CancelledError, TimeoutError) as error:
+            cancelled = error
+        assert connection._task is original_owner and not original_owner.done()
+    finally:
+        mcp_http_server.settings['release_delete'].set()
+        if not caller.done():
+            caller.cancel('dispose original deadline probe caller')
+        await asyncio.gather(caller, return_exceptions=True)
+        if original_owner is not None:
+            await asyncio.wait({original_owner}, timeout=3)
+        await connection.close()
+    if observation == 'cancel':
+        assert isinstance(cancelled, asyncio.CancelledError)
+        assert cancelled.args == ('caller withdrew after original MCP startup deadline',)
+    else:
+        assert isinstance(cancelled, TimeoutError) and outer_deadlines[0].expired()
+    original_deadlines = [error for error in explicit_errors(cancelled)
+        if isinstance(error, TimeoutError) and str(error) == 'MCP connection deadline exceeded']
+    assert len(original_deadlines) == 1, 'later caller cancellation lost the original MCP startup deadline evidence'
+    assert connection._task is None and original_owner.done()
 
 
 @pytest.mark.asyncio
