@@ -972,12 +972,16 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
         auto-restored.
         """
         gwm = self.gateway_manager
-        self._unmount_tools(_GATEWAY_OWNER)
-        await self._forget_server(server_name)
         try:
             remaining = [
                 s for s in gwm.gateway.requested_servers if s != server_name
             ]
+            if remaining:
+                rejection = await self._reject_unknown_servers(remaining)
+                if rejection is not None:
+                    return rejection
+            self._unmount_tools(_GATEWAY_OWNER)
+            await self._forget_server(server_name)
             if remaining:
                 await gwm.disable_server(server_name)
                 mounted = self._mount_gateway_tools()

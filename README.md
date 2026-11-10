@@ -43,18 +43,26 @@ discovery and execution (default `mcp/docker-mcp-catalog`). Server names are exa
 catalog names; patterns and separators are refused before replacing a gateway.
 
 Each gateway owns a unique native profile and a private Docker CLI configuration.
-Its native server snapshots receive unique instance names so Docker's container
-labels distinguish concurrent gateways using the same catalog server. Catalog
-selection and the configured public tool prefixes remain unchanged.
+Native server names retain their configuration-template and OAuth identity.
+`KESTREL_MCP_DOCKER_PROFILE` selects an existing native profile whose selected
+server settings, secret bindings and tool allowlists should be retained. The
+native `default` profile supplies settings when present; a new installation
+without one has no saved server settings. An explicitly named missing profile
+fails before replacing a working gateway.
+
 The process exposes concrete server tools rather than Docker's generic execution
 and configuration tools, so every mounted call reaches Kestrel's shared permission
-rail. The operator's configuration is read without being rewritten. Profile and
-private configuration removal follows physical retirement of the original CLI
-process group and confirmation that its uniquely labelled containers are gone.
-Only containers belonging to that native profile can be removed. Implicit and
-explicit Docker TLS certificate paths retain their original lookup.
-Unacknowledged profile creation and failed cleanup remain visible
-reconciliation debt; they are not reported as successful shutdown.
+rail. The operator's configuration is read without being rewritten, and implicit
+and explicit Docker TLS certificate paths retain their original lookup.
+
+Shutdown joins the original CLI process group and checks native daemon-container
+inventory before releasing its profile and private configuration. Docker labels
+containers by catalog name, without a per-profile ownership receipt. Remaining
+containers therefore produce an explicit unconfirmed retirement, including when
+another gateway uses the same server. Kestrel retains reconciliation state and
+never deletes containers it cannot attribute. Retirement can be retried after
+physical absence is confirmed. Failed inspection, profile operations and
+unacknowledged creation also retain their original cleanup state.
 
 ## Remote HTTPS servers
 
