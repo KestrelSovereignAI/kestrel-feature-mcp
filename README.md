@@ -35,6 +35,21 @@ Once installed, the `MCPAgent` feature is automatically discovered by kestrel-so
 - `!mcp-info <name>` — Inspect an official namespaced server and version
 - `!mcp-docker-catalog <query>` — Search Docker's catalog
 
+## Native Docker Gateway profiles
+
+Gateway mode requires Docker MCP CLI 0.44.1 or later with native profiles and a
+POSIX host. `KESTREL_MCP_DOCKER_CATALOG` selects the OCI catalog used for both
+discovery and execution (default `mcp/docker-mcp-catalog`). Server names are exact
+catalog names; patterns and separators are refused before replacing a gateway.
+
+Each gateway owns a unique native profile and a private Docker CLI configuration.
+The process exposes concrete server tools rather than Docker's generic execution
+and configuration tools, so every mounted call reaches Kestrel's shared permission
+rail. The operator's configuration is read without being rewritten. Profile and
+private configuration removal follows physical retirement of the original CLI
+process group. Unacknowledged profile creation and failed cleanup remain visible
+reconciliation debt; they are not reported as successful shutdown.
+
 ## Remote HTTPS servers
 
 Use the normal load/list/unload commands for an unauthenticated public server:

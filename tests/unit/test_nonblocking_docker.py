@@ -14,6 +14,8 @@ import asyncio
 import errno
 import threading
 import socket
+import subprocess
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -175,72 +177,40 @@ async def test_feature_survives_real_daemon_ping_transport_failure(failing_docke
 # --- F398: gateway stdout drained for the process's whole life --------------
 
 
-class _FakeGatewayPopen:
-    """Popen double that emits a ready line then a flood of log lines, then
-    EOF. Records every line handed out so a test can prove the drainer kept
-    reading after startup."""
-
-    def __init__(self, cmd, **kw):
-        self.returncode = 0
-        self.stdout = self
-        self.consumed = []
-        lines = ["> Start streaming server on port 34567\n"]
-        lines += [f"log line {i}\n" for i in range(2000)]
-        self._it = iter(lines)
-        self.total = len(lines)
-
-    def readline(self):
-        try:
-            line = next(self._it)
-        except StopIteration:
-            return ""  # EOF
-        self.consumed.append(line)
-        return line
-
-    def poll(self):
-        return None
-
-    def terminate(self):
-        pass
-
-    def wait(self):
-        return 0
-
-    def kill(self):
-        pass
-
-
 @pytest.mark.asyncio
-async def test_gateway_stdout_drained_after_startup(monkeypatch):
-    fakes = {}
-
-    def _make(cmd, **kw):
-        p = _FakeGatewayPopen(cmd, **kw)
-        fakes["proc"] = p
-        return p
-
-    monkeypatch.setattr("kestrel_feature_mcp.gateway.subprocess.Popen", _make)
-    monkeypatch.setattr(
-        DockerMCPGateway, "check_docker_mcp_available", staticmethod(lambda: True)
+async def test_gateway_stdout_drained_after_startup():
+    """A real child must finish a flood larger than its OS pipe after startup."""
+    script = (
+        "import sys\n"
+        "print('> Start streaming server on port 34567', flush=True)\n"
+        "assert sys.stdin.buffer.read(1) == b'G'\n"
+        "for number in range(4096):\n"
+        " print(str(number) + ':' + 'x' * 512)\n"
+        "print('OWNED_STDOUT_FLOOD_COMPLETE', flush=True)\n"
     )
-
-    async def _ready(self, timeout=10.0):
-        return True
-
-    monkeypatch.setattr(DockerMCPGateway, "_wait_port_listening", _ready)
-
-    gw = DockerMCPGateway(port=34567)
-    await gw.start(["x"])
-
-    # startup returned on the ready line; the drainer must keep consuming the
-    # remaining flood so the pipe is never left to fill and wedge the gateway.
-    proc = fakes["proc"]
-    for _ in range(500):
-        if len(proc.consumed) >= proc.total:
-            break
-        await asyncio.sleep(0.005)
-
-    assert len(proc.consumed) == proc.total  # every line drained post-startup
-
-    await gw.stop()
-    assert gw._stdout_thread is None  # drainer joined on stop
+    process = subprocess.Popen([sys.executable, "-I", "-B", "-c", script],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, start_new_session=True)
+    gateway = DockerMCPGateway()
+    gateway.process = process
+    gateway._startup_queue = asyncio.Queue()
+    gateway._feed_startup_queue = True
+    thread = threading.Thread(target=gateway._drain_stdout,
+        args=(process, asyncio.get_running_loop(), gateway._startup_queue), daemon=True)
+    gateway._stdout_thread = thread
+    thread.start()
+    try:
+        ready = await asyncio.wait_for(gateway._startup_queue.get(), 5)
+        assert gateway._is_ready_line(ready)
+        gateway._feed_startup_queue = False
+        process.stdin.write("G")
+        process.stdin.flush()
+        assert await asyncio.to_thread(process.wait, timeout=5) == 0
+        await gateway.stop()
+        assert gateway._stdout_thread is None and not thread.is_alive()
+        assert gateway._recent_output().endswith("OWNED_STDOUT_FLOOD_COMPLETE\n")
+        assert gateway._startup_queue is None
+    finally:
+        await gateway.stop()
+        process.stdin.close()
+        process.stdout.close()

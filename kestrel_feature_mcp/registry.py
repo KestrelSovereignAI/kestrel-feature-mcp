@@ -294,14 +294,22 @@ class _DockerCatalog(BaseModel):
     servers: list[_DockerCatalogEntry]
 
 
-async def list_docker_catalog_servers() -> List[Dict[str, str]]:
+def docker_catalog_reference() -> str:
+    """The native OCI catalog used by both discovery and gateway profiles."""
+    reference = os.environ.get("KESTREL_MCP_DOCKER_CATALOG", "mcp/docker-mcp-catalog")
+    if not reference or reference != reference.strip():
+        raise DockerCatalogError("Docker MCP catalog must be a non-empty OCI reference without surrounding whitespace")
+    return reference
+
+
+async def list_docker_catalog_servers(*, reference: str | None = None) -> List[Dict[str, str]]:
     """Read Docker's OCI catalog through its structured CLI, or fail clearly.
 
     This is discovery metadata, not evidence that a server is configured or
     running in any gateway/profile. Pulling a missing catalog only caches its
     metadata; it does not enable servers or modify profiles.
     """
-    reference = os.environ.get("KESTREL_MCP_DOCKER_CATALOG", "mcp/docker-mcp-catalog")
+    reference = docker_catalog_reference() if reference is None else reference
     try:
         result = await asyncio.to_thread(
             subprocess.run,
