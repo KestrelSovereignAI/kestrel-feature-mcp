@@ -715,10 +715,10 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
             )
         except (TimeoutError, RuntimeError, ValueError) as e:
             logger.error(f"Failed to load tool {image_name}: {e}")
-            return ToolResult.failed(_load_failure_message(f"Failed to load MCP tool: {str(e)}", persistent), data=failure_context)
+            return ToolResult.failed(_load_failure_message(f"Failed to load MCP tool: {connection_error_message(e)}", persistent), data=failure_context)
         except Exception as e:
             logger.error(f"Unexpected error loading tool {image_name}: {e}", exc_info=True)
-            return ToolResult.failed(_load_failure_message(f"Failed to load MCP tool: {str(e)}", persistent), data=failure_context)
+            return ToolResult.failed(_load_failure_message(f"Failed to load MCP tool: {connection_error_message(e)}", persistent), data=failure_context)
 
         finally:
             if not published:
@@ -815,13 +815,13 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
             )
         except (DockerMCPGatewayError, DockerMCPNotInstalledError) as e:
             logger.error(f"Gateway load failed for {server_name}: {e}")
-            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {str(e)}", persistent, gateway_unavailable=changed))
+            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {connection_error_message(e)}", persistent, gateway_unavailable=changed))
         except asyncio.TimeoutError:
             logger.error(f"Timeout loading {server_name} via gateway")
             return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: Connection timeout", persistent, gateway_unavailable=changed))
         except Exception as e:
             logger.error(f"Unexpected error loading {server_name} via gateway: {e}", exc_info=True)
-            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {str(e)}", persistent, gateway_unavailable=changed))
+            return ToolResult.failed(_load_failure_message(f"Failed to load {server_name}: {connection_error_message(e)}", persistent, gateway_unavailable=changed))
 
         finally:
             if changed and not published:
@@ -958,10 +958,10 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
             )
         except ValueError as e:
             logger.error(f"Tool not found: {container_name}")
-            return ToolResult.failed(f"Failed to unload tool: {str(e)}")
+            return ToolResult.failed(f"Failed to unload tool: {connection_error_message(e)}")
         except Exception as e:
             logger.error(f"Failed to unload tool {container_name}: {e}", exc_info=True)
-            return ToolResult.failed(f"Failed to unload tool: {str(e)}")
+            return ToolResult.failed(f"Failed to unload tool: {connection_error_message(e)}")
 
     async def _unload_via_gateway(self, server_name: str) -> ToolResult:
         """Disable a gateway-loaded server (inverse of _load_via_gateway).
@@ -999,7 +999,7 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
             )
         except Exception as e:
             logger.error(f"Failed to unload gateway server {server_name}: {e}", exc_info=True)
-            return ToolResult.failed(f"Failed to unload {server_name}: {str(e)}")
+            return ToolResult.failed(f"Failed to unload {server_name}: {connection_error_message(e)}")
 
     def _get_official_registry(self) -> "OfficialRegistryClient":
         """Construct only on an official request, never during tool introspection."""
@@ -1286,13 +1286,13 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
 
         except (DockerMCPGatewayError, DockerMCPNotInstalledError) as e:
             logger.error(f"Gateway error: {e}")
-            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {str(e)}", persistent, gateway_replaced=True, gateway_unavailable=changed))
+            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {connection_error_message(e)}", persistent, gateway_replaced=True, gateway_unavailable=changed))
         except asyncio.TimeoutError as e:
             logger.error(f"Timeout starting gateway: {e}")
             return ToolResult.failed(_load_failure_message("Failed to start gateway: Connection timeout", persistent, gateway_replaced=True, gateway_unavailable=changed))
         except Exception as e:
             logger.error(f"Unexpected error starting gateway: {e}", exc_info=True)
-            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {str(e)}", persistent, gateway_replaced=True, gateway_unavailable=changed))
+            return ToolResult.failed(_load_failure_message(f"Failed to start gateway: {connection_error_message(e)}", persistent, gateway_replaced=True, gateway_unavailable=changed))
 
         finally:
             if changed and not published:
@@ -1322,7 +1322,7 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
             raise
         except Exception as e:
             logger.error(f"Failed to stop gateway: {e}", exc_info=True)
-            return ToolResult.failed(f"Failed to stop gateway: {str(e)}")
+            return ToolResult.failed(f"Failed to stop gateway: {connection_error_message(e)}")
 
     @tool(
         name="mcp_gateway_tools",

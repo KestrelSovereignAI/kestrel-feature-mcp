@@ -49,6 +49,9 @@ server settings, secret bindings and tool allowlists should be retained. The
 native `default` profile supplies settings when present; a new installation
 without one has no saved server settings. An explicitly named missing profile
 fails before replacing a working gateway.
+The source profile must retain the same native server snapshot as the selected
+catalog before settings can be transferred. Rebuild the native source profile
+after changing the catalog definition, including its command or environment.
 
 The process exposes concrete server tools rather than Docker's generic execution
 and configuration tools, so every mounted call reaches Kestrel's shared permission
