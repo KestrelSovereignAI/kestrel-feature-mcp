@@ -322,22 +322,14 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
     async def _reject_unknown_servers(
         self, requested: List[str],
     ) -> Optional[ToolResult]:
-        """Return a ``failed`` ToolResult naming any requested server that
-        is absent from every resolvable catalog, else ``None`` (proceed).
+        """Use the launch catalog, before withdrawing any working handle."""
+        from .gateway import DockerMCPGateway, DockerMCPGatewayError
 
-        No-op when the catalog is unverifiable (see _known_catalog_servers)."""
-        known = await self._known_catalog_servers()
-        if known is None:
-            return None
-        unknown = [s for s in requested if s not in known]
-        if not unknown:
-            return None
-        return ToolResult.failed(
-            f"Unknown MCP server(s): {', '.join(unknown)}. "
-            "Not found in the Docker MCP catalog or the local registry, so "
-            "they cannot be enabled. Search with `!mcp-docker-catalog <query>`.",
-            data={"unknown_servers": unknown, "requested": requested},
-        )
+        try:
+            await DockerMCPGateway.validate_servers(requested)
+        except (ValueError, DockerMCPGatewayError, DockerCatalogError) as error:
+            return ToolResult.failed(str(error), data={"requested": requested})
+        return None
 
     # --- enablement persistence (survives restart via the host DB) ----------
 
@@ -758,7 +750,10 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
                 "Please install Docker Desktop 29+ with MCP Toolkit enabled."
             )
         # Honesty gate: never "load" a name the catalog says can't exist (#9).
-        rejection = await self._reject_unknown_servers([server_name])
+        selection = [server_name]
+        if self.gateway_manager is not None and self.gateway_manager.is_connected:
+            selection.extend(self.gateway_manager.gateway.requested_servers)
+        rejection = await self._reject_unknown_servers(selection)
         if rejection is not None:
             return rejection
 

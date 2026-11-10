@@ -519,6 +519,7 @@ class MCPGatewayManager:
         """Start and publish only a gateway with a working native connection."""
         if servers is None:
             servers = ["fetch"]
+        await self.gateway.validate_servers(servers)
         try:
             auth_token = await self.gateway.start(servers)
             return await self._connect(auth_token)
@@ -556,11 +557,15 @@ class MCPGatewayManager:
         await run_cleanup_steps([(True, self._disconnect), (True, self.gateway.stop)])
 
     async def enable_server(self, server_name: str):
+        await self.gateway.validate_servers([*self.gateway.requested_servers, server_name])
         await self._disconnect()
         auth_token = await self.gateway.add_server(server_name)
         return await self._connect(auth_token)
 
     async def disable_server(self, server_name: str):
+        remaining = self.gateway.requested_servers - {server_name}
+        if remaining:
+            await self.gateway.validate_servers(list(remaining))
         await self._disconnect()
         auth_token = await self.gateway.remove_server(server_name)
         return await self._connect(auth_token)

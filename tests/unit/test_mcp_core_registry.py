@@ -85,7 +85,7 @@ def test_tools_require_the_explicit_governed_host_contract_before_refresh():
 async def test_bad_native_catalog_never_reaches_gateway_enablement_storage(
     mcp_http_server, monkeypatch, already_connected, producer, caplog,
 ):
-    """Only substitute the Docker process; discovery uses the real SDK/HTTP."""
+    """Substitute Docker selection/process; discovery uses the real SDK/HTTP."""
     from kestrel_sdk.tools.result import ToolResultStatus
     from kestrel_feature_mcp.manager import MCPGatewayManager
 
@@ -93,6 +93,9 @@ async def test_bad_native_catalog_never_reaches_gateway_enablement_storage(
         endpoint_url = mcp_http_server.url
         is_running = True
         requested_servers = set()
+
+        async def validate_servers(self, servers):
+            assert servers
 
         async def start(self, servers):
             self.requested_servers = set(servers)

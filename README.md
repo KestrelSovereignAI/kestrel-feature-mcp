@@ -43,11 +43,17 @@ discovery and execution (default `mcp/docker-mcp-catalog`). Server names are exa
 catalog names; patterns and separators are refused before replacing a gateway.
 
 Each gateway owns a unique native profile and a private Docker CLI configuration.
+Its native server snapshots receive unique instance names so Docker's container
+labels distinguish concurrent gateways using the same catalog server. Catalog
+selection and the configured public tool prefixes remain unchanged.
 The process exposes concrete server tools rather than Docker's generic execution
 and configuration tools, so every mounted call reaches Kestrel's shared permission
 rail. The operator's configuration is read without being rewritten. Profile and
 private configuration removal follows physical retirement of the original CLI
-process group. Unacknowledged profile creation and failed cleanup remain visible
+process group and confirmation that its uniquely labelled containers are gone.
+Only containers belonging to that native profile can be removed. Implicit and
+explicit Docker TLS certificate paths retain their original lookup.
+Unacknowledged profile creation and failed cleanup remain visible
 reconciliation debt; they are not reported as successful shutdown.
 
 ## Remote HTTPS servers
