@@ -31,6 +31,7 @@ from .connection import (
     require_owner_did as _require_owner_did,
 )
 from .images import normalize_image_ref
+from ._lifecycle import run_cleanup_steps
 
 from .constants import (
     SESSION_CONNECT_TIMEOUT_SHORT,
@@ -518,15 +519,14 @@ class MCPGatewayManager:
         """Start and publish only a gateway with a working native connection."""
         if servers is None:
             servers = ["fetch"]
-        published = False
         try:
             auth_token = await self.gateway.start(servers)
-            tools = await self._connect(auth_token)
-            published = True
-            return tools
-        finally:
-            if not published:
-                await self.stop()
+            return await self._connect(auth_token)
+        except BaseException as failure:
+            # Retain the actual startup/cancellation source if profile or
+            # process retirement independently fails during the same attempt.
+            await run_cleanup_steps([(True, self.stop)], failure=failure)
+            raise AssertionError("Failed MCP gateway startup unexpectedly returned")
 
     async def _disconnect(self):
         connection = self.connection
@@ -553,10 +553,7 @@ class MCPGatewayManager:
 
     async def stop(self):
         """Join the client owner before stopping the gateway process."""
-        try:
-            await self._disconnect()
-        finally:
-            await self.gateway.stop()
+        await run_cleanup_steps([(True, self._disconnect), (True, self.gateway.stop)])
 
     async def enable_server(self, server_name: str):
         await self._disconnect()

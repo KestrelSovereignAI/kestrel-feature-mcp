@@ -20,8 +20,14 @@ Usage:
 import asyncio
 import contextlib
 import logging
+import json
 import os
+import re
+from pathlib import Path
+import shutil
+import tempfile
 import secrets
+import signal
 import socket
 import subprocess
 import threading
@@ -34,6 +40,9 @@ from .constants import (
     SSH_COMMAND_TIMEOUT_DEFAULT,
     HTTP_TIMEOUT_SHORT,
 )
+
+from ._lifecycle import join_maintenance, run_cleanup_steps
+from .registry import docker_catalog_reference, list_docker_catalog_servers
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +133,11 @@ class DockerMCPGateway:
         self.port = port
         self.session_timeout = session_timeout
         self.process: Optional[subprocess.Popen] = None
+        self._profile_id: str | None = None
+        self._profile_pending: str | None = None
+        self._stop_owner: asyncio.Task | None = None
+        self._config_directory: Path | None = None
+        self._process_env: dict[str, str] | None = None
         # Streamable HTTP authenticates via the MCP_GATEWAY_AUTH_TOKEN env var
         # (the gateway prints no Bearer line), so we mint the token up-front and
         # inject it into the gateway process and send it on every request.
@@ -218,38 +232,44 @@ class DockerMCPGateway:
             DockerMCPNotInstalledError: If Docker MCP is not available
             DockerMCPGatewayError: If gateway fails to start
         """
+        if os.name != "posix":
+            raise DockerMCPGatewayError("Native Docker Gateway ownership requires POSIX process groups")
         if not self.check_docker_mcp_available():
             raise DockerMCPNotInstalledError(
                 "Docker MCP Toolkit is not installed. "
                 "Please install Docker Desktop 29+ with MCP Toolkit enabled."
             )
 
+        if not servers or any(not isinstance(server, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", server)
+                              for server in servers):
+            raise ValueError("MCP gateway needs exact catalog server names, without patterns or separators")
+        reference = docker_catalog_reference()
+        available = {entry["name"] for entry in await list_docker_catalog_servers(reference=reference)}
+        missing = set(servers) - available
+        if missing:
+            raise DockerMCPGatewayError("Servers absent from the configured Docker MCP catalog: " + ", ".join(sorted(missing)))
         await self.stop()
-
-        if not servers or any(not server or "," in server for server in servers):
-            raise ValueError("MCP gateway needs a non-empty list of server names")
-        # --servers is the gateway's authoritative per-process selection. The
-        # old global `docker mcp server enable` command was removed by Docker.
+        self._prepare_gateway_configuration()
+        await self._create_profile(reference, sorted(set(servers)))
         self.requested_servers = set(servers)
 
         # Resolve the port at bind time: an explicit port is honoured, otherwise
         # pick a fresh ephemeral one so two gateways never fight over :9000 (#12).
         self.port = self._requested_port or self._find_free_port()
 
-        servers_arg = ",".join(sorted(self.requested_servers))
         cmd = [
             "docker", "mcp", "gateway", "run",
             f"--transport={self.transport}",
             f"--port={self.port}",
             "--host=127.0.0.1",
-            f"--servers={servers_arg}",
+            f"--profile={self._profile_id}",
         ]
         if self.long_lived:
             # Keep server containers alive across calls so stateful servers
             # retain in-process state (#12 follow-up); reaped on gateway stop.
             cmd.append("--long-lived")
 
-        env = dict(os.environ)
+        env = dict(self._process_env)
         self.auth_token = secrets.token_hex(24)
         env["MCP_GATEWAY_AUTH_TOKEN"] = self.auth_token
 
@@ -262,6 +282,7 @@ class DockerMCPGateway:
             text=True,
             bufsize=1,
             env=env,
+            start_new_session=True,
         )
 
         # Hand stdout to a single lifelong drainer thread (F398). It keeps the
@@ -408,43 +429,152 @@ class DockerMCPGateway:
         remaining = self.session_timeout - elapsed
         return max(0, remaining)
 
-    async def stop(self):
-        """Stop the gateway process."""
-        self._cancel_timeout_task()
+    def _prepare_gateway_configuration(self):
+        # The fixed profile must expose its concrete tools, never Docker's
+        # mcp-exec/code-mode dispatchers that could bypass a mounted-tool denial.
+        # Scope that native CLI setting to this process; preserve the operator's
+        # config and context store rather than rewriting their feature settings.
+        source = Path(os.environ.get("DOCKER_CONFIG", str(Path.home() / ".docker"))).resolve()
+        try:
+            configuration = json.loads((source / "config.json").read_text())
+        except FileNotFoundError:
+            configuration = {}
+        except json.JSONDecodeError as error:
+            raise DockerMCPGatewayError("Docker CLI config.json is not valid JSON") from error
+        if not isinstance(configuration, dict):
+            raise DockerMCPGatewayError("Docker CLI configuration must be a JSON object")
+        features = configuration.get("features")
+        if features is None:
+            features = configuration["features"] = {}
+        if not isinstance(features, dict):
+            raise DockerMCPGatewayError("Docker CLI features must be an object or null")
+        features["dynamic-tools"] = "disabled"
+        plugin_directories = configuration.get("cliPluginsExtraDirs")
+        if plugin_directories is None:
+            plugin_directories = configuration["cliPluginsExtraDirs"] = []
+        if not isinstance(plugin_directories, list) or any(not isinstance(path, str) for path in plugin_directories):
+            raise DockerMCPGatewayError("Docker CLI cliPluginsExtraDirs must be a string array or null")
+        plugin_directories.append(str(source / "cli-plugins"))
+        parent = source / "mcp" / "owned-gateways"
+        parent.mkdir(parents=True, exist_ok=True)
+        directory = Path(tempfile.mkdtemp(prefix="kestrel-", dir=parent))
+        self._config_directory = directory
+        descriptor = os.open(directory / "config.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(configuration, stream)
+        if (source / "contexts").exists():
+            (directory / "contexts").symlink_to(source / "contexts", target_is_directory=True)
+        self._process_env = dict(os.environ, DOCKER_CONFIG=str(directory))
 
-        if self.process:
-            logger.info("Stopping Docker MCP Gateway...")
-            try:
-                self.process.terminate()
+    async def _remove_gateway_configuration(self):
+        if self.process is not None or self._profile_id is not None or self._profile_pending is not None:
+            raise DockerMCPGatewayError("Native gateway resources still retain their process configuration")
+        if self._config_directory is not None:
+            shutil.rmtree(self._config_directory)
+            self._config_directory = None
+            self._process_env = None
+
+    async def _profile_command(self, arguments, *, acknowledged=None):
+        async def command():
+            result = await asyncio.to_thread(subprocess.run,
+                ["docker", "mcp", "profile", *arguments], capture_output=True, text=True,
+                timeout=SSH_COMMAND_TIMEOUT_DEFAULT, env=self._process_env)
+            if result.returncode != 0:
+                raise DockerMCPGatewayError("Docker MCP profile operation failed: " + result.stderr.strip())
+            if acknowledged is not None:
+                acknowledged()
+            return result
+
+        # A caller's cancellation must observe the actual CLI result before
+        # releasing custody of a profile that the CLI may have committed.
+        owner = asyncio.create_task(command(), name="mcp-native-profile-command")
+        await join_maintenance(owner, "Docker MCP profile operation")
+        return owner.result()
+
+    async def _create_profile(self, reference, servers):
+        profile = "kestrel-" + secrets.token_hex(16)
+        self._profile_pending = profile
+
+        def acknowledged():
+            self._profile_id = profile
+            self._profile_pending = None
+
+        await self._profile_command([
+            "create", "--id", profile, "--name", "Kestrel owned MCP gateway",
+            *[item for server in servers for item in ("--server", f"catalog://{reference}/{server}")],
+        ], acknowledged=acknowledged)
+
+    async def _remove_profile(self):
+        if self.process is not None:
+            raise DockerMCPGatewayError("Cannot remove an MCP profile before its gateway has physically stopped")
+        if self._profile_pending is not None:
+            raise DockerMCPGatewayError(
+                "MCP profile creation was not acknowledged; reconcile profile " + self._profile_pending)
+        if self._profile_id is None:
+            return
+        profile = self._profile_id
+
+        def acknowledged():
+            self._profile_id = None
+
+        await self._profile_command(["remove", profile], acknowledged=acknowledged)
+
+    async def _stop_process(self):
+        process = self.process
+        if process is not None:
+            def signal_group(kind):
                 try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(self.process.wait),
-                        timeout=HTTP_TIMEOUT_SHORT
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("Gateway didn't terminate gracefully, killing...")
-                    self.process.kill()
-                    await asyncio.to_thread(self.process.wait)
-            except Exception as e:
-                logger.warning(f"Error stopping gateway: {e}")
-            finally:
-                # The process is dead, so stdout is at EOF and the drainer's
-                # readline loop has ended (F398) — join it so no orphan thread
-                # outlives the gateway.
-                self._feed_startup_queue = False
-                if self._stdout_thread is not None:
-                    await asyncio.to_thread(self._stdout_thread.join, 2.0)
-                    self._stdout_thread = None
-                self._startup_queue = None
-                self.process = None
-                self.auth_token = None
-                self._start_time = None
-                logger.info("Gateway stopped")
-        # requested_servers tracks what THIS gateway process is serving; a stopped
-        # gateway serves nothing. restart()/add_server()/remove_server() all
-        # snapshot the desired list before calling stop(), so clearing here is
-        # safe and keeps the set from accumulating stale servers across restarts.
-        self.requested_servers.clear()
+                    os.killpg(process.pid, kind)
+                except ProcessLookupError:
+                    pass  # The original private process group already retired.
+
+            def group_alive():
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    return False
+                return True
+
+            async def await_group():
+                deadline = time.monotonic() + HTTP_TIMEOUT_SHORT
+                while group_alive() and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                return not group_alive()
+
+            signal_group(signal.SIGTERM)
+            try:
+                await asyncio.to_thread(process.wait, timeout=HTTP_TIMEOUT_SHORT)
+            except subprocess.TimeoutExpired:
+                signal_group(signal.SIGKILL)
+                await asyncio.to_thread(process.wait, timeout=HTTP_TIMEOUT_SHORT)
+            if not await await_group():
+                signal_group(signal.SIGKILL)
+                if not await await_group():
+                    raise DockerMCPGatewayError("Original MCP gateway process group did not physically retire")
+            self._feed_startup_queue = False
+            if self._stdout_thread is not None:
+                await asyncio.to_thread(self._stdout_thread.join, HTTP_TIMEOUT_SHORT)
+                if self._stdout_thread.is_alive():
+                    raise DockerMCPGatewayError("MCP gateway output owner did not physically retire")
+            self._stdout_thread = None
+            self._startup_queue = None
+            self.process = None
+            self.auth_token = None
+            self._start_time = None
+
+    async def stop(self):
+        """Join the original process retirement before removing its owned profile."""
+        if self._timeout_task is not asyncio.current_task():
+            self._cancel_timeout_task()
+        owner = self._stop_owner
+        if owner is None or owner.done():
+            async def retire():
+                await run_cleanup_steps([(True, self._stop_process), (True, self._remove_profile),
+                                         (True, self._remove_gateway_configuration)])
+                self.requested_servers.clear()
+            owner = asyncio.create_task(retire(), name="mcp-native-gateway-retirement")
+            self._stop_owner = owner
+        await join_maintenance(owner, "Docker MCP gateway retirement")
 
     async def restart(self, servers: List[str] = None) -> str:
         """Restart the gateway with optionally different servers."""

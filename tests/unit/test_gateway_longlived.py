@@ -1,9 +1,8 @@
 """Unit tests for the gateway --long-lived flag (#12 follow-up).
 
-Without long-lived containers the gateway runs a throwaway container per tool
-call, so stateful MCP servers lose in-process state between calls. We default
-to long-lived; these assert the flag wiring (the stateful behaviour itself is
-covered by the live integration probe).
+Constructor contracts remain pure unit checks. Actual command wiring and
+session ownership are exercised through the native Docker CLI by the Core
+Gateway permission and cancellation campaign, with physical effect witnesses.
 """
 
 from kestrel_feature_mcp.gateway import DockerMCPGateway
@@ -19,54 +18,3 @@ def test_long_lived_can_be_disabled():
     gw = DockerMCPGateway(long_lived=False)
     assert gw.long_lived is False
     assert MCPGatewayManager(long_lived=False).gateway.long_lived is False
-
-
-def test_start_cmd_includes_long_lived_when_enabled(monkeypatch):
-    captured = {}
-
-    class _FakePopen:
-        def __init__(self, cmd, **kw):
-            captured["cmd"] = cmd
-            self.returncode = None
-            self.stdout = self
-            self._lines = iter(["> Start streaming server on port 12345\n"])
-
-        def readline(self):
-            # Emit the ready line once, then '' (EOF) so the F398 stdout
-            # drainer terminates instead of hot-looping on a repeating line.
-            return next(self._lines, "")
-
-        def poll(self):
-            return self.returncode
-
-        def terminate(self):
-            self.returncode = 0
-
-        def wait(self):
-            return self.returncode
-
-    monkeypatch.setattr("kestrel_feature_mcp.gateway.subprocess.Popen", _FakePopen)
-    monkeypatch.setattr(DockerMCPGateway, "check_docker_mcp_available", staticmethod(lambda: True))
-
-    async def _ready(self, timeout=10.0):
-        return True
-
-    monkeypatch.setattr(DockerMCPGateway, "_wait_port_listening", _ready)
-
-    import asyncio
-
-    gw = DockerMCPGateway(port=12345)
-    asyncio.run(gw.start(["sequentialthinking"]))
-    assert "--long-lived" in captured["cmd"]
-    assert "--servers=sequentialthinking" in captured["cmd"]
-    assert "--host=127.0.0.1" in captured["cmd"]
-
-    # A new explicit selection replaces the old selection on this process;
-    # it does not retain servers from an earlier start.
-    asyncio.run(gw.start(["time"]))
-    assert gw.requested_servers == {"time"}
-    assert "--servers=time" in captured["cmd"]
-
-    gw2 = DockerMCPGateway(port=12346, long_lived=False)
-    asyncio.run(gw2.start(["sequentialthinking"]))
-    assert "--long-lived" not in captured["cmd"]
