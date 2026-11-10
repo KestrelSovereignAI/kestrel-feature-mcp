@@ -459,13 +459,13 @@ class TestMounting:
         gw.enable_server = AsyncMock()
         feat = _feature(gateway=gw)
 
-        async def _known():
-            return {"fetch", "sqlite"}
-        monkeypatch.setattr(feat, "_known_catalog_servers", _known)
+        async def _known(*, reference=None):
+            return [{"name": name} for name in ("fetch", "sqlite")]
+        monkeypatch.setattr("kestrel_feature_mcp.gateway.list_docker_catalog_servers", _known)
 
         res = await feat.gateway_enable("this-server-does-not-exist-xyz")
         assert res.status is ToolResultStatus.ERROR
-        assert "unknown mcp server" in (res.error or "").lower()
+        assert "absent from the configured Docker MCP catalog" in (res.error or "")
         gw.enable_server.assert_not_called()
 
     @pytest.mark.asyncio
@@ -479,9 +479,9 @@ class TestMounting:
         gw.get_all_tools = MagicMock(return_value=[])
         feat = _feature(gateway=gw)
 
-        async def _known():
-            return {"fetch", "sqlite"}
-        monkeypatch.setattr(feat, "_known_catalog_servers", _known)
+        async def _known(*, reference=None):
+            return [{"name": name} for name in ("fetch", "sqlite")]
+        monkeypatch.setattr("kestrel_feature_mcp.gateway.list_docker_catalog_servers", _known)
 
         res = await feat.gateway_enable("sqlite")
         assert res.status is ToolResultStatus.PARTIAL
@@ -500,18 +500,17 @@ class TestMounting:
         ])
         feat = _feature(gateway=gw)
 
-        async def _known():
-            return {"fetch", "sqlite"}
-        monkeypatch.setattr(feat, "_known_catalog_servers", _known)
+        async def _known(*, reference=None):
+            return [{"name": name} for name in ("fetch", "sqlite")]
+        monkeypatch.setattr("kestrel_feature_mcp.gateway.list_docker_catalog_servers", _known)
 
         res = await feat.gateway_enable("sqlite")
         assert res.status is ToolResultStatus.OK
         assert res.data["new_tools"] == ["sqlite_query"]
 
     @pytest.mark.asyncio
-    async def test_unverifiable_catalog_does_not_false_reject(self, monkeypatch):
-        """When no catalog is resolvable, validation must be SKIPPED (a
-        false rejection is its own honesty violation)."""
+    async def test_unverifiable_launch_catalog_refuses_gateway_replacement(self, monkeypatch):
+        """Missing authoritative metadata cannot authorize a replacement."""
         gw = MagicMock()
         gw.is_connected = True
         gw.tools = {}
@@ -519,15 +518,15 @@ class TestMounting:
         gw.get_all_tools = MagicMock(return_value=[])
         feat = _feature(gateway=gw)
 
-        async def _known():
-            return None
-        monkeypatch.setattr(feat, "_known_catalog_servers", _known)
+        async def _known(*, reference=None):
+            from kestrel_feature_mcp.registry import DockerCatalogError
+            raise DockerCatalogError("owned catalog is unavailable")
+        monkeypatch.setattr("kestrel_feature_mcp.gateway.list_docker_catalog_servers", _known)
 
         res = await feat.gateway_enable("some-unverifiable-server")
-        # Proceeds to enable (no FAILED on unknown name); honesty about
-        # the result is then governed by the new-tools delta.
-        gw.enable_server.assert_awaited_once()
-        assert res.status is not ToolResultStatus.ERROR
+        gw.enable_server.assert_not_awaited()
+        assert res.status is ToolResultStatus.ERROR
+        assert "owned catalog is unavailable" in res.error
 
     def test_generated_handles_are_provider_valid(self):
         # The host sanitises, but the proposed handles should already be tame.

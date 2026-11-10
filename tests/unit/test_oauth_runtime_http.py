@@ -724,7 +724,7 @@ async def permission_mount(b, producer, monkeypatch):
     def manager_factory(**kwargs):
         manager = MCPGatewayManager(**kwargs)
         manager.gateway = SimpleNamespace(endpoint_url=endpoint,
-            is_running=True, start=start, stop=stop)
+            is_running=True, start=start, stop=stop, validate_servers=known_catalog)
         managers.append(manager)
         return manager
 

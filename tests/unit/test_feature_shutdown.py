@@ -323,6 +323,7 @@ async def test_shutdown_rechecks_each_docker_producer_await_and_discloses_saved_
     )
     monkeypatch.setattr(MCPToolManager, "create", AsyncMock(return_value=manager))
     gateway = SimpleNamespace(tools={}, is_connected=producer == "gateway-add", stop=AsyncMock(),
+                              gateway=SimpleNamespace(requested_servers={"time"}),
                               get_all_tools=lambda: [{"name": "echo", "description": "", "inputSchema": {"type": "object"}}],
                               tool_caller=lambda: AsyncMock())
 

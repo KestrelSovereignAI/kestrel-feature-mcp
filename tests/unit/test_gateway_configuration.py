@@ -63,3 +63,23 @@ def test_invalid_configuration_fails_before_allocating_private_resources(tmp_pat
     assert original.read_text() == body
     assert gateway._config_directory is None and gateway._profile_id is None
     assert not (source / "mcp").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("certificate_path", [None, "", "explicit-certificate-directory"])
+async def test_private_configuration_preserves_native_docker_tls_certificate_lookup(tmp_path, monkeypatch, certificate_path):
+    source = tmp_path / "docker"
+    source.mkdir()
+    monkeypatch.setenv("DOCKER_CONFIG", str(source))
+    monkeypatch.setenv("DOCKER_TLS_VERIFY", "1")
+    if certificate_path is None:
+        monkeypatch.delenv("DOCKER_CERT_PATH", raising=False)
+    else:
+        monkeypatch.setenv("DOCKER_CERT_PATH", certificate_path)
+    gateway = DockerMCPGateway()
+    try:
+        gateway._prepare_gateway_configuration()
+        actual = gateway._process_env.get("DOCKER_CERT_PATH")
+        assert actual == (certificate_path or str(source))
+    finally:
+        await gateway.stop()

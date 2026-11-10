@@ -138,6 +138,8 @@ class DockerMCPGateway:
         self._stop_owner: asyncio.Task | None = None
         self._config_directory: Path | None = None
         self._process_env: dict[str, str] | None = None
+        self._container_server_names: tuple[str, ...] = ()
+        self._containers_retired = True
         # Streamable HTTP authenticates via the MCP_GATEWAY_AUTH_TOKEN env var
         # (the gateway prints no Bearer line), so we mint the token up-front and
         # inject it into the gateway process and send it on every request.
@@ -240,14 +242,7 @@ class DockerMCPGateway:
                 "Please install Docker Desktop 29+ with MCP Toolkit enabled."
             )
 
-        if not servers or any(not isinstance(server, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", server)
-                              for server in servers):
-            raise ValueError("MCP gateway needs exact catalog server names, without patterns or separators")
-        reference = docker_catalog_reference()
-        available = {entry["name"] for entry in await list_docker_catalog_servers(reference=reference)}
-        missing = set(servers) - available
-        if missing:
-            raise DockerMCPGatewayError("Servers absent from the configured Docker MCP catalog: " + ", ".join(sorted(missing)))
+        reference, servers = await self.validate_servers(servers)
         await self.stop()
         self._prepare_gateway_configuration()
         await self._create_profile(reference, sorted(set(servers)))
@@ -275,6 +270,7 @@ class DockerMCPGateway:
 
         logger.info(f"Starting Docker MCP Gateway: {' '.join(cmd)}")
 
+        self._containers_retired = False
         self.process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -465,31 +461,51 @@ class DockerMCPGateway:
         if (source / "contexts").exists():
             (directory / "contexts").symlink_to(source / "contexts", target_is_directory=True)
         self._process_env = dict(os.environ, DOCKER_CONFIG=str(directory))
+        # Docker CLI resolves implicit TLS files from DOCKER_CONFIG. Keep its
+        # original lookup when isolating the unrelated Gateway feature flags.
+        self._process_env["DOCKER_CERT_PATH"] = os.environ.get("DOCKER_CERT_PATH") or str(source)
 
     async def _remove_gateway_configuration(self):
-        if self.process is not None or self._profile_id is not None or self._profile_pending is not None:
+        if (self.process is not None or self._profile_id is not None or self._profile_pending is not None
+                or not self._containers_retired):
             raise DockerMCPGatewayError("Native gateway resources still retain their process configuration")
         if self._config_directory is not None:
             shutil.rmtree(self._config_directory)
             self._config_directory = None
             self._process_env = None
 
-    async def _profile_command(self, arguments, *, acknowledged=None):
+    async def _docker_command(self, arguments, label, *, acknowledged=None):
         async def command():
             result = await asyncio.to_thread(subprocess.run,
-                ["docker", "mcp", "profile", *arguments], capture_output=True, text=True,
+                ["docker", *arguments], capture_output=True, text=True,
                 timeout=SSH_COMMAND_TIMEOUT_DEFAULT, env=self._process_env)
             if result.returncode != 0:
-                raise DockerMCPGatewayError("Docker MCP profile operation failed: " + result.stderr.strip())
+                raise DockerMCPGatewayError("Docker MCP " + label + " operation failed: " + result.stderr.strip())
             if acknowledged is not None:
                 acknowledged()
             return result
 
         # A caller's cancellation must observe the actual CLI result before
         # releasing custody of a profile that the CLI may have committed.
-        owner = asyncio.create_task(command(), name="mcp-native-profile-command")
-        await join_maintenance(owner, "Docker MCP profile operation")
+        owner = asyncio.create_task(command(), name="mcp-native-docker-command")
+        await join_maintenance(owner, "Docker MCP " + label + " operation")
         return owner.result()
+
+    async def _profile_command(self, arguments, *, acknowledged=None):
+        return await self._docker_command(["mcp", "profile", *arguments], "profile", acknowledged=acknowledged)
+
+    @staticmethod
+    async def validate_servers(servers):
+        """Resolve the one authoritative selection before any replacement."""
+        if not servers or any(not isinstance(server, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", server)
+                              for server in servers):
+            raise ValueError("MCP gateway needs exact catalog server names, without patterns or separators")
+        reference = docker_catalog_reference()
+        available = {entry["name"] for entry in await list_docker_catalog_servers(reference=reference)}
+        missing = set(servers) - available
+        if missing:
+            raise DockerMCPGatewayError("Servers absent from the configured Docker MCP catalog: " + ", ".join(sorted(missing)))
+        return reference, sorted(set(servers))
 
     async def _create_profile(self, reference, servers):
         profile = "kestrel-" + secrets.token_hex(16)
@@ -504,9 +520,37 @@ class DockerMCPGateway:
             *[item for server in servers for item in ("--server", f"catalog://{reference}/{server}")],
         ], acknowledged=acknowledged)
 
+        # Native profiles contain editable server snapshots. Give this owned
+        # instance unique native server names, which Docker itself writes into
+        # container labels; ordinary catalog names cannot identify one Gateway
+        # among concurrent users of the same server. Keep public tool prefixes.
+        document = self._config_directory / "profile.json"
+        descriptor = os.open(document, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+        await self._profile_command(["export", profile, str(document)])
+        configuration = json.loads(document.read_text())
+        if configuration.get("id") != profile or configuration.get("version") != 1:
+            raise DockerMCPGatewayError("Native Docker profile export has an unexpected identity or version")
+        entries = configuration["servers"]
+        actual_names = [entry["snapshot"]["server"]["name"] for entry in entries]
+        if sorted(actual_names) != servers:
+            raise DockerMCPGatewayError("Native Docker profile export does not retain the requested servers")
+        prefix_names = json.loads((self._config_directory / "config.json").read_text())["features"].get("tool-name-prefix") == "enabled"
+        self._container_server_names = tuple(profile + "-" + name for name in actual_names)
+        for entry, owned_name in zip(entries, self._container_server_names, strict=True):
+            snapshot = entry["snapshot"]["server"]
+            if prefix_names and not snapshot.get("prefix"):
+                snapshot["prefix"] = snapshot["name"]
+            snapshot["name"] = owned_name
+        document.write_text(json.dumps(configuration))
+        self._profile_pending = profile
+        await self._profile_command(["import", str(document)], acknowledged=acknowledged)
+
     async def _remove_profile(self):
         if self.process is not None:
             raise DockerMCPGatewayError("Cannot remove an MCP profile before its gateway has physically stopped")
+        if not self._containers_retired:
+            raise DockerMCPGatewayError("Native MCP container retirement is unconfirmed; retain its profile for reconciliation")
         if self._profile_pending is not None:
             raise DockerMCPGatewayError(
                 "MCP profile creation was not acknowledged; reconcile profile " + self._profile_pending)
@@ -518,6 +562,26 @@ class DockerMCPGateway:
             self._profile_id = None
 
         await self._profile_command(["remove", profile], acknowledged=acknowledged)
+
+    async def _retire_containers(self):
+        """Physically retire only daemon resources bearing this native profile's unique names."""
+        if self._containers_retired:
+            return
+        if self.process is not None or not self._container_server_names:
+            raise DockerMCPGatewayError("Native MCP process/container ownership is still unresolved")
+        for name in self._container_server_names:
+            command = ["container", "ls", "--all", "--quiet", "--no-trunc",
+                       "--filter", "label=docker-mcp=true", "--filter", "label=docker-mcp-name=" + name]
+            result = await self._docker_command(command, "container inventory")
+            identities = result.stdout.splitlines()
+            if any(not re.fullmatch(r"[0-9a-f]{64}", identity) for identity in identities):
+                raise DockerMCPGatewayError("Native Docker container inventory returned an invalid identity")
+            for identity in identities:
+                await self._docker_command(["container", "rm", "--force", identity], "container retirement")
+            confirmed = await self._docker_command(command, "container retirement confirmation")
+            if confirmed.stdout.strip():
+                raise DockerMCPGatewayError("Native MCP containers remain; retain their profile for reconciliation")
+        self._containers_retired = True
 
     async def _stop_process(self):
         process = self.process
@@ -569,7 +633,7 @@ class DockerMCPGateway:
         owner = self._stop_owner
         if owner is None or owner.done():
             async def retire():
-                await run_cleanup_steps([(True, self._stop_process), (True, self._remove_profile),
+                await run_cleanup_steps([(True, self._stop_process), (True, self._retire_containers), (True, self._remove_profile),
                                          (True, self._remove_gateway_configuration)])
                 self.requested_servers.clear()
             owner = asyncio.create_task(retire(), name="mcp-native-gateway-retirement")
@@ -580,7 +644,6 @@ class DockerMCPGateway:
         """Restart the gateway with optionally different servers."""
         if servers is None:
             servers = list(self.requested_servers)
-        await self.stop()
         return await self.start(servers)
 
     async def add_server(self, server_name: str) -> str:
