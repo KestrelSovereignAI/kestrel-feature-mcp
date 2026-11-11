@@ -159,11 +159,39 @@ jobs:
         run: |
           "$RUNNER_TEMP/mcp-apps-install/bin/python" -I tests/packaging/sandbox_container.py
         timeout-minutes: 5
-      - name: Verify native Apps and OAuth through Core and independent HTTP peers
-        run: |
-          uv sync --locked --extra test --python 3.14
-          uv run --no-sync python -m pytest tests/browser/test_parent_bridge.py tests/browser/test_oauth_panel.py tests/browser/test_oauth_failure_panel.py tests/browser/test_oauth_hosted_panel.py -q --timeout=60
+
+  apps-native-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build-check
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - name: Install the public native dependency set
+        run: uv sync --locked --extra test --python 3.14
         timeout-minutes: 5
+      - name: Verify native Apps and OAuth in an owned process namespace
+        run: uv run --no-sync python tests/browser/run_native.py --output "$RUNNER_TEMP/native-browser"
+        timeout-minutes: 10
+      - name: Verify the original native container owner on failure and late forks
+        run: >-
+          uv run --no-sync python -m pytest tests/integration/test_browser_container.py
+          -q --timeout=30 --browser-build-receipt="$RUNNER_TEMP/native-browser/build.json"
+        timeout-minutes: 3
+      - name: Retire the original browser container
+        if: ${{ always() }}
+        run: uv run --no-sync python tests/browser/run_native.py --output "$RUNNER_TEMP/native-browser" --cleanup
+        timeout-minutes: 2
+      - name: Preserve native browser results and custody receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-browser-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-browser/
+          if-no-files-found: error
 
   install-check:
     runs-on: ubuntu-latest

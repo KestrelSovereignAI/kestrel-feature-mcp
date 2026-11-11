@@ -1,5 +1,22 @@
 import { chromium, expect } from '@playwright/test';
+import { createInterface } from 'node:readline';
+
+const policy = process.argv[3] ?? 'allow';
+if (!['allow', 'ask', 'deny'].includes(policy)) throw new TypeError('Unknown browser permission campaign');
+const controlled = policy !== 'allow';
+const input = createInterface({ input: process.stdin });
+const commands = input?.[Symbol.asyncIterator]();
+async function checkpoint(event) {
+    process.stdout.write(JSON.stringify(event) + '\n');
+    const command = await commands.next();
+    if (command.done || command.value !== 'continue') throw new Error('Original browser campaign was retired');
+}
+
 const browser = await chromium.launch();
+let closing;
+const closeOriginalBrowser = () => closing ??= browser.close();
+const terminate = () => { input?.close(); void closeOriginalBrowser(); };
+process.once('SIGTERM', terminate);
 try {
     const page = await browser.newPage();
     const calls = [];
@@ -13,6 +30,7 @@ try {
     await page.waitForFunction(() => window.nativeParentReady).catch(error => {
         throw new Error(`Core parent startup failed: ${JSON.stringify(errors)}`, { cause: error });
     });
+    await checkpoint({ event: 'initial-rendered' });
     await expect(page.locator('iframe')).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Open App', exact: true })).toBeEnabled();
     await page.getByRole('button', { name: 'Open App', exact: true }).click();
@@ -22,12 +40,19 @@ try {
     expect(await frames.locator('body').evaluate(() => window.origin)).toBe('null');
     await frames.getByRole('button', { name: 'List App tools' }).click();
     await expect(frames.locator('#native-result')).toHaveText('catalog-filtered');
-    await frames.getByRole('button', { name: 'Native governed call' }).click();
-    await expect(frames.locator('#native-result')).toHaveText('native-call:{"view":"only"}');
-    const secondReply = page.waitForResponse(response => response.request().method() === 'POST'
-        && response.url().includes('/tools/call?'));
-    await frames.getByRole('button', { name: 'Native governed call' }).click();
-    expect((await secondReply).ok()).toBe(true);
+    for (let index = 1; index <= 2; index += 1) {
+        const reply = page.waitForResponse(response => response.request().method() === 'POST'
+            && response.url().includes('/tools/call?'));
+        await frames.getByRole('button', { name: 'Native governed call' }).click();
+        const response = await reply;
+        expect(response.ok()).toBe(true);
+        const result = await response.json();
+        const refused = policy === 'deny' || (policy === 'ask' && index === 2);
+        expect(result.isError === true, 'Original Core permission decision reached the native App').toBe(refused);
+        await expect(frames.locator('#native-result')).toHaveText(refused
+            ? 'native-call-refused' : 'native-call:{"view":"only"}');
+        if (controlled) await checkpoint({ event: 'call-completed', index, refused });
+    }
     const intended = calls.filter(call => call.name === 'app_mutate');
     expect(intended).toHaveLength(2);
     expect(new Set(intended.map(call => call.operation_id)).size).toBe(2);
@@ -52,5 +77,9 @@ try {
     process.stdout.write(JSON.stringify({ native_app_ready: true, governed_call: true,
         model_only_refused: true, catalog_filtered: true, opaque_view: true,
         explicit_open_close: true, navigation_closed: true, reopened: true, dom_retired: true,
-        distinct_operation_ids: true }) + '\n');
-} finally { await browser.close(); }
+        distinct_operation_ids: true, original_permission_decisions: true }) + '\n');
+} finally {
+    input?.close();
+    process.off('SIGTERM', terminate);
+    await closeOriginalBrowser();
+}

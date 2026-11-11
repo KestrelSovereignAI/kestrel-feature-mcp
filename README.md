@@ -657,6 +657,33 @@ npm test --prefix web
 The browser checks use the actual built standalone service, the official App
 and AppBridge, and an opaque View inside the separate-origin proxy. The Python
 browser lane also drives the actual Core chat renderer and authenticated HTTP
-controller, a native MCP peer and SQLite audit, including one governed effect,
-model-only tool refusal, navigation, reopening and DOM retirement. These checks
-do not establish deployed-host acceptance or vendor OAuth consent.
+controller, a native MCP peer and SQLite audit. ALLOW, ASK and DENY campaigns
+check external effects and every successful or refused dispatch row against the
+original agent, tool and chat. ASK approves one call, refuses replay of that
+approval and denies a fresh call. The checks also cover model-only tool refusal,
+navigation, reopening and DOM retirement.
+
+The `apps-native-browser` CI job and local runner use an explicitly owned
+container built from the immutable official Playwright image declared in
+`tests/browser/runtime.json`. The runner retains the original immutable Docker
+ID before startup, joins the entire namespace, and verifies its removal on
+success, failure or interruption. The container has no host mounts, Docker
+socket, external network or host PID namespace. A normal GitHub job container
+exposes its host Docker socket and is unsuitable for this boundary.
+
+Node/Playwright normally close through their original stdin and browser
+lifetime; a stalled shutdown is a test failure. Docker retires every child,
+including detached descendants or a child created during shutdown. Run locally
+with Docker running and the test extra installed:
+
+```bash
+uv run --locked --extra test --python 3.14 python tests/browser/run_native.py --output /absolute/temporary/browser-results
+```
+
+The output contains the source inventory, build log, JUnit results and original
+container receipt. `--cleanup` reconciles that same receipt; CI invokes it in an
+`always()` step as well as the runner's normal `finally` cleanup. Native Docker
+tests exercise the same owner on original failure, late forks and normal exit.
+These checks establish component integration; full Bootstrap, the actual
+approval dialog, deployed-host acceptance and real vendor OAuth consent remain
+separate acceptance work.
