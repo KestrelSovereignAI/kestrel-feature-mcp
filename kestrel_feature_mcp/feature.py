@@ -279,20 +279,26 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
         if publications is not None and app_registration_current() is not True:
             raise MCPHostCapabilityError("MCP Apps require the original active native Core feature registration")
         wrappers = build_wrappers(handle_prefix, tool_dicts, caller,
-            app_executor=publications.executor if publications is not None else None)
+            app_executor=publications.executor if publications is not None else None,
+            input_runtime=self._input_runtime)
         self._unmount_tools(owner)
-        if publications is None:
+        if publications is None and self._input_runtime is None:
             return self.agent.register_dynamic_tools(owner, wrappers)
         registered = []
         count = self.agent.register_dynamic_tools(owner, wrappers,
             on_registered=lambda tool, binding: registered.append(RegisteredAppTool(tool, binding)))
-        publications.register(owner, registered, is_current=app_registration_current)
+        if publications is not None:
+            publications.register(owner, registered, is_current=app_registration_current)
+        if self._input_runtime is not None:
+            self._input_runtime.register(owner, registered)
         return count
 
     def _unmount_tools(self, owner: str) -> int:
         """Remove all tools mounted under ``owner`` (inverse of _mount_tools)."""
         if self._apps_publications is not None:
             self._apps_publications.retire(owner)
+        if self._input_runtime is not None:
+            self._input_runtime.unregister(owner)
         if not self._host_supports_dynamic_tools():
             return 0
         return self.agent.unregister_dynamic_tools(owner)
@@ -1527,7 +1533,7 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
         # initialization gate also joins direct manager acquisition, so no
         # client can appear after the cleanup snapshot and escape custody.
         async with self._docker_operations, self._docker_initialization:
-            await run_cleanup_steps([(True, self._close_oauth), (True, self._close_apps), (True, self._release_connections)])
+            await run_cleanup_steps([(True, self._close_inputs), (True, self._close_oauth), (True, self._close_apps), (True, self._release_connections)])
 
     async def _release_connections(self):
         manager = self.manager

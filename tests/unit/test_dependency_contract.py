@@ -15,24 +15,16 @@ def test_remote_mcp_requires_the_shared_sdk_trust_bundle_policy():
     (sdk,) = [Requirement(raw) for raw in project["dependencies"]
               if Requirement(raw).name == "kestrel-sovereign-sdk"]
     assert sdk.extras == {"crypto", "httpx2"}
-    assert not sdk.specifier.contains("0.42.3")
-    assert not sdk.specifier.contains("0.42.4")
-    assert not sdk.specifier.contains("0.43.0")
-    assert not sdk.specifier.contains("0.44.0")
-    assert not sdk.specifier.contains("0.44.1")
-    assert not sdk.specifier.contains("0.45.0")
-    assert not sdk.specifier.contains("0.46.0")
-    assert not sdk.specifier.contains("0.47.0")
-    assert not sdk.specifier.contains("0.48.0")
-    assert not sdk.specifier.contains("0.51.0")
-    assert not sdk.specifier.contains("0.51.1")
-    assert sdk.specifier.contains("0.51.2")
+    minimum = max(Version(spec.version) for spec in sdk.specifier if spec.operator == '>=')
+    assert minimum >= Version('0.52.1')
+    assert not sdk.specifier.contains('0.52.0')
+    assert sdk.specifier.contains(str(minimum))
 
 
 def test_frozen_mcp_install_uses_public_patched_security_dependencies():
     packages = {item["name"]: item for item in tomllib.loads(
         (ROOT / "uv.lock").read_text())["package"]}
-    for name, floor in [("kestrel-sovereign-sdk", "0.51.2"), ("certifi", "2026.10.23"),
+    for name, floor in [("kestrel-sovereign-sdk", "0.52.1"), ("certifi", "2026.10.23"),
                         ("pyasn1", "0.6.5")]:
         assert Version(packages[name]["version"]) >= Version(floor)
         assert packages[name]["source"] == {"registry": "https://pypi.org/simple"}
@@ -43,13 +35,9 @@ def test_host_tests_require_native_apps_oauth_and_unconfirmed_outcomes():
     project = metadata["project"]
     (core,) = [Requirement(raw) for raw in project["optional-dependencies"]["test"]
                if Requirement(raw).name == "kestrel-sovereign"]
-    floor = Version("0.64.0")
-    assert any(spec.operator == ">=" and Version(spec.version) >= floor
-               for spec in core.specifier)
-    assert not core.specifier.contains("0.61.3")
-    assert not core.specifier.contains("0.62.0")
-    assert not core.specifier.contains("0.62.1")
-    assert not core.specifier.contains("0.63.1")
+    floor = max(Version(spec.version) for spec in core.specifier if spec.operator == '>=')
+    assert floor >= Version('0.64.4')
+    assert not core.specifier.contains('0.64.3')
     assert core.specifier.contains(str(floor))
     packages = {item["name"]: item for item in tomllib.loads(
         (ROOT / "uv.lock").read_text())["package"]}

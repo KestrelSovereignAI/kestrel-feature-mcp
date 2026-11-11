@@ -168,8 +168,8 @@ unload command refuses an OAuth connection so it cannot bypass the original
 principal's authority. Authorization alone grants no tool permission: calls still
 pass through Core's permission, approval, policy and audit boundary.
 
-Apps and OAuth share one feature configuration generation. Omitted settings are
-preserved, both domains are validated before replacement, and existing
+Apps, OAuth and operator input share one feature configuration generation. Omitted settings are
+preserved, all enabled domains are validated before replacement, and existing
 connections or pending authorizations must be retired before changing settings.
 
 ## Calling tools
@@ -336,8 +336,8 @@ requests); zero disables them. `KESTREL_MCP_STATE_ONLY_BACKOFF_INITIAL` and
 `KESTREL_MCP_STATE_ONLY_BACKOFF_MAX` default to 0.05 and 0.25 seconds, with capped
 exponential pacing. Low-level calls without an original host authority check
 do not continue. The SDK's automatic input loop stays disabled. Nonempty input
-requests are refused without fulfillment; operator-input continuation and durable
-resumption remain unfinished. MCP SDK 2.3 rejects an empty `inputRequests` map
+requests require the governed input host described below; without it they are
+refused without fulfillment. MCP SDK 2.3 rejects an empty `inputRequests` map
 without `requestState`; that response fails without retry, rather than bypassing
 the native validator. This is a documented SDK limitation, not full conformance.
 See the [MRTR specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr)
@@ -422,6 +422,68 @@ done
 Update the pinned harness and lock together, rerun the profile, and review
 new required scenarios as the remaining host capabilities land.
 
+## Optional operator input (0.16)
+
+Governed tool calls can pause for standard MCP form elicitation, including calls
+from an open MCP App. Input is disabled by default. It requires Core's durable,
+authenticated `mcp-input` host, introduced in the Core 0.65 delivery; earlier
+hosts refuse explicit enablement. Configure it before loading connections:
+
+```json
+{"inputs": {"enabled": true}}
+```
+
+For saved agent configuration, use the registered package key:
+
+```toml
+[features.mcp.config.inputs]
+enabled = true
+
+[features.mcp.config.inputs.host]
+max_pending = 64
+max_payload_bytes = 1048576
+max_request_bytes = 65536
+retention_seconds = 900.0
+operation_seconds = 30.0
+```
+
+An input card identifies the requesting server and permits review, modification,
+decline and cancellation. Server text is rendered as text. Form values are
+validated against the original schema, including its formats. Answers, original
+arguments and native request state stay out of conversation parts and browser
+storage. Core encrypts the checkpoint and answers under the agent's data key;
+preserve that key across restarts. `retention_seconds` is the response deadline,
+not a promise that encrypted reconciliation records are deleted at that time.
+
+The original turn returns control without awaiting the person. Submitting an
+answer creates a fresh governed dispatch under the authenticated principal,
+original chat, current connection contract, tool permissions and approvals.
+A durable compare-and-swap consumes each waiting revision before network I/O.
+The native SDK request keeps the exact original arguments and opaque
+`requestState`, supplies standard `inputResponses`, and receives a fresh RPC
+identifier. Reloading a card reads saved state, including subsequent form rounds;
+it does not repeat the original operation. A matching reconnected server can
+resume its checkpoint after a host restart if the remote state remains valid.
+
+App continuations retain the exact original physical View through private HTTP
+delivery. A closed, replaced or lost View cannot be adopted after restart.
+Completed private native results reach that View through AppBridge; an initial
+tool's completed App publication uses Core's audited part renderer. Another
+initial App call is refused while that View's input remains pending.
+
+Signal-driven and other unattended work receives an audited `no_approver`
+decline. URL-mode elicitation receives an audited standard decline, with no
+navigation. Legacy inline requests have no restartable checkpoint and are also
+declined. Resources and prompts do not acquire a tool's interactive authority;
+this delivery provides durable forms for governed tool calls. Unknown or
+already-consumed continuations remain fenced against replay, including when
+native execution completed but result storage or delivery failed.
+
+Durable MCP Tasks remains a separate capability and is not advertised yet.
+Its implementation uses the official SDK's public extension interface and the
+published Tasks schema, while MCP stays on the published official Python SDK.
+There is no MCP SDK fork or private protocol translation layer.
+
 ## Optional MCP Apps host
 
 The optional host composes native AppBridge rendering, Core-authenticated View
@@ -476,7 +538,7 @@ An unfinished close retains its original owner and is retried before re-enable.
 Version 0.8.0 introduced the native components described below; 0.9.0 added
 completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
-Version 0.14.1 requires Core 0.64.0 or newer and SDK 0.51.2 or newer for native
+Version 0.16 requires Core 0.64.4 or newer and SDK 0.52.1 or newer for native
 Apps, OAuth and durable tool outcome contracts. The test profile uses the same
 minimums. `uv sync --locked --extra test` resolves the host and the feature's
 runtime dependencies from the public package index.
