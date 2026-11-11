@@ -1,6 +1,7 @@
 import { chromium, expect } from '@playwright/test';
 
 const browser = await chromium.launch();
+const expectedContent = JSON.parse(process.argv[4] ?? 'null') ?? { city: 'owned-private-answer' };
 let closing;
 const close = () => closing ??= browser.close();
 const terminated = () => { void close(); };
@@ -21,12 +22,21 @@ try {
     const city = page.getByRole('textbox', { name: 'city', exact: true });
     await expect(city).toBeVisible();
     expect(await page.locator('body').innerText()).not.toContain('private-witness');
-    await city.fill('owned-private-answer');
+    if (expectedContent.city.startsWith('https:')) {
+        await city.fill('not a URI');
+        const rejected = page.waitForResponse(response => response.request().method() === 'POST'
+            && new URL(response.url()).pathname.endsWith('/responses'));
+        await page.getByRole('button', { name: 'Continue tool', exact: true }).click();
+        expect((await rejected).status()).toBe(400);
+        await expect(page.getByRole('status').filter({ hasText: 'response was not accepted' })).toHaveCount(1);
+        expect(await city.count(), 'Invalid input must preserve the form inside its original App View').toBe(1);
+    }
+    await city.fill(expectedContent.city);
     await page.getByRole('button', { name: 'Continue tool', exact: true }).click();
     await expect(app.locator('#input-app-result')).toHaveText('native-result:app-effect');
     await expect(city).toHaveCount(0);
     expect(posts.filter(path => path.endsWith('/tools/call'))).toHaveLength(1);
-    expect(posts.filter(path => path.endsWith('/responses'))).toHaveLength(1);
+    expect(posts.filter(path => path.endsWith('/responses'))).toHaveLength(expectedContent.city.startsWith('https:') ? 2 : 1);
     await page.getByRole('button', { name: 'Close App', exact: true }).click();
     await expect(page.locator('iframe')).toHaveCount(0);
     expect(errors).toEqual([]);

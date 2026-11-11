@@ -26,11 +26,12 @@ export function renderMCPForm(parent, schema) {
         const label = document.createElement('label');
         label.textContent = property.title ?? key;
         const required = Array.isArray(schema.required) && schema.required.includes(key);
-        let input, read;
+        let input, read, htmlRequired = required;
         const choices = enumChoices(property.type === 'array' ? property.items ?? {} : property);
         if (choices) {
             input = document.createElement('select');
             input.multiple = property.type === 'array';
+            if (input.multiple) htmlRequired = required && (property.minItems ?? 0) > 0;
             if (!input.multiple) {
                 const option = document.createElement('option');
                 option.value = ''; option.textContent = 'Choose a value'; input.append(option);
@@ -46,6 +47,7 @@ export function renderMCPForm(parent, schema) {
                 const values = Array.from(input.selectedOptions).filter(option => option.value !== '')
                     .map(option => choices[Number(option.value)].value);
                 if (input.multiple) {
+                    if (!values.length && !required) return undefined;
                     if (values.length < (property.minItems ?? 0) || values.length > (property.maxItems ?? Infinity)) {
                         throw new TypeError('Review the number of selected values');
                     }
@@ -63,6 +65,7 @@ export function renderMCPForm(parent, schema) {
             read = () => input.value === '' ? undefined : input.value === 'true';
         } else if (['string', 'number', 'integer'].includes(property.type)) {
             input = document.createElement('input');
+            if (property.type === 'string') htmlRequired = required && (property.minLength ?? 0) > 0;
             input.type = property.type === 'string' ? ({ email: 'email', date: 'date' }[property.format] ?? 'text') : 'number';
             if (property.type !== 'string') {
                 input.step = property.type === 'integer' ? '1' : 'any';
@@ -78,7 +81,9 @@ export function renderMCPForm(parent, schema) {
         } else {
             throw new TypeError('The server requested an unsupported form field');
         }
-        input.required = required;
+        // JSON Schema requires the property, not a nonempty string/array.
+        // read() supplies required empty values; the schema owns their limits.
+        input.required = htmlRequired;
         input.setAttribute('aria-label', property.title ?? key);
         input.autocomplete = 'off';
         label.append(input); parent.append(label);
@@ -175,9 +180,13 @@ export function mountMCPInput({ root, reference, sessionId, isCurrentChat, reque
                 }
             } catch (error) {
                 if (retired || !isCurrentChat()) return;
+                if (error.status === 400) {
+                    status.textContent = 'The response was not accepted. Review the form and try again.';
+                    buttons(false); submit.disabled = !supported;
+                    return;
+                }
                 content.replaceChildren();
-                status.textContent = error.status === 400 ? 'The response was not accepted. Reopen the card to review the form.'
-                    : error.status === 403 || error.status === 409 ? 'This input is unavailable for the current account or conversation.'
+                status.textContent = error.status === 403 || error.status === 409 ? 'This input is unavailable for the current account or conversation.'
                     : 'The continuation outcome is uncertain. Reopen the card to inspect its state; do not repeat the tool call.';
             } finally { busy = false; }
         }
