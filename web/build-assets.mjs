@@ -57,6 +57,7 @@ export async function buildSandboxAssets(outputDirectory) {
         ['src/sandbox-entry.js', 'sandbox-entry.js', 'browser', 'es2022'],
         ['src/sandbox-server-entry.js', 'sandbox-service.mjs', 'node', 'node22'],
         ['src/parent-entry.js', 'parent-entry.js', 'browser', 'es2022'],
+        ['src/input-entry.js', 'input-entry.js', 'browser', 'es2022'],
         ['src/oauth-panel.js', 'oauth-panel.js', 'browser', 'es2022'],
     ]) {
         const result = await build({ absWorkingDir: webRoot, entryPoints: [entry],

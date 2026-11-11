@@ -58,6 +58,14 @@ class MCPAppResultWithheld(ResourceOutcomeUnknown):
     """The call completed, but native delivery was refused; never replay it."""
 
 
+class MCPAppInputRequired(ResourceConflict):
+    """The native operation is durably paused, with no final App result yet."""
+
+    def __init__(self, view, suspension):
+        super().__init__('MCP App is waiting for operator input; do not repeat its call')
+        self.view, self.suspension = view, suspension
+
+
 @dataclass(frozen=True)
 class RegisteredAppTool:
     tool: MCPToolWrapper
@@ -68,12 +76,14 @@ class RegisteredAppTool:
 class _Invocation:
     view: AppView
     registered: RegisteredAppTool
+    input_reference: str | None = None
     native: types.CallToolResult | None = None
     projection: dict | None = None
     delivery_approved: bool = False
     started: bool = False
     finished: bool = False
     refusal: BaseException | None = None
+    suspension: object | None = None
 
 
 @dataclass(eq=False, frozen=True)
@@ -87,6 +97,7 @@ class AppView:
     _tools: Mapping[str, RegisteredAppTool] = field(repr=False)
     _owner_is_current: Callable[[], bool] = field(repr=False)
     _closed: bool = field(default=False, init=False)
+    _input_reference: str | None = field(default=None, init=False, repr=False)
     _calls: set[asyncio.Task] = field(default_factory=set, init=False, repr=False)
     _delivery_tasks: dict[asyncio.Task, asyncio.Future] = field(default_factory=dict, init=False, repr=False)
     _cancelled_calls: WeakSet[asyncio.Task] = field(default_factory=WeakSet, init=False, repr=False)
@@ -265,6 +276,18 @@ class AppExecutor:
 
     supports_owned_delivery = True
 
+    @staticmethod
+    def input_required(error, view):
+        """Expose only an audited suspension from this exact physical View."""
+        from .input_requests import MCPInputSuspension
+        if type(error) is not MCPAppInputRequired or error.view is not view:
+            return None
+        view.require_current()
+        suspension = error.suspension
+        if type(suspension) is not MCPInputSuspension or suspension.session_id != view.session_id:
+            raise ResourceConflict('Original MCP App input suspension changed')
+        return {'reference': suspension.reference, 'session_id': suspension.session_id}
+
     def __init__(self, *, host: DeferredToolResultHost, max_pending_calls: int,
                  initial_publisher: InitialAppPublisher | None = None):
         if type(max_pending_calls) is not int or max_pending_calls <= 0:
@@ -367,6 +390,8 @@ class AppExecutor:
         if invocation.registered.tool is not tool or tool.app_executor is not self:
             raise ResourceConflict("MCP App invocation cannot change its admitted tool")
         invocation.view.require_current()
+        if invocation.view._input_reference != invocation.input_reference:
+            raise ResourceConflict('MCP App must finish its original operator input before another call')
         if "app" not in tool.visibility:
             raise ResourceConflict("MCP tool is not available to Apps")
         invocation.started = True
@@ -381,6 +406,17 @@ class AppExecutor:
         self._require_capture(invocation)
         if (_rejected_before_execution(error) or issubclass(type(error), OAuthGrantChanged)) and not observed_outcome_unknown(error):
             invocation.refusal = error
+
+    def capture_suspension(self, invocation, suspension, projection):
+        self._require_capture(invocation)
+        invocation.suspension = suspension
+        object.__setattr__(invocation.view, '_input_reference', suspension.reference)
+        def approved():
+            self._require_capture(invocation)
+            invocation.view.require_current()
+            invocation.delivery_approved = True
+            return []
+        return DeferredToolResult(projection, publish=approved)
 
     def capture(self, invocation: _Invocation, native: types.CallToolResult,
                 projection: dict) -> DeferredToolResult:
@@ -403,17 +439,19 @@ class AppExecutor:
         return DeferredToolResult(projection, publish=approve_delivery)
 
     async def invoke(self, view: AppView, name: str, arguments: dict,
-                     *, operation_id: str) -> types.CallToolResult:
+                     *, operation_id: str, input_reference: str | None = None) -> types.CallToolResult:
         if view.executor is not self:
             raise ResourceConflict("MCP App View belongs to another host")
         view.require_current()
+        if view._input_reference != input_reference:
+            raise ResourceConflict('MCP App must finish its original operator input before another call')
         registered = view._tools.get(name)
         if registered is None or "app" not in registered.tool.visibility:
             raise ResourceConflict("MCP tool is not available to this App")
         if not isinstance(arguments, dict):
             raise TypeError("MCP App tool arguments must be an object")
         arguments = deepcopy(arguments)
-        invocation = _Invocation(view, registered)
+        invocation = _Invocation(view, registered, input_reference=input_reference)
 
         def revoked_outcome():
             if not invocation.started:
@@ -441,6 +479,9 @@ class AppExecutor:
                             "MCP App call may have executed; reconcile before retrying",
                         ) from error
                     raise
+                if invocation.suspension is not None and invocation.delivery_approved:
+                    view.require_current()
+                    raise MCPAppInputRequired(view, invocation.suspension)
                 if invocation.native is None:
                     if invocation.refusal is not None:
                         view.require_current()
@@ -470,6 +511,7 @@ class AppExecutor:
                     )
                 # Never forward the private native result before invoke returns:
                 # at this point Core has confirmed its required structured audit.
+                object.__setattr__(view, '_input_reference', None)
                 return invocation.native.model_copy(deep=True)
             finally:
                 invocation.finished = True

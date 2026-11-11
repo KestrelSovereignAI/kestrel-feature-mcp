@@ -102,12 +102,14 @@ class MCPToolWrapper:
         tool: types.Tool,
         caller: MCPCaller,
         app_executor: AppExecutor | None = None,
+        input_runtime=None,
     ):
         self.name = handle_name
         self._native_tool = tool.model_copy(deep=True)
         self.visibility, self.resource_uri = validate_tool_contract(self._native_tool)
         self._caller = caller
         self.app_executor = app_executor
+        self.input_runtime = input_runtime
         self.schema = _MCPToolSchema(handle_name, self._native_tool)
         if app_executor is not None:
             app_executor.require_initial_tool(self)
@@ -143,7 +145,11 @@ class MCPToolWrapper:
                     "MCP app-only tool requires a live authorized view",
                 ).to_dict()
             options = {} if invocation is None else {"require_authority": invocation.view.require_current}
+            if self.input_runtime is not None:
+                options.update(await self.input_runtime.before_call(self, kwargs, invocation))
             result = await self._caller(self._real_name, kwargs, **options)
+            if self.input_runtime is not None:
+                self.input_runtime.received(self, result)
         except OAuthGrantChanged as error:
             if invocation is not None:
                 self.app_executor.capture_refusal(invocation, error)
@@ -166,6 +172,14 @@ class MCPToolWrapper:
             )
             return ToolResult.failed(f"MCP tool '{self._real_name}' failed: {e}").to_dict()
 
+        from .input_requests import MCPInputSuspension
+        if isinstance(result, MCPInputSuspension):
+            projected = ToolResult.partial('MCP tool is waiting for operator input',
+                'No final result has been received. Use the MCP input card; do not repeat the original call.',
+                data={'mcp_tool': self._real_name, 'mcp_input': result.reference}).to_dict()
+            if invocation is not None:
+                return self.app_executor.capture_suspension(invocation, result, projected)
+            return self.input_runtime.defer_suspension(self, result, projected)
         text, is_error = extract_mcp_result(result)
         data = {"mcp_tool": self._real_name}
         if getattr(result, "structured_content", None) is not None:
@@ -192,6 +206,7 @@ def build_wrappers(
     tool_dicts: List[Dict[str, Any]],
     caller: MCPCaller,
     *, app_executor: AppExecutor | None = None,
+    input_runtime=None,
 ) -> List[MCPToolWrapper]:
     """Build wrappers from native SDK Tool records with host connection labels.
 
@@ -208,6 +223,7 @@ def build_wrappers(
                 tool=native,
                 caller=caller,
                 app_executor=app_executor,
+                input_runtime=input_runtime,
             )
         )
     return wrappers

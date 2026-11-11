@@ -1,6 +1,7 @@
 import { AppBridge, buildAllowAttribute } from '@modelcontextprotocol/ext-apps/app-bridge';
 import { OriginBoundTransport } from './origin-transport.js';
 import { approveSandboxPolicy } from './sandbox-proxy.js';
+import { isInputReference, mountMCPInput } from './input-card.js';
 
 /** One physical View. request() is the original authenticated host HTTP lane. */
 export function mountMCPApp({ root, reference, sessionId, request, isCurrentChat,
@@ -10,6 +11,7 @@ export function mountMCPApp({ root, reference, sessionId, request, isCurrentChat
         throw new TypeError('An original chat and authenticated App request lane are required');
     }
     let bridge, proxy, viewId, retired = false, cleanup;
+    let inputCard, inputRoot, inputPending = false;
     const calls = new AbortController();
     const query = '?session_id=' + encodeURIComponent(sessionId);
     const viewPath = () => '/api/mcp/apps/views/' + encodeURIComponent(viewId);
@@ -31,6 +33,7 @@ export function mountMCPApp({ root, reference, sessionId, request, isCurrentChat
         if (cleanup) return cleanup;
         retired = true;
         calls.abort();
+        inputCard?.dispose(); inputRoot?.remove();
         const bridgeClosed = bridge?.close();
         proxy?.remove();
         cleanup = (async () => {
@@ -84,6 +87,7 @@ export function mountMCPApp({ root, reference, sessionId, request, isCurrentChat
         bridge.onerror = fail;
         bridge.oncalltool = async (params, extra) => {
             current();
+            if (inputPending) throw new Error('Finish the original operator input before another App call');
             if (!params || Object.keys(params).some(key => !['name', 'arguments', '_meta'].includes(key))) {
                 throw new TypeError('This App host supports ordinary governed tool calls; Tasks require separate host support');
             }
@@ -94,6 +98,26 @@ export function mountMCPApp({ root, reference, sessionId, request, isCurrentChat
                 signal: AbortSignal.any([calls.signal, extra.mcpReq.signal]),
             });
             current();
+            if (result?.input_required) {
+                const pending = result.input_required;
+                if (!isInputReference(pending.reference) || pending.session_id !== sessionId) {
+                    throw new TypeError('The host returned no original operator input reference');
+                }
+                inputCard?.dispose(); inputRoot?.remove();
+                inputRoot = eventWindow.document.createElement('div');
+                inputRoot.className = 'mcp-input-card'; root.append(inputRoot);
+                inputPending = true;
+                inputCard = mountMCPInput({ root: inputRoot, reference: pending.reference, sessionId,
+                    request, isCurrentChat: () => !retired && isCurrentChat(), browser: eventWindow,
+                    async onResult(completed) {
+                        current();
+                        if (completed.app_result) {
+                            await bridge.sendToolResult(completed.app_result); current();
+                        }
+                        if (completed.state === 'RESOLVED' && !completed.next_request_id) inputPending = false;
+                    } });
+                throw new Error('The tool is waiting for operator input. Review the form in the host; do not repeat the call.');
+            }
             return result;
         };
         bridge.setRequestHandler('tools/list', async (_params, extra) => {

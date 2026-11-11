@@ -13,6 +13,7 @@ import pytest
 from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 from kestrel_feature_mcp.connection import MCPConnection, MCPCallOutcomeUnknownError, bind_tool_caller
+from kestrel_feature_mcp.input_requests import MCPInputResume, MCPInputSuspension
 from tests.http_peers import serve_http
 
 
@@ -37,8 +38,16 @@ async def mrtr_peer(tmp_path):
         await asyncio.sleep(peer.delay)
         if peer.failure is not None and count > 1:
             raise MCPError(peer.failure, 'Rejected after previous work')
-        if peer.requested_inputs is not None:
+        if peer.requested_inputs is not None and not params.input_responses:
             return types.InputRequiredResult(input_requests=peer.requested_inputs, request_state='private-input-state')
+        if peer.requested_inputs is not None:
+            assert params.request_state == 'private-input-state'
+            assert params.input_responses['form'].action == 'accept'
+            assert params.input_responses['form'].content == {'city': 'private answer'}
+            if ctx.method == 'tools/call':
+                return types.CallToolResult(content=[types.TextContent(type='text', text='resumed exactly')])
+            return types.ReadResourceResult(contents=[types.TextResourceContents(uri=params.uri,
+                text='resumed exactly')])
         if peer.infinite or count <= len(peer.states):
             state = peer.state_for(key, peer.states[(count - 1) % len(peer.states)])
             return types.InputRequiredResult(input_requests={}, request_state=state)
@@ -112,6 +121,83 @@ async def test_state_only_echoes_latest_opaque_and_empty_state_with_fresh_ids(mr
             assert all(m['params']['arguments'] == calls[0]['params']['arguments'] for m in calls)
         else:
             assert all(m['params']['uri'] == 'ui://work/view.html' for m in calls)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.parametrize('kind', ['tool', 'resource'])
+async def test_native_pause_releases_caller_and_new_connection_resumes_exact_original_request(mrtr_peer, tmp_path, kind):
+    native_input = types.ElicitRequest(params=types.ElicitRequestFormParams(message='Private city?',
+        requested_schema={'type': 'object', 'properties': {'city': {'type': 'string'}}, 'required': ['city']}))
+    mrtr_peer.requested_inputs = {'form': native_input}
+    path = tmp_path / 'owned-native-checkpoint'
+    callbacks = []
+    async def inline_decline(context, params):
+        callbacks.append(params)
+        return types.ElicitResult(action='decline')
+    async def pause(result):
+        path.write_text(result.model_dump_json(by_alias=True, exclude_none=True))
+        return MCPInputSuspension('owned-input-reference')
+    connection = MCPConnection(mrtr_peer.url, elicitation_callback=inline_decline)
+    await connection.connect()
+    caller = bind_tool_caller(connection, lambda: True, 'owned-original')
+    try:
+        result = (await caller('work', {'key': 'work', 'original': True}, input_handler=pause)
+            if kind == 'tool' else await caller.read_resource('ui://work/view.html', input_handler=pause))
+        assert result == MCPInputSuspension('owned-input-reference')
+        assert len(mrtr_peer.effects) == 1 and path.exists() and callbacks == []
+    finally:
+        await connection.close()
+    # The previous client and caller are retired. No inherited turn/task is reused.
+    connection = MCPConnection(mrtr_peer.url, elicitation_callback=inline_decline)
+    await connection.connect()
+    caller = bind_tool_caller(connection, lambda: True, 'owned-new-authority')
+    resume = MCPInputResume.seal(types.InputRequiredResult.model_validate_json(path.read_text()),
+        {'form': types.ElicitResult(action='accept', content={'city': 'private answer'})})
+    try:
+        result = (await caller('work', {'key': 'work', 'original': True}, resume=resume, input_handler=pause)
+            if kind == 'tool' else await caller.read_resource('ui://work/view.html', resume=resume, input_handler=pause))
+        assert 'resumed exactly' in str(result)
+        assert len(mrtr_peer.effects) == 2 and callbacks == []
+        native_calls = [(scope, message) for scope, message in mrtr_peer.wire if message.get('method') ==
+            ('tools/call' if kind == 'tool' else 'resources/read')]
+        calls = [message for _, message in native_calls]
+        assert len(calls) == 2
+        # The official dispatcher scopes its numeric IDs to each client session.
+        # A newly connected client can reuse an integer, on its fresh transport.
+        assert native_calls[0][0]['client'] != native_calls[1][0]['client']
+        assert 'requestState' not in calls[0]['params']
+        assert calls[1]['params']['requestState'] == 'private-input-state'
+        assert calls[1]['params']['inputResponses'] == {'form': {'action': 'accept', 'content': {'city': 'private answer'}}}
+        if kind == 'tool':
+            assert calls[0]['params']['name'] == calls[1]['params']['name'] == 'work'
+            assert calls[0]['params']['arguments'] == calls[1]['params']['arguments'] == {'key': 'work', 'original': True}
+        assert all('form' in message['params']['_meta']['io.modelcontextprotocol/clientCapabilities']['elicitation'] for message in calls)
+    finally:
+        await connection.close()
+
+
+async def test_same_client_resume_uses_new_native_rpc_id_and_never_drops_rejected_state(mrtr_peer):
+    mrtr_peer.requested_inputs = {'form': types.ElicitRequest(params=types.ElicitRequestFormParams(
+        message='Private city?', requested_schema={'type': 'object', 'properties': {}}))}
+    checkpoints = []
+    async def pause(result):
+        checkpoints.append(result.model_dump_json(by_alias=True, exclude_none=True))
+        return MCPInputSuspension('owned-checkpoint')
+    connection = MCPConnection(mrtr_peer.url)
+    try:
+        await connection.connect()
+        caller = bind_tool_caller(connection, lambda: True, 'owned')
+        assert await caller('work', {}, input_handler=pause) == MCPInputSuspension('owned-checkpoint')
+        resume = MCPInputResume.seal(types.InputRequiredResult.model_validate_json(checkpoints[0]),
+            {'form': types.ElicitResult(action='accept', content={'city': 'private answer'})})
+        mrtr_peer.failure = types.INVALID_PARAMS
+        with pytest.raises(MCPCallOutcomeUnknownError):
+            await caller('work', {}, input_handler=pause, resume=resume)
+        calls = [message for _, message in mrtr_peer.wire if message.get('method') == 'tools/call']
+        assert len(calls) == 2 and calls[0]['id'] != calls[1]['id']
+        assert calls[1]['params']['requestState'] == 'private-input-state'
+        assert len(mrtr_peer.effects) == 2 and len(checkpoints) == 1
     finally:
         await connection.close()
 

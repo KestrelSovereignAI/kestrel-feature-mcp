@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
+import hashlib
 from pathlib import Path
 
 from mcp.client.extension import advertise
@@ -89,6 +91,13 @@ class MCPAppsFeatureMixin:
 
     def _new_mcp_connection(self, *args, **kwargs):
         self._require_open()
+        if self._input_settings.enabled:
+            self._require_inputs_ready()
+            endpoint = args[0] if args else kwargs['url']
+            url = getattr(endpoint, 'url', endpoint)
+            identifier = 'inline:' + hashlib.sha256(str(url).encode()).hexdigest()
+            kwargs['elicitation_callback'] = partial(self._input_runtime.inline_decline,
+                connection_id=identifier)
         if self._apps_settings.enabled:
             self._require_apps_ready()
             kwargs["extensions"] = [advertise(EXTENSION_ID)]

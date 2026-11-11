@@ -5,7 +5,7 @@
     "version": "0.28.2"
   },
   "sources": {
-    "build-assets.mjs": "d61c4b1f56c3396996dc2867d86cc0b78adc3a33bf3d9b67c50c99f4d99c5b2c",
+    "build-assets.mjs": "3ce1944005e3d88973cd76b7b89c63ee23624c7047356905bdce6ecb0d421bdb",
     "build-notices.mjs": "c1e124b406cb7bbfaea7246b35d2119735ac7ec13d2caaec6bbf9b30ed2163e6",
     "build.mjs": "59ff7f106ce843f69c28f32839ea22c993629174bde0d49611a1c3b4c2e6884e",
     "licenses/ajv-8.18.0-LICENSE": "a05350a88e318e4f5f2c2a1ff1e2e88daa4dd38e6e78b71cccae422bdc762cc3",
@@ -17,12 +17,14 @@
     "licenses/json-schema-traverse-1.0.0-LICENSE": "7bf9b2de73a6b356761c948d0e9eeb4be6c1270bd04c79cd489c1e400ffdfc1a",
     "package-lock.json": "86ab8c6bb16dc9c4d445ef3e6e0bc32c38409053475381e0f3bb4b81b121f478",
     "package.json": "5e09ea1a34316cd25005db422ebb0b2e11ccec6029f37dc99f56658fd5ba664b",
+    "src/input-card.js": "68e0730fdc4b02773cedb4021f629a880428de779709289cb1282a905fa5c459",
+    "src/input-entry.js": "5d22f9cca6f48739c21dd501e90f8da4eadc7b382faee0ac0c8b5ec3dc791765",
     "src/oauth-panel.css": "f927cdfefa34ff25d936603370e04d99cc019357949dd5600befbee450d692c5",
     "src/oauth-panel.js": "24dec056217773a985e413b95602394239eb04e0c37296ec9d95d39eac1442f8",
     "src/origin-transport.js": "7df4d94e870edd9a73ba34f5ce0773e07709aa6809a4111c6534eccb7f459689",
     "src/parent-entry.js": "99baa8d1679c944d345915893db6993da9186265d6a4841c7cde73fa4a89bee6",
-    "src/parent-view.js": "4905eb049c1e46bfedb1726f0a22590c3bc8d417c73e78f18b271d663a4a7c13",
-    "src/sandbox-assets.js": "cccb90507dea3bf93a3b0754b81878ee57c90db3e32a159d30d37e9313cefd1c",
+    "src/parent-view.js": "85308e947cc6c3d0d39f8b735a8ec0627ef2ae7bcd4af093be5c2feb8420605e",
+    "src/sandbox-assets.js": "1fdcbb42c664d237302ac1db36ec260c0163ee88a17e8affa94f99a86d87d380",
     "src/sandbox-cli.js": "fd5040123976a121a34a8e8349f8d8ddb8f33cb942992da81156488058f46050",
     "src/sandbox-config.js": "05cb572ecdd4675f089279a77dd6b8abd038c6bb5ec4143b03fa34bc8c03040d",
     "src/sandbox-entry.js": "644ef47a17025c0b71c9ef627d36a2b30d81995774783786757bb26abda58288",
@@ -193,11 +195,14 @@
     "node_modules/zod/v4/locales/yo.js": "88b33f6527c1a2faaf159568330cf727c448dc468eac72142a6fb24f8714ac1e",
     "node_modules/zod/v4/locales/zh-CN.js": "8fc02f2bd4d92f46b24b8d82da0ee95c962fc80c14dd7dd469500e14de08d320",
     "node_modules/zod/v4/locales/zh-TW.js": "01d9b119e318d8b9f1a8fa720d06424457429425a61d0730984b750e6a5edf7d",
+    "src/input-card.css": "608ab8ae76816aa90e2747ca43f4d60e7b9a3bd397e12a71d45e0b5d53cea224",
+    "src/input-card.js": "68e0730fdc4b02773cedb4021f629a880428de779709289cb1282a905fa5c459",
+    "src/input-entry.js": "5d22f9cca6f48739c21dd501e90f8da4eadc7b382faee0ac0c8b5ec3dc791765",
     "src/oauth-panel.js": "24dec056217773a985e413b95602394239eb04e0c37296ec9d95d39eac1442f8",
     "src/origin-transport.js": "7df4d94e870edd9a73ba34f5ce0773e07709aa6809a4111c6534eccb7f459689",
     "src/parent-entry.js": "99baa8d1679c944d345915893db6993da9186265d6a4841c7cde73fa4a89bee6",
-    "src/parent-view.js": "4905eb049c1e46bfedb1726f0a22590c3bc8d417c73e78f18b271d663a4a7c13",
-    "src/sandbox-assets.js": "cccb90507dea3bf93a3b0754b81878ee57c90db3e32a159d30d37e9313cefd1c",
+    "src/parent-view.js": "85308e947cc6c3d0d39f8b735a8ec0627ef2ae7bcd4af093be5c2feb8420605e",
+    "src/sandbox-assets.js": "1fdcbb42c664d237302ac1db36ec260c0163ee88a17e8affa94f99a86d87d380",
     "src/sandbox-cli.js": "fd5040123976a121a34a8e8349f8d8ddb8f33cb942992da81156488058f46050",
     "src/sandbox-config.js": "05cb572ecdd4675f089279a77dd6b8abd038c6bb5ec4143b03fa34bc8c03040d",
     "src/sandbox-entry.js": "644ef47a17025c0b71c9ef627d36a2b30d81995774783786757bb26abda58288",
@@ -354,11 +359,13 @@
     }
   ],
   "assets": {
+    "input-entry.css": "a1f38b8dd19254a5fcdd9bf9954105f8a55325ae32b45a5d576f7398c08d7ca7",
+    "input-entry.js": "83ae743dd845a0cb726aee01b9708582528aa6aebdbb2cc883344d716e63e8f2",
     "oauth-panel.css": "f927cdfefa34ff25d936603370e04d99cc019357949dd5600befbee450d692c5",
     "oauth-panel.js": "699d27d30c927591fe50c4c576951cfd110b1f0828249c657c88465d687fc1c5",
-    "parent-entry.js": "5cccc54f1ebb2dad9efe3cb0ad37f0025a4f6009ee277e6ac8ec441fb253a729",
+    "parent-entry.js": "36a81cc106347ee9eeaa4634b4d89ddb7ba63d3d3ebb7978313eccc652f8e203",
     "sandbox-entry.js": "9d10d2cc095a19b63e907f5e73871fb9d18e12809bc23e1742842778ec40fcf1",
-    "sandbox-service.mjs": "41e0a24d9c0e38bb1e7478f4fdaab260fcdbafa6365441896e3ef2af824498b8",
+    "sandbox-service.mjs": "bc2c6476a280daa45e857d101f434d0dc14ee5fc96dcd2fd92f0445409e12d19",
     "THIRD_PARTY_NOTICES.txt": "5176f1d103deea45d829e91f31e0d683425bd7eee067c37c135130f20829863f"
   }
 }

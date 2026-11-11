@@ -1,0 +1,6 @@
+.mcp-input-card { border: 1px solid var(--border-color, #777); border-radius: .5rem; padding: 1rem; }
+.mcp-input-card fieldset { margin: .75rem 0; padding: .75rem; }
+.mcp-input-card label { display: flex; flex-direction: column; gap: .25rem; margin: .75rem 0; }
+.mcp-input-card input, .mcp-input-card select { max-width: 100%; padding: .5rem; }
+.mcp-input-card button { margin: .25rem .5rem .25rem 0; }
+.mcp-input-card p { overflow-wrap: anywhere; }
