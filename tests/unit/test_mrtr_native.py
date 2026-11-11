@@ -21,7 +21,7 @@ from tests.http_peers import serve_http
 async def mrtr_peer(tmp_path):
     peer = SimpleNamespace(rounds=defaultdict(list), wire=[], effects=[], first=asyncio.Event(),
         release=asyncio.Event(), states=['opaque/Δ\r\nstate', ''], delay=0, failure=None, invalid_result=None,
-        requested_inputs=None, hold=False, infinite=False, state_for=lambda key, state: state)
+        requested_inputs=None, input_state='private-input-state', hold=False, infinite=False, state_for=lambda key, state: state)
 
     async def list_tools(ctx, params):
         return types.ListToolsResult(tools=[types.Tool(name='work', input_schema={'type': 'object'})])
@@ -39,9 +39,9 @@ async def mrtr_peer(tmp_path):
         if peer.failure is not None and count > 1:
             raise MCPError(peer.failure, 'Rejected after previous work')
         if peer.requested_inputs is not None and not params.input_responses:
-            return types.InputRequiredResult(input_requests=peer.requested_inputs, request_state='private-input-state')
+            return types.InputRequiredResult(input_requests=peer.requested_inputs, request_state=peer.input_state)
         if peer.requested_inputs is not None:
-            assert params.request_state == 'private-input-state'
+            assert params.request_state == peer.input_state
             assert params.input_responses['form'].action == 'accept'
             assert params.input_responses['form'].content == {'city': 'private answer'}
             if ctx.method == 'tools/call':
@@ -126,10 +126,12 @@ async def test_state_only_echoes_latest_opaque_and_empty_state_with_fresh_ids(mr
 
 
 @pytest.mark.parametrize('kind', ['tool', 'resource'])
-async def test_native_pause_releases_caller_and_new_connection_resumes_exact_original_request(mrtr_peer, tmp_path, kind):
+@pytest.mark.parametrize('state', [None, 'private-input-state'])
+async def test_native_pause_releases_caller_and_new_connection_resumes_exact_original_request(mrtr_peer, tmp_path, kind, state):
     native_input = types.ElicitRequest(params=types.ElicitRequestFormParams(message='Private city?',
         requested_schema={'type': 'object', 'properties': {'city': {'type': 'string'}}, 'required': ['city']}))
     mrtr_peer.requested_inputs = {'form': native_input}
+    mrtr_peer.input_state = state
     path = tmp_path / 'owned-native-checkpoint'
     callbacks = []
     async def inline_decline(context, params):
@@ -167,7 +169,10 @@ async def test_native_pause_releases_caller_and_new_connection_resumes_exact_ori
         # A newly connected client can reuse an integer, on its fresh transport.
         assert native_calls[0][0]['client'] != native_calls[1][0]['client']
         assert 'requestState' not in calls[0]['params']
-        assert calls[1]['params']['requestState'] == 'private-input-state'
+        if state is None:
+            assert 'requestState' not in calls[1]['params'], 'The client invented an absent native requestState'
+        else:
+            assert calls[1]['params']['requestState'] == state
         assert calls[1]['params']['inputResponses'] == {'form': {'action': 'accept', 'content': {'city': 'private answer'}}}
         if kind == 'tool':
             assert calls[0]['params']['name'] == calls[1]['params']['name'] == 'work'

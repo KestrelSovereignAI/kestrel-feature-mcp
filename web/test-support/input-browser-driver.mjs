@@ -33,7 +33,12 @@ try {
     await page.evaluate(() => window.leaveChat()); await expect(city).toHaveCount(0);
     await page.evaluate(() => window.returnToChat());
     await review.click(); await expect(city).toBeVisible();
-    await city.fill('owned-private-answer');
+    await city.fill(expectedContent.city);
+    if (expectedContent.city === '') {
+        const valid = await page.evaluate(() => Array.from(document.querySelectorAll('input[aria-label="city"], select[aria-label="labels"]'))
+            .map(input => input.checkValidity()));
+        expect(valid, 'Required property presence must permit schema-valid empty values').toEqual([true, true]);
+    }
     if (rich) {
         await expect(page.getByRole('spinbutton', { name: 'count', exact: true })).toHaveValue('2');
         await expect(page.getByRole('combobox', { name: 'enabled', exact: true })).toHaveValue('false');
@@ -49,7 +54,15 @@ try {
     if (process.argv[3]) await page.screenshot({ path: process.argv[3], fullPage: true });
     const completed = page.waitForResponse(response => response.request().method() === 'POST'
         && new URL(response.url()).pathname.endsWith('/responses'));
+    await page.evaluate(() => {
+        window.inputClientRejected = false;
+        document.addEventListener('submit', () => queueMicrotask(() => {
+            window.inputClientRejected = Array.from(document.querySelectorAll('[role="status"]'))
+                .some(node => node.textContent === 'Review the requested values before continuing.');
+        }), { capture: true, once: true });
+    });
     await page.getByRole('button', { name: { accept: 'Continue tool', decline: 'Decline', cancel: 'Cancel' }[action], exact: true }).click();
+    expect(await page.evaluate(() => window.inputClientRejected), 'A schema-valid form was rejected by client value collection').toBe(false);
     expect((await completed).status()).toBe(200);
     await expect(page.getByRole('status')).toContainText(action === 'accept'
         ? 'Recorded: original-marker' : 'Operator input declined');

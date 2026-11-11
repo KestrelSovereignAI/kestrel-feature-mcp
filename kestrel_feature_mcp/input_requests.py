@@ -39,7 +39,7 @@ class MCPInputPlan:
         return types.InputRequiredResult.model_validate_json(self._checkpoint)
 
     @property
-    def request_state(self) -> str:
+    def request_state(self) -> str | None:
         return self.checkpoint.request_state
 
     @property
@@ -112,7 +112,7 @@ class MCPInputResume:
             adapter.dump_json(native, by_alias=True, exclude_none=True))
 
     @property
-    def request_state(self) -> str:
+    def request_state(self) -> str | None:
         return types.InputRequiredResult.model_validate_json(self._checkpoint).request_state
 
     @property
