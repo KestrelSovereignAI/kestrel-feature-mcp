@@ -32,6 +32,12 @@ try {
         expect(await city.count(), 'Invalid input must preserve the form inside its original App View').toBe(1);
     }
     await city.fill(expectedContent.city);
+    if ('count' in expectedContent) {
+        const count = page.getByRole('spinbutton', { name: 'count', exact: true });
+        await count.fill(String(expectedContent.count));
+        expect(await count.evaluate(input => input.checkValidity()),
+            'Fractional schema bounds must allow valid integers inside the original App View').toBe(true);
+    }
     await page.getByRole('button', { name: 'Continue tool', exact: true }).click();
     await expect(app.locator('#input-app-result')).toHaveText('native-result:app-effect');
     await expect(city).toHaveCount(0);
