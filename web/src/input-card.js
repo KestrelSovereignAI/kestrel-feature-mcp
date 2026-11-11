@@ -66,15 +66,17 @@ export function renderMCPForm(parent, schema) {
         } else if (['string', 'number', 'integer'].includes(property.type)) {
             input = document.createElement('input');
             if (property.type === 'string') htmlRequired = required && (property.minLength ?? 0) > 0;
-            input.type = property.type === 'string' ? ({ email: 'email', date: 'date' }[property.format] ?? 'text') : 'number';
+            input.type = property.type === 'string' ? (property.format === 'date' ? 'date' : 'text') : 'number';
+            if (property.type === 'string' && property.format === 'email') input.inputMode = 'email';
             if (property.type !== 'string') {
-                input.step = property.type === 'integer' ? '1' : 'any';
+                // HTML's step base follows min, which may be fractional even for integers.
+                // The original JSON Schema validator owns integer validation.
+                input.step = 'any';
                 if (typeof property.minimum === 'number') input.min = String(property.minimum);
                 if (typeof property.maximum === 'number') input.max = String(property.maximum);
-            } else {
-                if (Number.isInteger(property.minLength)) input.minLength = property.minLength;
-                if (Number.isInteger(property.maxLength)) input.maxLength = property.maxLength;
             }
+            // HTML string lengths count UTF-16 code units and its email grammar
+            // differs from JSON Schema. Validate those with the original schema.
             if (property.default !== undefined) input.value = String(property.default);
             read = () => input.value === '' && !required ? undefined
                 : property.type === 'string' ? input.value : input.valueAsNumber;

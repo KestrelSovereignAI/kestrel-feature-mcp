@@ -2,7 +2,7 @@ import { chromium, expect } from '@playwright/test';
 
 const browser = await chromium.launch();
 const expectedContent = JSON.parse(process.argv[4] ?? 'null') ?? { city: 'owned-private-answer' };
-const rich = 'count' in expectedContent, action = process.argv[5] ?? 'accept';
+const rich = 'ratio' in expectedContent, action = process.argv[5] ?? 'accept';
 let closing;
 const close = () => closing ??= browser.close();
 const terminated = () => { void close(); };
@@ -34,6 +34,19 @@ try {
     await page.evaluate(() => window.returnToChat());
     await review.click(); await expect(city).toBeVisible();
     await city.fill(expectedContent.city);
+    expect(await city.inputValue(), 'A schema-valid Unicode string must remain enterable').toBe(expectedContent.city);
+    if ('count' in expectedContent && !rich) {
+        const count = page.getByRole('spinbutton', { name: 'count', exact: true });
+        await count.fill(String(expectedContent.count));
+        expect(await count.evaluate(input => input.checkValidity()),
+            'Fractional schema bounds must allow valid integers').toBe(true);
+    }
+    if ('contact' in expectedContent) {
+        const contact = page.getByRole('textbox', { name: 'contact', exact: true });
+        await contact.fill(expectedContent.contact);
+        expect(await contact.evaluate(input => input.checkValidity()),
+            'HTML email rules must not reject an original-schema-valid email').toBe(true);
+    }
     if (expectedContent.city === '') {
         const valid = await page.evaluate(() => Array.from(document.querySelectorAll('input[aria-label="city"], select[aria-label="labels"]'))
             .map(input => input.checkValidity()));
