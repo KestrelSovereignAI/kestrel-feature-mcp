@@ -8,7 +8,8 @@ function button(label, name, arguments_) {
     element.onclick = async () => {
         try {
             const value = await app.callServerTool({ name, arguments: arguments_ });
-            result.textContent = 'native-call:' + JSON.stringify(value._meta?.['private-result']);
+            result.textContent = value.isError ? 'native-call-refused'
+                : 'native-call:' + JSON.stringify(value._meta?.['private-result']);
         } catch (error) {
             result.textContent = name === 'echo' ? 'model-only-refused' : 'native-call-failed:' + error.message;
         }

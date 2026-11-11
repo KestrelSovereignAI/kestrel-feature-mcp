@@ -1,4 +1,4 @@
-"""Native MCP and Core fixtures; browser helpers own only temporary listeners."""
+"""Native Core/browser tests run inside the caller-owned Docker namespace."""
 
 import asyncio
 import json
@@ -15,6 +15,17 @@ from tests.unit.test_mcp_apps_host import native_apps_host as native_apps_host
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def require_browser_container():
+    assert not Path("/var/run/docker.sock").exists() and not os.environ.get("DOCKER_HOST"), (
+        "Native browser acceptance must have no access to the host Docker daemon"
+    )
+    assert Path("/.dockerenv").is_file(), (
+        "Run native browser acceptance in the apps-native-browser container job; "
+        "its owner must retire the entire process namespace, including on failure"
+    )
 
 
 @pytest.fixture
