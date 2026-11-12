@@ -97,6 +97,7 @@ def main():
     generated = set(json.loads((ASSETS / "manifest.json").read_text())["assets"])
     generated.add("manifest.json")
     assert generated == {"sandbox-entry.js", "sandbox-service.mjs", "parent-entry.js",
+                         "input-entry.js", "input-entry.css",
                          "oauth-panel.js", "oauth-panel.css", "THIRD_PARTY_NOTICES.txt", "manifest.json"}
     with tempfile.TemporaryDirectory(prefix="mcp-sandbox-container-") as temporary, ExitStack() as cleanup:
         folder = Path(temporary)
@@ -191,7 +192,7 @@ def main():
                     raise AssertionError("Sandbox accepted host credentials")
         # The shared manifest verifies Core's host UI files too. They are not
         # public sandbox routes; Core serves them through its feature UI mount.
-        for host_asset in ("/oauth-panel.js", "/oauth-panel.css"):
+        for host_asset in ("/oauth-panel.js", "/oauth-panel.css", "/input-entry.js", "/input-entry.css"):
             try:
                 opener.open(origin + host_asset, timeout=3)
             except urllib.error.HTTPError as error:
