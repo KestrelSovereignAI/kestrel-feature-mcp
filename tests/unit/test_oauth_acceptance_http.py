@@ -42,6 +42,7 @@ class OAuthPeers:
     requests: list
     browser_requests: list
     release_body: asyncio.Event
+    callback_listener: socket.socket
     wire: object | None = None
 
     async def browser(self, url):
@@ -69,9 +70,10 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
     resource_port = urlsplit(resource_peer.url).port
     resource_url = f"https://remote.example:{resource_port}/mcp"
     resource_id = resource_url.rsplit("/mcp", 1)[0] if options.get("parent_resource") else resource_url
-    with socket.socket() as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        callback_port = reservation.getsockname()[1]
+    reservation = socket.socket()
+    request.addfinalizer(reservation.close)
+    reservation.bind(("127.0.0.1", 0))
+    callback_port = reservation.getsockname()[1]
     callback = f"http://127.0.0.1:{callback_port}/oauth/callback"
     state = SimpleNamespace(issuer=None, client_id=None, access_token="native-fixture-access",
                             codes={}, requests=[], release_body=asyncio.Event())
@@ -251,7 +253,8 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         monkeypatch.setenv("NO_PROXY", "")
         try:
             yield OAuthPeers(selection, options, issuer_peer, resource_peer, state.requests, [],
-                state.release_body, SimpleNamespace(state=state, authorities=authorities, bundle=bundle))
+                state.release_body, reservation,
+                SimpleNamespace(state=state, authorities=authorities, bundle=bundle))
         finally:
             state.release_body.set()
 
@@ -259,7 +262,24 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
 async def drive(peers, mode="authorize", *, network_timeout=5):
     return await run(peers.selection, mode=mode, browser_timeout=0.3 if peers.options.get(
         "wrong_callback_state") else 5, network_timeout=network_timeout, connect_timeout=5,
-        call_timeout=5, close_timeout=5, browser_opener=peers.browser)
+        call_timeout=5, close_timeout=5, browser_opener=peers.browser,
+        reserved_callback_socket=peers.callback_listener)
+
+
+@pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
+async def test_native_callback_keeps_its_original_port_until_the_listener_consumes_it(oauth_peers):
+    port = urlsplit(oauth_peers.selection.redirect_uri).port
+    assert port not in {urlsplit(oauth_peers.issuer.url).port,
+                        urlsplit(oauth_peers.resource.url).port}, (
+        'A peer took the callback port before its original listener started')
+    with socket.socket() as rival:
+        with pytest.raises(OSError):
+            rival.bind(('127.0.0.1', port))
+    try:
+        result = await drive(oauth_peers)
+    except OSError:
+        pytest.fail('The native listener did not consume its original callback socket')
+    assert result['grant_obtained'] and result['stage'] == 'authorized_and_discovered'
 
 
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)

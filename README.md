@@ -689,7 +689,7 @@ docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges \
 
 Set `listen.host` to `0.0.0.0` in the container's JSON configuration and publish
 its configured listener port. The image follows
-maintained Node LTS, runs as a non-root user and includes four hash-verified
+maintained Node LTS, runs as a non-root user and includes the hash-verified
 sandbox assets, their manifest and the project license. Its build context excludes source, Git
 metadata and host configuration. Mount no host identity files or credentials,
 and expose the service through a separate HTTPS origin. Startup refuses
