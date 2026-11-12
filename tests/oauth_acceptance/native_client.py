@@ -11,6 +11,7 @@ from contextlib import AsyncExitStack
 from importlib.metadata import version
 import hashlib
 import json
+import socket
 import sys
 from urllib.parse import urlsplit
 
@@ -97,7 +98,7 @@ async def client_metadata(selection: GrantSelection, *, timeout: float, response
 async def run(selection: GrantSelection, *, mode: str, browser_timeout: float,
               network_timeout: float, connect_timeout: float, call_timeout: float,
               close_timeout: float, response_max_bytes=DEFAULT_RESPONSE_MAX_BYTES,
-              browser_opener=open_authorization):
+              browser_opener=open_authorization, reserved_callback_socket: socket.socket | None = None):
     if mode not in {"discover", "authorize"}:
         raise GrantRejected("Select discovery or initial authorization explicitly")
     if any(not 0 < value < float("inf") for value in (
@@ -105,6 +106,7 @@ async def run(selection: GrantSelection, *, mode: str, browser_timeout: float,
         raise GrantRejected("Every acceptance timeout must be finite and positive")
     callback_candidate = LoopbackCallback(
         selection.redirect_uri, selection.issuer, timeout=browser_timeout,
+        reserved_socket=reserved_callback_socket,
     )
     policy = GrantPolicy(selection, response_max_bytes=response_max_bytes)
     metadata, identity_sha256 = await client_metadata(

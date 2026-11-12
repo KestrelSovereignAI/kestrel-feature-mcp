@@ -74,6 +74,59 @@ async def test_completed_attempt_can_retry_the_published_callback_port(redirect_
             assert (await callback.result()).code == CODE
 
 
+@pytest.mark.parametrize('listening', [False, True])
+async def test_reserved_callback_transfers_the_exact_socket_and_closes_it(listening):
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        if listening:
+            listener.listen()
+        endpoint = listener.getsockname()
+        redirect = f'http://127.0.0.1:{endpoint[1]}/oauth/callback'
+        original = listener.fileno()
+        callback = LoopbackCallback(redirect, ISSUER, timeout=5, reserved_socket=listener)
+        with socket.socket() as rival:
+            with pytest.raises(OSError):
+                rival.bind(endpoint)
+        async with callback:
+            assert callback._server.sockets[0].fileno() == original
+            callback.arm(STATE)
+            assert (await request(redirect)).startswith(b'HTTP/1.1 200')
+            assert (await callback.result()).code == CODE
+        assert listener.fileno() == -1
+
+
+@pytest.mark.parametrize('fault', ['closed', 'unbound', 'different_endpoint',
+    pytest.param('reused_port', marks=pytest.mark.skipif(not hasattr(socket, 'SO_REUSEPORT'),
+        reason='The platform does not expose shared-port listeners'))])
+def test_reserved_callback_refuses_a_changed_or_nonexclusive_socket(fault):
+    with socket.socket() as listener, socket.socket() as other:
+        other.bind(('127.0.0.1', 0))
+        if fault == 'unbound':
+            port = other.getsockname()[1]
+        else:
+            listener.bind(('127.0.0.1', 0))
+            port = listener.getsockname()[1]
+        if fault == 'closed':
+            listener.close()
+        elif fault == 'reused_port':
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        elif fault == 'different_endpoint':
+            port = other.getsockname()[1]
+        with pytest.raises(CallbackRejected, match='Reserved'):
+            LoopbackCallback(f'http://127.0.0.1:{port}/oauth/callback', ISSUER,
+                timeout=5, reserved_socket=listener)
+
+
+async def test_reserved_callback_rechecks_its_socket_after_constructor():
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        redirect = f'http://127.0.0.1:{listener.getsockname()[1]}/oauth/callback'
+        callback = LoopbackCallback(redirect, ISSUER, timeout=5, reserved_socket=listener)
+        listener.close()
+        with pytest.raises(CallbackRejected, match='unavailable'):
+            await callback.__aenter__()
+
+
 @pytest.mark.parametrize("change", [
     "state", "state-unicode", "state-invalid-utf8", "issuer", "missing-issuer", "code", "duplicate-code", "duplicate-state",
     "path", "host", "duplicate-host", "body", "transfer", "absolute", "fragment",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import secrets
+import socket
 from urllib.parse import parse_qs, urlsplit
 
 from mcp.shared.auth import AuthorizationCodeResult
@@ -18,7 +19,7 @@ class LoopbackCallback:
     """Bounded, one-use callback; no request target or credential is logged."""
 
     def __init__(self, redirect_uri: str, issuer: str, *, timeout: float,
-                 max_connections: int = 32):
+                 max_connections: int = 32, reserved_socket: socket.socket | None = None):
         url = urlsplit(redirect_uri)
         if (url.scheme != "http" or url.hostname != "127.0.0.1" or not url.port
                 or url.username or url.password or url.query or url.fragment
@@ -38,17 +39,37 @@ class LoopbackCallback:
         self._result: asyncio.Future[AuthorizationCodeResult] | None = None
         self._tasks: set[asyncio.Task] = set()
         self._accepted = False
+        self._reserved_socket = reserved_socket
+        if reserved_socket is not None:
+            self._require_reserved_socket()
+
+    def _require_reserved_socket(self):
+        listener = self._reserved_socket
+        if not isinstance(listener, socket.socket) or listener.fileno() < 0:
+            raise CallbackRejected('Reserved callback socket is unavailable')
+        try:
+            valid = (listener.family == socket.AF_INET and listener.type == socket.SOCK_STREAM
+                     and listener.getsockname() == ('127.0.0.1', self._url.port)
+                     and not (hasattr(socket, 'SO_REUSEPORT')
+                              and listener.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT)))
+        except OSError:
+            raise CallbackRejected('Reserved callback socket is unavailable') from None
+        if not valid:
+            raise CallbackRejected('Reserved socket must exclusively own the exact callback endpoint')
+        return listener
 
     async def __aenter__(self):
         self._result = asyncio.get_running_loop().create_future()
         # A busy published port is a failure; a different redirect is a new client.
-        self._server = await asyncio.start_server(
-            self._connected, "127.0.0.1", self._url.port, limit=8192,
+        options = {'limit': 8192}
+        if self._reserved_socket is not None:
+            options['sock'] = self._require_reserved_socket()
+        else:
             # POSIX TIME_WAIT from our completed connection must not prevent
             # retrying the published port. Active listeners remain exclusive;
             # SO_REUSEPORT is never enabled. Windows keeps its safer default.
-            reuse_address=os.name == "posix",
-        )
+            options.update(host='127.0.0.1', port=self._url.port, reuse_address=os.name == 'posix')
+        self._server = await asyncio.start_server(self._connected, **options)
         return self
 
     async def __aexit__(self, *exc):
