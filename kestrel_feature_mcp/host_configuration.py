@@ -12,6 +12,7 @@ from kestrel_sdk.resources import ResourceConflict
 
 from ._lifecycle import MCPFeatureClosingError, join_maintenance, run_cleanup_steps
 from .apps_host import AppsSettings, MCPAppsFeatureMixin
+from .apps_execution import require_owned_call_host
 from .oauth_grants import initialize_grant_schema
 from .oauth_runtime import OAuthRuntime, OAuthSettings
 from .input_runtime import InputSettings, MCPInputRuntime
@@ -52,6 +53,7 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
                 validate = getattr(self.agent, 'validate_mcp_apps_host_configuration', None)
                 if getattr(self.agent, 'supports_mcp_apps_host', None) is not True or not callable(validate):
                     raise TypeError("MCP Apps require Core's authenticated physical View host")
+                require_owned_call_host(self.agent)
                 apps = apps.model_copy(update={'host': validate(apps.host)})
             if oauth.enabled and (getattr(self.agent, 'supports_mcp_oauth_host', None) is not True
                     or not callable(getattr(self.agent, 'create_mcp_oauth_host', None))):

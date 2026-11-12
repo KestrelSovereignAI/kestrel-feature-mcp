@@ -538,7 +538,7 @@ An unfinished close retains its original owner and is retried before re-enable.
 Version 0.8.0 introduced the native components described below; 0.9.0 added
 completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
-Version 0.16 requires Core 0.64.4 or newer and SDK 0.52.1 or newer for native
+Version 0.17 requires Core 0.64.6 or newer and SDK 0.52.1 or newer for native
 Apps, OAuth and durable tool outcome contracts. The test profile uses the same
 minimums. `uv sync --locked --extra test` resolves the host and the feature's
 runtime dependencies from the public package index.
@@ -570,6 +570,16 @@ Withdrawing a View before native admission raises `ResourceConflict`; withdrawal
 after admission raises `ResourceOutcomeUnknown`. An awaiting caller's own
 cancellation remains cancellation. Closing a View joins its owned calls and
 required audit finalization; it cannot undo effects already accepted remotely.
+
+App execution additionally requires `supports_owned_mcp_app_calls` to be exactly
+`True` and the host's `mcp_app_call_scope(operation, name=..., cancel=...)`.
+The scope admits the original native child and yields its `task` and `wait()`
+observer. The View retains that exact child through physical scope retirement.
+Caller cancellation uses the View's existing cancellation policy, so overlapping
+View closure and caller cancellation cannot interrupt its cleanup twice. An
+older host without this contract is refused; the feature does not create an
+independent child in its place. Durable form input still requires the Core 0.65
+input host described above.
 
 Initial publication requires the supported host contracts
 `supports_audited_deferred_tool_results` and `supports_tool_publication_context`,

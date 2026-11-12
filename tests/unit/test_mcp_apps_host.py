@@ -267,6 +267,28 @@ async def test_invalid_reconfiguration_preserves_the_current_host_and_copied_set
     assert await b.feature.get_config() == configuration
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('missing', ['capability', 'scope'])
+@pytest.mark.parametrize('mcp_http_server', [{'apps_tools': True, 'apps_execution_tools': True,
+    'app_mutate_visibility': ['model', 'app']}], indirect=True)
+async def test_missing_owned_call_contract_preserves_original_configuration(native_apps_host, monkeypatch, missing):
+    b = native_apps_host
+    await b.connection.close()
+    original = b.feature._apps_host
+    configuration = await b.feature.get_config()
+    changed = await b.feature.get_config()
+    changed['apps']['max_pending_calls'] += 1
+    if missing == 'capability':
+        monkeypatch.setattr(b.agent, 'supports_owned_mcp_app_calls', False)
+    else:
+        monkeypatch.setattr(b.agent, 'mcp_app_call_scope', None)
+    with pytest.raises(TypeError, match='host-owned task contract'):
+        await b.feature.set_config(changed)
+    assert b.feature._apps_host is original and not original.retired, (
+        'An unsupported App task host retired the original configuration before validation')
+    assert await b.feature.get_config() == configuration
+
+
 @pytest.mark.parametrize("mcp_http_server", [{"apps_tools": True, "apps_execution_tools": True,
     "app_mutate_visibility": ["model", "app"]}], indirect=True)
 @pytest.mark.asyncio

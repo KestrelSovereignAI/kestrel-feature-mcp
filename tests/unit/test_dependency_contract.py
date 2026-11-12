@@ -36,8 +36,8 @@ def test_host_tests_require_native_apps_oauth_and_unconfirmed_outcomes():
     (core,) = [Requirement(raw) for raw in project["optional-dependencies"]["test"]
                if Requirement(raw).name == "kestrel-sovereign"]
     floor = max(Version(spec.version) for spec in core.specifier if spec.operator == '>=')
-    assert floor >= Version('0.64.4')
-    assert not core.specifier.contains('0.64.3')
+    assert floor >= Version('0.64.6')
+    assert not core.specifier.contains('0.64.5')
     assert core.specifier.contains(str(floor))
     packages = {item["name"]: item for item in tomllib.loads(
         (ROOT / "uv.lock").read_text())["package"]}

@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-mcp"
-version = "0.16.0"
+version = "0.17.0"
 description = "Model Context Protocol (MCP) server management for Kestrel Sovereign agents"
 readme = "README.md"
 license = "Apache-2.0"
@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "kestrel-sovereign>=0.64.4,<1",
+    "kestrel-sovereign>=0.64.6,<1",
     "packaging",
     "pytest>=8.0.0",
     "pytest-asyncio>=1.4.0",
