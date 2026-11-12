@@ -37,6 +37,14 @@ InitialAppPublisher = Callable[
 ]
 
 
+def require_owned_call_host(host):
+    """Validate before replacing any live host or constructing an executor."""
+    if (getattr(host, 'supports_owned_mcp_app_calls', None) is not True
+            or not callable(getattr(host, 'mcp_app_call_scope', None))):
+        raise TypeError("MCP Apps require Core's host-owned task contract")
+    return host.mcp_app_call_scope
+
+
 def require_synchronous_callback(callback, *, label: str, allow_builtin: bool = False) -> None:
     """Private delivery callbacks run inline and cannot escape as awaitables."""
     if (not (isfunction(callback) or ismethod(callback) or (allow_builtin and isbuiltin(callback)))
@@ -158,22 +166,26 @@ class AppView:
         self.require_current()
         if self._pending_count >= self.executor._max_pending_calls:
             raise ResourceConflict("MCP App View reached its pending-call limit")
-        call = asyncio.create_task(operation(), name=name)
-        self._calls.add(call)
+        call = None
         try:
-            result = await call
-            # The child may finish before a queued lifecycle callback runs,
-            # while this awaiting API task resumes after that callback.
-            try:
-                self.require_current()
-            except ResourceConflict as error:
-                if revoked_outcome is not None:
-                    raise revoked_outcome() from error
-                raise
-            return result
+            async with self.executor._call_scope(operation, name=name, cancel=self._cancel_call) as owner:
+                call = owner.task
+                if not isinstance(call, asyncio.Task) or not callable(owner.wait):
+                    raise TypeError('MCP Apps require the original host-owned task and waiter')
+                self._calls.add(call)
+                result = await owner.wait()
+                # The child may finish before a queued lifecycle callback runs,
+                # while this awaiting API task resumes after that callback.
+                try:
+                    self.require_current()
+                except ResourceConflict as error:
+                    if revoked_outcome is not None:
+                        raise revoked_outcome() from error
+                    raise
+                return result
         except asyncio.CancelledError as error:
-            owner = asyncio.current_task()
-            if self._closed and owner is not None and owner.cancelling() == 0:
+            caller = asyncio.current_task()
+            if self._closed and caller is not None and caller.cancelling() == 0:
                 # Withdrawal cancels our child, not the awaiting caller's task.
                 # Preserve actual caller cancellation; otherwise report whether
                 # this View had already admitted a native tool invocation.
@@ -182,7 +194,8 @@ class AppView:
                 raise ResourceConflict("MCP App View closed before resource delivery") from error
             raise
         finally:
-            self._calls.discard(call)
+            if call is not None:
+                self._calls.discard(call)
 
     def revoke(self) -> None:
         """Withdraw authority synchronously before any asynchronous cleanup."""
@@ -299,6 +312,7 @@ class AppExecutor:
             if (getattr(host, "supports_audited_deferred_tool_results", False) is not True
                     or getattr(host, "supports_tool_publication_context", False) is not True):
                 raise ValueError("MCP Apps initial publication requires audited host-selected chat context")
+        self._call_scope = require_owned_call_host(host)
         self._initial_publisher = initial_publisher
         self._max_pending_calls = max_pending_calls
         self._invocation: ContextVar[_Invocation | None] = ContextVar(

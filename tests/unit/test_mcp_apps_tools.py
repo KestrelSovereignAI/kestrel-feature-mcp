@@ -13,6 +13,25 @@ from kestrel_feature_mcp.connection import MCPConnection, describe_tools
 from kestrel_feature_mcp.apps_execution import AppExecutor
 
 
+@pytest.mark.parametrize('flag', [False, 1, None])
+def test_app_execution_requires_exact_host_task_ownership_capability(flag):
+    def scope(*args, **kwargs):
+        pytest.fail('A constructor must not start App work')
+
+    host = SimpleNamespace(supports_deferred_tool_results=True,
+        supports_owned_mcp_app_calls=flag, mcp_app_call_scope=scope)
+    with pytest.raises(TypeError, match='host-owned task contract'):
+        AppExecutor(host=host, max_pending_calls=2)
+
+
+@pytest.mark.parametrize('scope', [None, 0])
+def test_app_execution_requires_its_actual_host_task_scope(scope):
+    host = SimpleNamespace(supports_deferred_tool_results=True,
+        supports_owned_mcp_app_calls=True, mcp_app_call_scope=scope)
+    with pytest.raises(TypeError, match='host-owned task contract'):
+        AppExecutor(host=host, max_pending_calls=2)
+
+
 @pytest.mark.parametrize("capability", ["supports_audited_deferred_tool_results", "supports_tool_publication_context"])
 @pytest.mark.parametrize("flag", [False, 1, None])
 def test_initial_publication_requires_both_exact_host_promises(capability, flag):

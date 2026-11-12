@@ -3,7 +3,7 @@
 from uuid import uuid4
 
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import copy_context
 from dataclasses import dataclass
 import json
@@ -122,6 +122,28 @@ async def allow(boundary, name, permission=PermissionLevel.ALLOW):
 
 
 @pytest.mark.asyncio
+async def test_native_app_call_uses_and_retires_its_host_owned_task(app_boundary, mcp_http_server, monkeypatch):
+    peer = app_boundary
+    await allow(peer, 'app_mutate')
+    admitted, retired = [], []
+
+    @asynccontextmanager
+    async def call_scope(operation, *, name, cancel):
+        async with peer.host.mcp_app_call_scope(operation, name=name, cancel=cancel) as owner:
+            admitted.append(owner.task)
+            yield owner
+        retired.append(owner.task)
+
+    monkeypatch.setattr(peer.executor, '_call_scope', call_scope, raising=False)
+    result = await peer.executor.invoke(peer.view, 'app_mutate', {'text': 'host-owned'},
+        operation_id=uuid4().hex)
+    assert len(admitted) == 1, 'MCP App bypassed its original host-owned task admission'
+    assert retired == admitted and admitted[0].done() and not peer.view._calls
+    assert result.structured_content == {'text': 'host-owned'}
+    assert mcp_http_server.witness == ['host-owned']
+
+
+@pytest.mark.asyncio
 async def test_app_only_native_tool_is_governed_and_private_result_follows_required_sql_audit(app_boundary, mcp_http_server):
     peer = app_boundary
     tool = await allow(peer, "app_mutate")
@@ -222,7 +244,9 @@ async def test_app_cannot_call_model_only_or_foreign_tools(app_boundary, mcp_htt
 
 
 @pytest.mark.asyncio
-async def test_view_close_joins_required_sql_finalization_through_repeated_cancellation(app_boundary, mcp_http_server):
+@pytest.mark.parametrize('cancellation', ['view', 'caller-first', 'view-first'])
+async def test_view_close_joins_required_sql_finalization_through_repeated_cancellation(
+        app_boundary, mcp_http_server, cancellation):
     peer = app_boundary
     await allow(peer, "app_mutate")
     peer.store.dispatch_started, peer.store.release_dispatch = asyncio.Event(), asyncio.Event()
@@ -231,8 +255,19 @@ async def test_view_close_joins_required_sql_finalization_through_repeated_cance
     try:
         await asyncio.wait_for(peer.store.dispatch_started.wait(), 5)
         assert mcp_http_server.witness == ["before-close"]
+        child, = peer.view._calls
+        if cancellation == 'caller-first':
+            call.cancel()
+            async with asyncio.timeout(5):
+                while child not in peer.view._cancelled_calls:
+                    await asyncio.sleep(0)
         closing = asyncio.create_task(peer.view.close())
-        await asyncio.sleep(0)
+        async with asyncio.timeout(5):
+            while child not in peer.view._cancelled_calls or not peer.view.is_closed:
+                await asyncio.sleep(0)
+        if cancellation == 'view-first':
+            call.cancel()
+        assert not child.done(), 'The original App task lost its pending SQL finalization'
         with pytest.raises(ResourceConflict, match="expired"):
             peer.view.list_tools()
         for _ in range(2):
@@ -243,11 +278,16 @@ async def test_view_close_joins_required_sql_finalization_through_repeated_cance
         with pytest.raises(asyncio.CancelledError):
             await closing
         assert closing.cancelled()
-        with pytest.raises(ResourceOutcomeUnknown):
-            await call
-        assert not call.cancelled()
+        if cancellation == 'view':
+            with pytest.raises(ResourceOutcomeUnknown):
+                await call
+            assert not call.cancelled()
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            assert call.cancelled()
         row = await peer.backend.fetch_one("SELECT result_status, error_class FROM a2a_tool_dispatches")
-        # The tool returned before closing; its original audit acknowledged
+        # The native effect returned before cancellation; its audit acknowledged
         # that known effect. Closing still withholds the private result.
         assert tuple(row) == ("success", None)
         assert peer.store.dispatch_attempts == peer.store.dispatch_acks == 1
