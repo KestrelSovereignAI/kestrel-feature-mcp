@@ -1,4 +1,6 @@
 """Typed client extension against an independently defined native SDK peer."""
+import asyncio
+from copy import deepcopy
 import json
 
 import pytest
@@ -6,11 +8,15 @@ import httpx2
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp import types
-from mcp.client.extension import UnexpectedClaimedResult
+from mcp.client.extension import ClientExtension, UnexpectedClaimedResult
 from mcp.server.extension import Extension, MethodBinding
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from kestrel_feature_mcp.input_requests import plan_mcp_inputs, validate_form_responses
+from kestrel_feature_mcp.connection import MCPConnection, MCPCallOutcomeUnknownError, bind_tool_caller
+from kestrel_feature_mcp.input_requests import MCPInputResume, MCPInputSuspension
+from kestrel_sdk.resources import ResourceConflict, ResourceUnsupported
+from mcp.shared.exceptions import MCPError
 
 from kestrel_feature_mcp.tasks_protocol import (
     CancelTaskRequest, CreateTaskResult, DetailedTaskResult, GetTaskRequest,
@@ -35,6 +41,9 @@ class NativeTasksPeer(Extension):
         self.status = "working"
         self.task_id = "opaque/task:1"
         self.ttl_ms = 60000
+        self.before_response = None
+        self.require_input = False
+        self.reject_code = None
 
     def state(self):
         return {"resultType": "complete", "taskId": self.task_id,
@@ -45,11 +54,27 @@ class NativeTasksPeer(Extension):
     async def intercept_tool_call(self, params, ctx, call_next):
         if params.name != "echo":
             return await call_next(ctx)
+        if self.require_input:
+            if params.request_state is None:
+                return types.InputRequiredResult(request_state='native-mrtr-state', input_requests={
+                    'form': types.ElicitRequest.model_validate({'method': 'elicitation/create', 'params': {
+                        'mode': 'form', 'message': 'Choose a label', 'requestedSchema': {'type': 'object',
+                            'properties': {'label': {'type': 'string'}}, 'required': ['label']}}})})
+            assert params.request_state == 'native-mrtr-state'
+            assert params.input_responses['form'].content == {'label': 'native input'}
         self.calls.append("started")
         return {**self.state(), "resultType": "task"}
 
-    async def get(self, ctx, params):
+    async def respond(self, result):
+        return result if self.before_response is None else await self.before_response(result)
+
+    def require_request(self, params):
         assert params.task_id == self.task_id
+        if self.reject_code is not None:
+            raise MCPError(self.reject_code, 'Task request rejected before execution')
+
+    async def get(self, ctx, params):
+        self.require_request(params)
         self.calls.append("get")
         state = self.state()
         if self.status == "input_required":
@@ -61,20 +86,20 @@ class NativeTasksPeer(Extension):
             state["result"] = {"resultType": "complete", "content": [
                 {"type": "text", "text": "actual deferred result"}],
                 "structuredContent": {"result": "actual deferred result"}}
-        return state
+        return await self.respond(state)
 
     async def update(self, ctx, params):
-        assert params.task_id == self.task_id
+        self.require_request(params)
         assert params.input_responses["form"].action == "accept"
         assert params.input_responses["form"].content == {"label": "native input"}
         self.calls.append("update")
         self.status = "completed"
-        return {"resultType": "complete"}
+        return await self.respond({"resultType": "complete"})
 
     async def cancel(self, ctx, params):
-        assert params.task_id == self.task_id
+        self.require_request(params)
         self.calls.append("cancel")
-        return {"resultType": "complete"}
+        return await self.respond({"resultType": "complete"})
 
     def methods(self):
         return [MethodBinding(method=method, params_type=shape, handler=handler,
@@ -86,6 +111,14 @@ class NativeTasksPeer(Extension):
 
 async def no_implicit_resolution(result, context):
     raise AssertionError("one-round native calls must not replay or poll implicitly")
+
+
+class IndependentTasksExtension(ClientExtension):
+    """The same public capability identifier without Kestrel class identity."""
+    identifier = TasksExtension.identifier
+
+    def claims(self):
+        return TasksExtension(no_implicit_resolution).claims()
 
 
 @pytest.mark.asyncio
@@ -260,3 +293,400 @@ async def test_native_sdk_wire_claim_rejects_python_field_names(mcp_http_server,
         rejected = True
     assert rejected, "Native wire accepted a Python-only task_id alias"
     assert peer.calls == ["started"] and not mcp_http_server.witness
+
+
+def native_task_request(verb, task_id):
+    if verb == 'update':
+        return UpdateTaskRequest(params=UpdateTaskParams(task_id=task_id,
+            input_responses={'form': types.ElicitResult(action='accept', content={'label': 'native input'})}))
+    request_type = GetTaskRequest if verb == 'get' else CancelTaskRequest
+    return request_type(params=TaskIdParams(task_id=task_id))
+
+
+def native_task_messages(server):
+    return [json.loads(body) for _, body in server.requests if body
+        and json.loads(body).get('method', '').startswith('tasks/')]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mcp_http_server', [{'extensions': [NativeTasksPeer()]}], indirect=True)
+@pytest.mark.parametrize('task_id', ['', 'opaque/task:1', 'opaque/Δ:1', 'opaque\r\nInjected:1'])
+@pytest.mark.parametrize('ttl_ms', [60000, None])
+async def test_connection_owns_native_claim_and_all_task_verbs(mcp_http_server, task_id, ttl_ms, official_tasks_schema):
+    peer = mcp_http_server.settings['extensions'][0]
+    peer.task_id, peer.ttl_ms = task_id, ttl_ms
+    connection = MCPConnection(mcp_http_server.url, extensions=[TasksExtension(no_implicit_resolution)])
+    try:
+        tools = await connection.connect()
+        bound = bind_tool_caller(connection, lambda: True, 'native-task-owner', tool_names=[t.name for t in tools])
+        def authority():
+            assert bound.is_current
+        created = None
+        try:
+            created = await bound('echo', {'text': 'accepted once'}, require_authority=authority, allow_claimed=True)
+        except MCPCallOutcomeUnknownError:
+            pass
+        assert isinstance(created, CreateTaskResult) and created.task_id == task_id and created.ttl_ms == ttl_ms
+        # A Tasks-capable call still accepts the real ordinary result variant.
+        ordinary = await bound('fail', {}, require_authority=authority, allow_claimed=True)
+        assert isinstance(ordinary, types.CallToolResult) and ordinary.is_error
+        state = await bound.request_task(native_task_request('get', task_id), require_authority=authority)
+        assert state.status == 'working'
+        peer.status = 'input_required'
+        state = await bound.request_task(native_task_request('get', task_id), require_authority=authority)
+        assert state.input_requests['form'].method == 'elicitation/create'
+        ack = await bound.request_task(native_task_request('update', task_id), require_authority=authority)
+        assert isinstance(ack, TaskAcknowledgement) and ack.result_type == 'complete'
+        state = await bound.request_task(native_task_request('get', task_id), require_authority=authority)
+        assert state.status == 'completed' and state.result['content'][0]['text'] == 'actual deferred result'
+        peer.status = 'working'
+        ack = await bound.request_task(native_task_request('cancel', task_id), require_authority=authority)
+        assert isinstance(ack, TaskAcknowledgement)
+        state = await bound.request_task(native_task_request('get', task_id), require_authority=authority)
+        assert state.status == 'working', 'A cancellation acknowledgement falsely completed the Task'
+        peer.status = 'cancelled'
+        state = await bound.request_task(native_task_request('get', task_id), require_authority=authority)
+        assert state.status == 'cancelled'
+    finally:
+        await connection.close()
+    assert peer.calls == ['started', 'get', 'get', 'update', 'get', 'cancel', 'get', 'get']
+    assert not mcp_http_server.witness
+    names = {'tasks/get': 'GetTaskRequest', 'tasks/update': 'UpdateTaskRequest', 'tasks/cancel': 'CancelTaskRequest'}
+    for message in native_task_messages(mcp_http_server):
+        official_tasks_schema(names[message['method']], message)
+        assert message['params']['taskId'] == task_id
+        assert 'requestState' not in message['params']
+    headers = [dict(scope['headers'])[b'mcp-name'] for scope, body in mcp_http_server.requests
+        if body and json.loads(body).get('method', '').startswith('tasks/')]
+    assert len(set(headers)) == 1 and all(b'\r' not in header and b'\n' not in header for header in headers)
+    assert sum(json.loads(body).get('method') == 'tools/call' for _, body in mcp_http_server.requests if body) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mcp_http_server', [{'extensions': [NativeTasksPeer()]}], indirect=True)
+@pytest.mark.parametrize('pause', [False, True])
+async def test_connection_keeps_native_task_claim_after_actual_mrtr_round(mcp_http_server, pause):
+    peer = mcp_http_server.settings['extensions'][0]
+    peer.require_input = True
+    checkpoint = []
+    connection = MCPConnection(mcp_http_server.url, extensions=[TasksExtension(no_implicit_resolution)])
+    try:
+        await connection.connect()
+        bound = bind_tool_caller(connection, lambda: True, 'native-mrtr-to-task')
+        async def handle(native):
+            checkpoint.append(native.model_copy(deep=True))
+            if pause:
+                return MCPInputSuspension('owned-input-reference', 'owned-chat')
+            return {'form': types.ElicitResult(action='accept', content={'label': 'native input'})}
+        result = await bound('echo', {'text': 'accepted once'}, require_authority=bound.require_current,
+            input_handler=handle, allow_claimed=True)
+        if pause:
+            assert isinstance(result, MCPInputSuspension)
+            resume = MCPInputResume.seal(checkpoint[0], {'form': types.ElicitResult(
+                action='accept', content={'label': 'native input'})})
+            result = await bound('echo', {'text': 'accepted once'}, require_authority=bound.require_current,
+                input_handler=handle, resume=resume, allow_claimed=True)
+        assert isinstance(result, CreateTaskResult) and result.task_id == peer.task_id
+    finally:
+        await connection.close()
+    assert len(checkpoint) == 1 and peer.calls == ['started'] and not mcp_http_server.witness
+    messages = [json.loads(body) for _, body in mcp_http_server.requests if body
+        and json.loads(body).get('method') == 'tools/call']
+    assert len(messages) == 2 and 'requestState' not in messages[0]['params']
+    assert messages[1]['params']['requestState'] == checkpoint[0].request_state
+    assert messages[1]['params']['inputResponses']['form']['content'] == {'label': 'native input'}
+    assert not native_task_messages(mcp_http_server), 'Connection implicitly polled a deferred Task'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mcp_http_server', [
+    {'extensions': [NativeTasksPeer()]}, {}, {'extensions': [NativeTasksPeer()], 'legacy': True},
+], indirect=True)
+async def test_task_support_requires_native_local_and_server_negotiation(mcp_http_server):
+    for extension in (None, TasksExtension(no_implicit_resolution), IndependentTasksExtension()):
+        configured = extension is not None
+        connection = MCPConnection(mcp_http_server.url,
+            extensions=[extension] if configured else [])
+        try:
+            await connection.connect()
+            bound = bind_tool_caller(connection, lambda: True, 'native-negotiation')
+            supported = configured and bool(mcp_http_server.settings.get('extensions')) and not mcp_http_server.settings.get('legacy')
+            if supported:
+                refusal = None
+                try:
+                    await bound('echo', {'text': 'not admitted'})
+                except (ResourceUnsupported, MCPCallOutcomeUnknownError, MCPError) as error:
+                    refusal = error
+                assert isinstance(refusal, ResourceUnsupported), 'Tasks capability reached wire without explicit claim handling'
+                assert 'explicit native claim' in str(refusal)
+                with pytest.raises(ResourceUnsupported, match='current host authority'):
+                    await connection.call_tool('echo', {'text': 'not admitted'}, allow_claimed=True)
+                with pytest.raises(ResourceUnsupported, match='current host authority'):
+                    await bound('echo', {'text': 'not admitted'}, allow_claimed=True)
+            else:
+                with pytest.raises(ResourceUnsupported, match='native negotiated extension'):
+                    await bound.request_task(native_task_request('get', 'opaque/task:1'), require_authority=bound.require_current)
+                if not configured or mcp_http_server.settings.get('legacy'):
+                    with pytest.raises(ResourceUnsupported, match='native negotiated extension'):
+                        await bound('echo', {'text': 'not admitted'}, allow_claimed=True,
+                            require_authority=bound.require_current)
+        finally:
+            await connection.close()
+    assert not native_task_messages(mcp_http_server) and not mcp_http_server.witness
+    assert not any(json.loads(body).get('method') == 'tools/call' for _, body in mcp_http_server.requests if body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mcp_http_server', [{'extensions': [NativeTasksPeer()]}], indirect=True)
+@pytest.mark.parametrize('verb', ['get', 'update', 'cancel'])
+@pytest.mark.parametrize('change', ['request', 'authority', 'registration'])
+async def test_bound_task_custody_survives_real_awaited_admission(mcp_http_server, verb, change):
+    peer = mcp_http_server.settings['extensions'][0]
+    entered, release = asyncio.Event(), asyncio.Event()
+    current, authorized = True, True
+    async def admit():
+        entered.set()
+        await release.wait()
+    def authority():
+        if not authorized:
+            raise ResourceConflict('Original host authority was withdrawn')
+    connection = MCPConnection(mcp_http_server.url, extensions=[TasksExtension(no_implicit_resolution)])
+    try:
+        await connection.connect()
+        bound = bind_tool_caller(connection, lambda: current, 'admitted-task-owner', admit=admit)
+        request = native_task_request(verb, peer.task_id)
+        expected = deepcopy(request.model_dump(mode='json', by_alias=True, exclude_none=True))
+        task = asyncio.create_task(bound.request_task(request, require_authority=authority))
+        async with asyncio.timeout(5):
+            await entered.wait()
+            if change == 'request':
+                request.params.task_id = 'substituted-task'
+                if verb == 'update':
+                    request.params.input_responses['form'].content['label'] = 'substituted-answer'
+            elif change == 'authority':
+                authorized = False
+            else:
+                current = False
+            release.set()
+            if change == 'request':
+                outcome_error = None
+                try:
+                    await task
+                except (MCPError, MCPCallOutcomeUnknownError) as error:
+                    outcome_error = error
+                message, = native_task_messages(mcp_http_server)
+                assert {key: value for key, value in message['params'].items() if key != '_meta'} == expected['params']
+                assert outcome_error is None, 'Original native request was not accepted'
+            else:
+                with pytest.raises((ResourceConflict, ValueError)):
+                    await task
+                assert not native_task_messages(mcp_http_server), 'Task was sent after its original authority expired'
+        assert peer.calls == ([verb] if change == 'request' else [])
+    finally:
+        release.set()
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mcp_http_server', [{'extensions': [NativeTasksPeer()]}], indirect=True)
+@pytest.mark.parametrize('verb', ['get', 'update', 'cancel'])
+@pytest.mark.parametrize('failure', ['withdraw', 'timeout', 'cancel', 'native-error', 'invalid-result'])
+async def test_task_transport_keeps_one_native_outcome_without_replay(mcp_http_server, verb, failure):
+    peer = mcp_http_server.settings['extensions'][0]
+    entered, release = asyncio.Event(), asyncio.Event()
+    authorized = True
+    def authority():
+        if not authorized:
+            raise ResourceConflict('Original host authority was withdrawn')
+    async def before_response(result):
+        nonlocal authorized
+        entered.set()
+        if failure in {'timeout', 'cancel'}:
+            await release.wait()
+        if failure == 'withdraw':
+            authorized = False
+        if failure == 'native-error':
+            raise MCPError(types.INTERNAL_ERROR, 'Native operation has no readable acknowledgement')
+        if failure == 'invalid-result':
+            return {**result, 'resultType': 'invalid-task-response'}
+        return result
+    peer.before_response = before_response
+    connection = MCPConnection(mcp_http_server.url, extensions=[TasksExtension(no_implicit_resolution)], call_timeout=0.5)
+    task = None
+    try:
+        await connection.connect()
+        bound = bind_tool_caller(connection, lambda: True, 'task-failure-owner')
+        task = asyncio.create_task(bound.request_task(native_task_request(verb, peer.task_id), require_authority=authority))
+        async with asyncio.timeout(5):
+            await entered.wait()
+            if failure == 'cancel':
+                task.cancel('original Task request cancellation')
+            error, delivered = None, False
+            try:
+                await task
+                delivered = True
+            except (asyncio.CancelledError, MCPError, MCPCallOutcomeUnknownError,
+                    ResourceConflict, ValueError, TimeoutError) as observed:
+                error = observed
+            assert not delivered, 'Unconfirmed native Task outcome became a delivered result'
+            if failure == 'cancel':
+                assert isinstance(error, asyncio.CancelledError), 'Original cancellation identity was replaced'
+                assert error.args == ('original Task request cancellation',)
+            elif verb != 'get':
+                assert isinstance(error, MCPCallOutcomeUnknownError), 'Unconfirmed Task mutation lost its unknown outcome'
+                assert 'do not replay' in str(error)
+            elif failure == 'withdraw':
+                assert isinstance(error, ResourceConflict)
+            elif failure == 'timeout':
+                assert isinstance(error, TimeoutError)
+            elif failure == 'native-error':
+                assert isinstance(error, MCPError) and error.code == types.INTERNAL_ERROR
+            else:
+                assert isinstance(error, ValidationError)
+    finally:
+        release.set()
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await connection.close()
+    assert peer.calls == [verb], 'Task transport resent a native operation'
+    message, = native_task_messages(mcp_http_server)
+    assert message['method'] == 'tasks/' + verb
+    assert not mcp_http_server.witness
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mcp_http_server', [{'extensions': [NativeTasksPeer()]}], indirect=True)
+async def test_task_requests_require_current_authority_and_the_exact_native_contract_before_admission(mcp_http_server):
+    admissions = []
+    async def admit():
+        admissions.append('admitted')
+    connection = MCPConnection(mcp_http_server.url, extensions=[TasksExtension(no_implicit_resolution)])
+    try:
+        await connection.connect()
+        bound = bind_tool_caller(connection, lambda: True, 'closed-native-requests', admit=admit)
+        with pytest.raises(TypeError, match='current host authority'):
+            await bound.request_task(native_task_request('cancel', 'opaque/task:1'), require_authority=None)
+        with pytest.raises(TypeError, match='current host authority'):
+            await connection.request_task(native_task_request('cancel', 'opaque/task:1'),
+                incarnation=connection.incarnation, round_check=None)
+        with pytest.raises(TypeError, match='native Tasks'):
+            await bound.request_task(types.CallToolRequest(params=types.CallToolRequestParams(name='echo')),
+                require_authority=bound.require_current)
+        with pytest.raises(ValidationError) as invalid:
+            await bound.request_task(GetTaskRequest.model_construct(params=None),
+                require_authority=bound.require_current)
+        assert invalid.value.errors()[0]['loc'] == ('params',)
+        assert not admissions, 'Invalid Task operation reached credential admission'
+        assert not native_task_messages(mcp_http_server), 'Invalid Task operation reached the wire'
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mcp_http_server', [{'extensions': [NativeTasksPeer()]}], indirect=True)
+@pytest.mark.parametrize('verb', ['get', 'update', 'cancel'])
+@pytest.mark.parametrize('phase', ['before', 'after'])
+async def test_direct_task_request_rechecks_incarnation_after_its_host_callback(mcp_http_server, verb, phase, monkeypatch):
+    # Fault the local connection stamp, never SDK behavior or native wire. A
+    # host callback must not make a result current after retiring its owner.
+    peer = mcp_http_server.settings['extensions'][0]
+    connection = MCPConnection(mcp_http_server.url, extensions=[TasksExtension(no_implicit_resolution)])
+    checks, delivered = 0, False
+    def check():
+        nonlocal checks
+        checks += 1
+        if checks == (1 if phase == 'before' else 2):
+            monkeypatch.setattr(connection, '_incarnation', None)
+    try:
+        await connection.connect()
+        try:
+            await connection.request_task(native_task_request(verb, peer.task_id),
+                incarnation=connection.incarnation, round_check=check)
+            delivered = True
+        except (ValueError, ConnectionError, MCPCallOutcomeUnknownError):
+            pass
+        assert not delivered, 'Native Task result was delivered after its host callback retired the original connection'
+    finally:
+        await connection.close()
+    assert peer.calls == ([] if phase == 'before' else [verb])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mcp_http_server', [{}, {'legacy': True}], indirect=True)
+async def test_tasks_client_keeps_ordinary_servers_usable(mcp_http_server):
+    connection = MCPConnection(mcp_http_server.url, extensions=[TasksExtension(no_implicit_resolution)])
+    try:
+        await connection.connect()
+        bound = bind_tool_caller(connection, lambda: True, 'ordinary-result-owner')
+        result = await bound('echo', {'text': 'ordinary result'}, require_authority=bound.require_current,
+            allow_claimed=not bool(mcp_http_server.settings.get('legacy')))
+        assert isinstance(result, types.CallToolResult) and result.content[0].text == 'ordinary result'
+    finally:
+        await connection.close()
+    assert mcp_http_server.witness == ['ordinary result'] and not native_task_messages(mcp_http_server)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mcp_http_server', [{'extensions': [NativeTasksPeer()]}], indirect=True)
+@pytest.mark.parametrize('verb', ['get', 'update', 'cancel'])
+@pytest.mark.parametrize('code', [types.INVALID_PARAMS, types.METHOD_NOT_FOUND, types.HEADER_MISMATCH])
+async def test_native_task_refusal_is_not_reclassified_or_resent(mcp_http_server, verb, code):
+    peer = mcp_http_server.settings['extensions'][0]
+    peer.reject_code = code
+    connection = MCPConnection(mcp_http_server.url, extensions=[TasksExtension(no_implicit_resolution)])
+    try:
+        await connection.connect()
+        bound = bind_tool_caller(connection, lambda: True, 'refused-task-owner')
+        with pytest.raises(MCPError) as rejected:
+            await bound.request_task(native_task_request(verb, peer.task_id), require_authority=bound.require_current)
+        assert rejected.value.code == code
+        assert connection.is_connected == (code != types.HEADER_MISMATCH)
+    finally:
+        await connection.close()
+    assert not peer.calls and not mcp_http_server.witness
+    message, = native_task_messages(mcp_http_server)
+    assert message['method'] == 'tasks/' + verb
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mcp_http_server', [{'extensions': [NativeTasksPeer()]}], indirect=True)
+@pytest.mark.parametrize('changed_after_adoption', [False, True])
+async def test_claim_guard_keeps_the_extension_membership_consumed_by_the_sdk(mcp_http_server, changed_after_adoption):
+    extension = IndependentTasksExtension()
+    if not changed_after_adoption:
+        extension.identifier = 'example.com/other-extension'
+    connection = MCPConnection(mcp_http_server.url, extensions=[extension])
+    try:
+        await connection.connect()
+        if changed_after_adoption:
+            extension.identifier = 'example.com/other-extension'
+        assert connection.supports_task_claims is changed_after_adoption
+        bound = bind_tool_caller(connection, lambda: True, 'adopted-capability-owner')
+        if changed_after_adoption:
+            refusal = None
+            try:
+                await bound('echo', {'text': 'no native claim handling'})
+            except (ResourceUnsupported, MCPCallOutcomeUnknownError) as error:
+                refusal = error
+            assert isinstance(refusal, ResourceUnsupported), 'Live extension metadata disabled the guard after SDK adoption'
+            assert not mcp_http_server.settings['extensions'][0].calls
+            created = await bound('echo', {'text': 'accepted once'}, require_authority=bound.require_current,
+                allow_claimed=True)
+            assert isinstance(created, CreateTaskResult)
+            current = await bound.request_task(native_task_request('get', created.task_id),
+                require_authority=bound.require_current)
+            assert current.status == 'working'
+            messages = [json.loads(body) for _, body in mcp_http_server.requests if body
+                and json.loads(body).get('method') == 'tools/call']
+            message, = messages
+            assert 'io.modelcontextprotocol/tasks' in message['params']['_meta'][
+                'io.modelcontextprotocol/clientCapabilities']['extensions']
+        else:
+            with pytest.raises(ResourceUnsupported):
+                await bound.request_task(native_task_request('get', 'opaque/task:1'),
+                    require_authority=bound.require_current)
+            assert not native_task_messages(mcp_http_server)
+    finally:
+        await connection.close()
+    assert not connection.supports_task_claims

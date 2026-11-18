@@ -484,6 +484,17 @@ Its implementation uses the official SDK's public extension interface and the
 published Tasks schema, while MCP stays on the published official Python SDK.
 There is no MCP SDK fork or private protocol translation layer.
 
+The connection layer can explicitly return the SDK's native claimed result with
+`allow_claimed=True`, including after MRTR. `BoundMCPCaller.request_task` accepts
+only the native get/update/cancel request classes and retains credential
+admission, current host authority, the original connection and a bounded native
+request. It does not poll or retry mutations. Configuring a Tasks extension
+requires explicit claim handling on each eligible call. These transport APIs do
+not provide durable admission or permission; the complete host and wait-provider
+integration is still required before enabling the capability.
+`MCPConnection.supports_task_claims` diagnoses the capability adopted by the
+current connection; later extension-object mutations do not change that session.
+
 ## Optional MCP Apps host
 
 The optional host composes native AppBridge rendering, Core-authenticated View
