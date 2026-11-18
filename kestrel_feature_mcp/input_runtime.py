@@ -114,7 +114,7 @@ class MCPInputRuntime:
 
     async def _handle(self, registered, arguments, invocation, native):
         origin = self.host.origin()
-        plan = plan_mcp_inputs(native, allow_blocking=origin.allow_blocking)
+        plan = plan_mcp_inputs(native.input_requests, allow_blocking=origin.allow_blocking)
         decisions = [(decision.request_id, decision.reason) for decision in plan.decisions]
         decisions.extend((key, 'unsupported_input') for key in plan.unsupported_requests)
         if decisions:
@@ -160,7 +160,7 @@ class MCPInputRuntime:
 
     def describe(self, record):
         native = types.InputRequiredResult.model_validate(record.payload['native'])
-        plan = plan_mcp_inputs(native, allow_blocking=True)
+        plan = plan_mcp_inputs(native.input_requests, allow_blocking=True)
         available = True
         try:
             self._lookup(record)
@@ -179,7 +179,7 @@ class MCPInputRuntime:
     async def respond(self, record, responses, *, operation_id):
         registered = self._lookup(record)
         native = types.InputRequiredResult.model_validate(record.payload['native'])
-        plan = plan_mcp_inputs(native, allow_blocking=True)
+        plan = plan_mcp_inputs(native.input_requests, allow_blocking=True)
         answers = {**validate_form_responses(plan, responses), **plan.declines}
         encoded = {key: result.model_dump(mode='json', by_alias=True, exclude_none=True)
             for key, result in answers.items()}
