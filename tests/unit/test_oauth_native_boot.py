@@ -4,15 +4,17 @@ import socket
 import traceback
 import aiosqlite
 import pytest
+from kestrel_sdk.payer_policy import PayerKind, PayerPolicy, PayerSpec
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.llm.service import LLMService
+from kestrel_sovereign.llm.service import LLMService, PolicyDeniedError
 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 @pytest.mark.timeout(60)
-async def test_native_full_boot_loads_actual_oauth_feature_and_resolves_original_storage(tmp_path, monkeypatch, owned_oauth_key):
+@pytest.mark.parametrize('bedrock_credentials', [False, True])
+async def test_native_full_boot_loads_actual_oauth_feature_and_resolves_original_storage(tmp_path, monkeypatch, owned_oauth_key, bedrock_credentials):
     connections = []
     native_connect = aiosqlite.connect
 
@@ -33,6 +35,19 @@ async def test_native_full_boot_loads_actual_oauth_feature_and_resolves_original
     monkeypatch.setenv('KESTREL_HOME', str(tmp_path))
     monkeypatch.setenv('KESTREL_DB_PATH', str(tmp_path))
     monkeypatch.setenv('AWS_EC2_METADATA_DISABLED', 'true')
+    aws_config = tmp_path / 'owned-aws-config'
+    aws_config.write_text('')
+    monkeypatch.setenv('AWS_SHARED_CREDENTIALS_FILE', str(aws_config))
+    monkeypatch.setenv('AWS_CONFIG_FILE', str(aws_config))
+    for key in ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN',
+                'AWS_PROFILE', 'AWS_DEFAULT_PROFILE', 'AWS_WEB_IDENTITY_TOKEN_FILE',
+                'AWS_ROLE_ARN', 'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI',
+                'AWS_CONTAINER_CREDENTIALS_FULL_URI', 'AWS_REGION', 'AWS_DEFAULT_REGION'):
+        monkeypatch.delenv(key, raising=False)
+    if bedrock_credentials:
+        monkeypatch.setenv('AWS_ACCESS_KEY_ID', 'owned-test-only')
+        monkeypatch.setenv('AWS_SECRET_ACCESS_KEY', 'owned-test-only-not-a-real-key')
+        monkeypatch.setenv('AWS_DEFAULT_REGION', 'us-east-1')
     (tmp_path / 'kestrel.toml').write_text('[llm]\nroute_priority=[]\n')
     async def audit(_prompt):
         return {'risk_level': 1, 'reasoning': 'Owned fixture genesis; no tool approval granted.'}
@@ -40,10 +55,18 @@ async def test_native_full_boot_loads_actual_oauth_feature_and_resolves_original
         agent_name='OwnedOAuthBoot', did_web_domain='owned-oauth-boot.invalid', genesis_auditor=audit,
         genesis_audit_provenance='test:3679-owned-native-boot')
     service = LLMService(agent_data_dir=tmp_path)
+    policy = PayerPolicy.model_validate({**PayerPolicy.host_env_default().model_dump(),
+        'llm': PayerSpec(vendor='local', kind=PayerKind.NONE),
+        'storage': PayerSpec(vendor='local-disk', kind=PayerKind.HOST_ENV)})
     agent = KestrelAgent(did=identity.agent_did, storage_path=str(tmp_path / 'kestrel_prime.db'),
-        llm_service=service, allowed_features={'MCPAgent'}, sync_enabled=False)
+        llm_service=service, allowed_features={'MCPAgent'}, sync_enabled=False, payer_policy=policy)
     try:
         await agent.initialize()
+        assert service.disabled
+        if bedrock_credentials:
+            assert any(provider['vendor'] == 'bedrock' for provider in service.providers)
+        with pytest.raises(PolicyDeniedError):
+            await service.generate(system_prompt='Owned no-LLM boot', user_prompt='Must be refused')
         assert {type(feature).__name__ for feature in agent.features.values()} == MANDATORY_FEATURES | {'MCPAgent'}
         feature = next(feature for feature in agent.features.values() if type(feature).__name__ == 'MCPAgent')
         await feature.set_config({'oauth': {'enabled': True, 'close_seconds': 2.0}})

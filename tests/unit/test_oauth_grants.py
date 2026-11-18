@@ -5,6 +5,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 import hashlib
 import os
+import sqlite3
 from urllib.parse import urlsplit
 import uuid
 
@@ -58,8 +59,6 @@ async def owners(tmp_path, binding, owned_oauth_key, request):
                 cleanup.push_async_callback(db.close)
                 databases.append(db)
         else:
-            if os.environ.get('GITHUB_ACTIONS') != 'true':
-                pytest.skip('Native PostgreSQL grant tests run only in the dedicated CI service')
             dsn = os.environ.get('TEST_POSTGRES_URL')
             if not dsn:
                 if os.environ.get('KESTREL_REQUIRE_POSTGRES_TESTS') == '1':
@@ -216,7 +215,7 @@ async def test_only_one_independent_refresh_claim_can_commit(owners, binding, to
 
 
 @pytest.mark.asyncio
-async def test_revision_cas_rejects_refresh_completed_between_read_and_update(
+async def test_revision_cas_honors_native_cross_owner_writer_order(
         owners, binding, tokens, monkeypatch):
     databases, (first, second) = owners
     installed = await install_grant(first, binding, tokens)
@@ -231,8 +230,28 @@ async def test_revision_cas_rejects_refresh_completed_between_read_and_update(
 
     monkeypatch.setattr(databases[0], 'execute', pause_before_real_update)
     pending = asyncio.create_task(first.begin_refresh(installed))
+    busy_timeout = None
     try:
         await asyncio.wait_for(entered.wait(), timeout=5)
+        if isinstance(databases[0], SQLiteBackend):
+            # Core acquires SQLite's writer slot at BEGIN IMMEDIATE. A foreign
+            # refresh cannot commit inside that admitted transaction's body.
+            # A zero native busy timeout makes writer exclusion observable
+            # without inferring a lock wait from task scheduling or a sleep.
+            busy_timeout, = await databases[1].fetch_one('PRAGMA busy_timeout')
+            await databases[1].execute('PRAGMA busy_timeout = 0')
+            with pytest.raises(TransactionError) as blocked:
+                await second.begin_refresh(installed)
+            assert isinstance(blocked.value.__cause__, sqlite3.OperationalError)
+            assert blocked.value.__cause__.sqlite_errorcode == sqlite3.SQLITE_BUSY
+            release.set()
+            current_claim = await pending
+            with pytest.raises(OAuthGrantChanged):
+                await second.begin_refresh(installed)
+            rotated = replace(tokens, access_token='writer-next-access', refresh_token='writer-rotated-refresh')
+            completed = await first.finish_refresh(current_claim, rotated)
+            assert await read_payload(second, binding) == completed
+            return
         current_claim = await second.begin_refresh(installed)
         rotated = replace(tokens, access_token='race-next-access',
                           refresh_token='race-rotated-refresh')
@@ -242,6 +261,38 @@ async def test_revision_cas_rejects_refresh_completed_between_read_and_update(
             await pending
         assert type(changed.value) is OAuthGrantChanged
         assert await read_payload(second, binding) == completed
+    finally:
+        release.set()
+        await asyncio.gather(pending, return_exceptions=True)
+        if busy_timeout is not None:
+            await databases[1].execute(f'PRAGMA busy_timeout = {busy_timeout}')
+
+
+@pytest.mark.asyncio
+async def test_refresh_snapshot_is_revalidated_after_native_writer_admission(owners, binding, tokens, monkeypatch):
+    databases, (first, second) = owners
+    installed = await install_grant(first, binding, tokens)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = databases[0].transaction
+
+    @asynccontextmanager
+    async def admission(**options):
+        entered.set()
+        await release.wait()
+        async with original(**options):
+            yield
+
+    monkeypatch.setattr(databases[0], 'transaction', admission)
+    pending = asyncio.create_task(first.begin_refresh(installed))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        claim = await second.begin_refresh(installed)
+        completed = await second.finish_refresh(claim, replace(tokens,
+            access_token='admission-next-access', refresh_token='admission-next-refresh'))
+        release.set()
+        with pytest.raises(OAuthGrantChanged):
+            await pending
+        assert await read_payload(first, binding) == completed
     finally:
         release.set()
         await asyncio.gather(pending, return_exceptions=True)

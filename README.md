@@ -4,6 +4,8 @@ Model Context Protocol (MCP) server management and tool bridging for Kestrel Sov
 
 ## Installation
 
+Requires Python 3.11.5 through 3.14, matching the current secure Core dependencies.
+
 ```bash
 uv pip install kestrel-feature-mcp
 ```
@@ -14,7 +16,7 @@ uv pip install kestrel-feature-mcp
 - `docker>=7.1.0`
 - `mcp>=2.3,<3`
 - `requests>=2.34.2`
-- `anyio>=4.7,<5`
+- `anyio>=4.16,<5`
 - `Authlib>=1.9.4,<2`
 - `pydantic>=2.12,<3`
 - `jsonschema>=4.26,<5`
@@ -549,7 +551,7 @@ An unfinished close retains its original owner and is retried before re-enable.
 Version 0.8.0 introduced the native components described below; 0.9.0 added
 completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
-Version 0.17 requires Core 0.64.6 or newer and SDK 0.52.1 or newer for native
+Version 0.18 requires Core 0.66.4 or newer and SDK 0.52.1 or newer for native
 Apps, OAuth and durable tool outcome contracts. The test profile uses the same
 minimums. `uv sync --locked --extra test` resolves the host and the feature's
 runtime dependencies from the public package index.
