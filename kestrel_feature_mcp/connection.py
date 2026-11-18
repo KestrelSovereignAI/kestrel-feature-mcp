@@ -16,7 +16,7 @@ from functools import partial
 
 import httpx2
 from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from mcp.shared.exceptions import MCPError
 from mcp.client import InputRequiredRoundsExceededError
 from mcp import Client, types
@@ -30,6 +30,11 @@ from .http_limits import MCPResponseBudget, MCPResponseLimitError, identity_acce
 from .tool_contract import MCPToolContractError, validate_tool_contract
 from ._lifecycle import run_cleanup_steps
 from .input_requests import MCPInputResume, MCPInputSuspension
+from .tasks_protocol import (
+    EXTENSION_ID as TASKS_EXTENSION_ID, PROTOCOL_VERSIONS as TASKS_PROTOCOL_VERSIONS,
+    CancelTaskRequest, DetailedTaskResult, GetTaskRequest, TaskAcknowledgement,
+    UpdateTaskRequest,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +55,14 @@ class _RequestProgress:
 
 class MCPCallOutcomeUnknownError(ResourceOutcomeUnknown):
     """A call returned no valid result; its external effects are unconfirmed."""
+
+
+def _task_request_snapshot(request: GetTaskRequest | UpdateTaskRequest | CancelTaskRequest):
+    """Validate and detach a closed native request before credential admission."""
+    if type(request) not in (GetTaskRequest, UpdateTaskRequest, CancelTaskRequest):
+        raise TypeError('A native Tasks get, update or cancel request is required')
+    return type(request).model_validate(request.model_dump(mode='python', by_alias=True,
+        exclude_none=True), by_alias=True, by_name=False)
 
 
 def _rejected_before_execution(error: BaseException) -> bool:
@@ -135,12 +148,29 @@ class BoundMCPCaller:
         self.require_current()
 
     async def __call__(self, tool_name: str, arguments: dict | None = None, *, require_authority=None,
-                       input_handler=None, resume: MCPInputResume | None = None):
+                       input_handler=None, resume: MCPInputResume | None = None, allow_claimed: bool = False):
+        if allow_claimed is True and not callable(require_authority):
+            raise ResourceUnsupported('MCP Task claims require current host authority')
         await self._admitted()
         if self.tool_names is not None and tool_name not in self.tool_names:
             raise ValueError(f"Unknown tool: {tool_name}. Available: {sorted(self.tool_names)}")
         return await self.connection.call_tool(tool_name, arguments or {},
-            round_check=partial(self._require_round, require_authority), input_handler=input_handler, resume=resume)
+            round_check=partial(self._require_round, require_authority), input_handler=input_handler,
+            resume=resume, allow_claimed=allow_claimed)
+
+    async def request_task(self, request: GetTaskRequest | UpdateTaskRequest | CancelTaskRequest, *, require_authority):
+        """One native Task verb on the original connection, under fresh authority.
+
+        The host owns durable pre-wire mutation custody and permission. This
+        transport binding and a task ID are not substitutes for either one.
+        """
+        if not callable(require_authority):
+            raise TypeError('MCP Task operations require current host authority')
+        request = _task_request_snapshot(request)
+        self._require_round(require_authority)
+        await self._admitted()
+        return await self.connection.request_task(request, incarnation=self.incarnation,
+            round_check=partial(self._require_round, require_authority))
 
     async def read_resource(self, uri: str, *, require_authority=None,
                             input_handler=None, resume: MCPInputResume | None = None):
@@ -248,6 +278,7 @@ class MCPConnection:
         self._headers = dict(request_headers)
         self._auth = auth
         self._extensions = tuple(extensions or ())
+        self._task_extension_registered = False
         if elicitation_callback is not None and not callable(elicitation_callback):
             raise TypeError('MCP elicitation callback must be callable')
         self._elicitation_callback = elicitation_callback
@@ -278,6 +309,12 @@ class MCPConnection:
     def protocol_version(self) -> str | None:
         """The published revision selected by the SDK's standard negotiation."""
         return self._client.protocol_version if self.is_connected else None
+
+    @property
+    def supports_task_claims(self) -> bool:
+        """Diagnose the adopted native capability; this grants no authority."""
+        return (self.is_connected and self._has_tasks_extension()
+            and self.protocol_version in TASKS_PROTOCOL_VERSIONS)
 
     @property
     def incarnation(self) -> object | None:
@@ -322,6 +359,10 @@ class MCPConnection:
                 ))
                 transport = streamable_http_client(self.url, http_client=http_client,
                     max_sse_event_size=self._response_budget.max_bytes)
+                # Client consumes declarative extension descriptors synchronously
+                # at construction. Later metadata changes cannot revoke its ad.
+                tasks_registered = any(extension.identifier == TASKS_EXTENSION_ID
+                    for extension in self._extensions)
                 client = await resources.enter_async_context(Client(
                     transport,
                     cache=None,
@@ -331,12 +372,14 @@ class MCPConnection:
                     # Operator inputs require a separate governed surface.
                     input_required_max_rounds=0,
                 ))
+                self._task_extension_registered = tasks_registered
                 self._client = client
                 if self._ready is not None and not self._ready.done():
                     self._ready.set_result(client)
                 await asyncio.Future()
         finally:
             self._client = None
+            self._task_extension_registered = False
 
     async def _close_failed_startup(self, exc_type, exc_value, traceback):
         if exc_type is not None and issubclass(exc_type, (TimeoutError, asyncio.CancelledError)):
@@ -477,9 +520,63 @@ class MCPConnection:
         self.require_incarnation(incarnation)
         return result
 
-    async def call_tool(self, name: str, arguments: dict | None = None, *, round_check=None,
-                        input_handler=None, resume: MCPInputResume | None = None):
+    def _has_tasks_extension(self):
+        return self._task_extension_registered
+
+    def _require_tasks(self, *, server_capability=True):
         client = self._require_client()
+        capabilities = client.session.server_capabilities
+        if (not self.supports_task_claims
+                or (server_capability and (capabilities is None
+                    or TASKS_EXTENSION_ID not in (capabilities.extensions or {})))):
+            raise ResourceUnsupported('MCP Tasks require the native negotiated extension')
+        return client
+
+    async def request_task(self, request: GetTaskRequest | UpdateTaskRequest | CancelTaskRequest, *, incarnation, round_check):
+        """One typed SDK request; no polling, continuation, refresh or resend."""
+        if not callable(round_check):
+            raise TypeError('MCP Task operations require current host authority')
+        request = _task_request_snapshot(request)
+        self.require_incarnation(incarnation)
+        client = self._require_tasks()
+        round_check()
+        self.require_incarnation(incarnation)
+        mutation = type(request) is not GetTaskRequest
+        result_type = TaskAcknowledgement if mutation else TypeAdapter(DetailedTaskResult)
+        try:
+            async with asyncio.timeout(self._call_timeout):
+                result = await client.session.send_request(request, result_type)
+                self.require_incarnation(incarnation)
+                round_check()
+                self.require_incarnation(incarnation)
+                return result
+        except (ExceptionGroup, *MCP_REQUEST_ERRORS) as error:
+            self._retire_changed_contract(error)
+            if isinstance(error, ExceptionGroup):
+                _, unexpected = error.split(MCP_REQUEST_ERRORS)
+                if unexpected is not None:
+                    raise
+            if not mutation or _rejected_before_execution(error):
+                raise
+            raise MCPCallOutcomeUnknownError(
+                'MCP Task mutation returned no confirmed acknowledgement; do not replay'
+            ) from error
+
+    async def call_tool(self, name: str, arguments: dict | None = None, *, round_check=None,
+                        input_handler=None, resume: MCPInputResume | None = None, allow_claimed: bool = False):
+        client = self._require_client()
+        if type(allow_claimed) is not bool:
+            raise TypeError('Native claimed-result handling must be explicit')
+        if allow_claimed:
+            # Declaring a client capability still permits an ordinary result
+            # from a server which does not implement the extension.
+            self._require_tasks(server_capability=False)
+            if not callable(round_check):
+                raise ResourceUnsupported('MCP Task claims require current host authority')
+        elif self.supports_task_claims:
+            # The SDK stamps registered extensions on every eligible request.
+            # Refuse before wire if this caller cannot retain a native claim.
+            raise ResourceUnsupported('MCP Tasks-capable calls require explicit native claim handling')
         incarnation = self.incarnation
         arguments = deepcopy(arguments or {})
         progress = _RequestProgress()
@@ -487,7 +584,8 @@ class MCPConnection:
             # The public one-round API retains native headers and output
             # validation, without the high-level schema-refresh resend.
             return await client.session.call_tool(name, arguments,
-                request_state=state, input_responses=responses, allow_input_required=True)
+                request_state=state, input_responses=responses, allow_input_required=True,
+                allow_claimed=allow_claimed)
         # ClientSession.validate_tool_result documents plain RuntimeError for
         # output-schema failures after execution. Preserve uncertainty rather
         # than treating an unreadable result as proof the tool did not run.
