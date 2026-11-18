@@ -1,4 +1,4 @@
-"""Classify native MRTR inputs without invoking callbacks or granting authority."""
+"""Classify native MRTR and Task inputs without invoking callbacks or granting authority."""
 
 from dataclasses import dataclass, field
 import json
@@ -7,6 +7,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from mcp import types
 from pydantic import TypeAdapter
+from pydantic_core import to_jsonable_python
 from referencing import Registry
 from referencing.exceptions import Unresolvable
 
@@ -21,35 +22,31 @@ class InputDecision:
 
 @dataclass(frozen=True)
 class MCPInputPlan:
-    """A sealed native checkpoint; every returned SDK object is an independent copy.
+    """Sealed native input requests; returned SDK objects are independent copies.
 
     This plan supplies neither execution authority nor an acknowledged audit.
     The host must persist/audit its decisions before sending any responses.
     Roots and sampling remain unsupported and never become human prompts.
     """
 
-    _checkpoint: str = field(repr=False)
+    _requests: bytes = field(repr=False)
     _form_ids: tuple[str, ...] = field(repr=False)
     _url_ids: tuple[str, ...] = field(repr=False)
     _unsupported_ids: tuple[str, ...] = field(repr=False)
     allow_blocking: bool
 
     @property
-    def checkpoint(self) -> types.InputRequiredResult:
-        return types.InputRequiredResult.model_validate_json(self._checkpoint)
-
-    @property
-    def request_state(self) -> str | None:
-        return self.checkpoint.request_state
+    def input_requests(self) -> types.InputRequests:
+        return TypeAdapter(types.InputRequests).validate_json(self._requests)
 
     @property
     def operator_requests(self) -> dict[str, types.ElicitRequest]:
-        requests = self.checkpoint.input_requests
+        requests = self.input_requests
         return {key: requests[key] for key in self._form_ids} if self.allow_blocking else {}
 
     @property
     def unsupported_requests(self) -> dict[str, types.InputRequest]:
-        requests = self.checkpoint.input_requests
+        requests = self.input_requests
         return {key: requests[key] for key in self._unsupported_ids}
 
     @property
@@ -64,14 +61,24 @@ class MCPInputPlan:
         return {decision.request_id: types.ElicitResult(action='decline') for decision in self.decisions}
 
 
-def plan_mcp_inputs(result: types.InputRequiredResult, *, allow_blocking: bool) -> MCPInputPlan:
+def plan_mcp_inputs(requests: types.InputRequests, *, allow_blocking: bool) -> MCPInputPlan:
     """Keep machine declines distinct from modern form input requiring a host."""
-    if not isinstance(result, types.InputRequiredResult):
-        raise TypeError('MCP input planning requires a native InputRequiredResult')
+    if type(requests) is not dict:
+        raise TypeError('MCP input planning requires a native input request map')
     if not isinstance(allow_blocking, bool):
         raise TypeError('MCP operator interaction requires an explicit boolean policy')
+    adapter = TypeAdapter(types.InputRequests)
+    try:
+        # JSON mode would silently turn non-finite schema values into null.
+        plain = adapter.dump_python(adapter.validate_python(requests), mode='python',
+            by_alias=True, exclude_none=True, warnings='error')
+        plain = to_jsonable_python(plain, inf_nan_mode='constants')
+        sealed = json.dumps(plain, allow_nan=False).encode()
+        native = adapter.validate_json(sealed)
+    except ValueError:
+        raise ValueError('Invalid native MCP input request map') from None
     forms, urls, unsupported = [], [], []
-    for key, request in result.input_requests.items():
+    for key, request in native.items():
         if isinstance(request, types.ElicitRequest):
             if isinstance(request.params, types.ElicitRequestFormParams):
                 forms.append(key)
@@ -81,7 +88,7 @@ def plan_mcp_inputs(result: types.InputRequiredResult, *, allow_blocking: bool) 
                 raise TypeError('Unsupported native MCP elicitation request mode')
         else:
             unsupported.append(key)
-    return MCPInputPlan(result.model_dump_json(by_alias=True, exclude_none=True),
+    return MCPInputPlan(sealed,
         tuple(forms), tuple(urls), tuple(unsupported), allow_blocking)
 
 

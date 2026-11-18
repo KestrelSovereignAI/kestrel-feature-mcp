@@ -10,6 +10,8 @@ from mcp.client.extension import UnexpectedClaimedResult
 from mcp.server.extension import Extension, MethodBinding
 from pydantic import TypeAdapter
 
+from kestrel_feature_mcp.input_requests import plan_mcp_inputs, validate_form_responses
+
 from kestrel_feature_mcp.tasks_protocol import (
     CancelTaskRequest, CreateTaskResult, DetailedTaskResult, GetTaskRequest,
     TaskAcknowledgement, TaskIdParams, TasksExtension, UpdateTaskParams,
@@ -132,9 +134,17 @@ async def test_sdk_claim_and_current_task_verbs_cross_real_http_without_tool_rep
             state = await session.send_request(GetTaskRequest(
                 params=TaskIdParams(task_id=created.task_id)), TypeAdapter(DetailedTaskResult))
             assert state.input_requests["form"].method == "elicitation/create"
+            plan = plan_mcp_inputs(state.input_requests, allow_blocking=True)
+            assert peer.calls.count("update") == 0
+            with pytest.raises(ValueError, match="original schema"):
+                validate_form_responses(plan, {"form": {"action": "accept", "content": {"label": 42}}})
+            assert peer.calls.count("update") == 0
+            answers = validate_form_responses(plan, {"form": {"action": "accept", "content": {"label": "native input"}}})
             update = UpdateTaskRequest(params=UpdateTaskParams(
-                task_id=created.task_id, input_responses={"form": types.ElicitResult(
-                    action="accept", content={"label": "native input"})}))
+                task_id=created.task_id, input_responses={**answers, **plan.declines}))
+            wire = update.model_dump(mode="json", by_alias=True, exclude_none=True)
+            assert set(wire["params"]) == {"taskId", "inputResponses"}
+            assert wire["params"]["inputResponses"]["form"] == {"action": "accept", "content": {"label": "native input"}}
             official_tasks_schema("UpdateTaskRequest", {"jsonrpc": "2.0", "id": 1,
                 **update.model_dump(mode="json", by_alias=True, exclude_none=True)})
             ack = await session.send_request(update, TaskAcknowledgement)
