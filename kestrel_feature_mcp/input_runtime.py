@@ -6,7 +6,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
 import hashlib
-import json
 from uuid import uuid4
 from weakref import WeakKeyDictionary, WeakValueDictionary
 
@@ -21,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .apps_execution import MCPAppInputRequired
 from .connection import BoundMCPCaller
 from .input_requests import MCPInputResume, MCPInputSuspension, plan_mcp_inputs, validate_form_responses
+from .tool_contract import capture_tool_contract
 
 
 class InputSettings(BaseModel):
@@ -67,11 +67,8 @@ class MCPInputRuntime:
         if not isinstance(caller, BoundMCPCaller):
             raise TypeError('MCP input requires a native bound connection')
         caller.require_current()
-        value = {'connection': caller.name, 'url': caller.connection.url,
-            'protocol': caller.connection.protocol_version,
-            'tool': tool.native_tool.model_dump(mode='json', by_alias=True, exclude_none=True)}
-        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
-            allow_nan=False).encode()).hexdigest()
+        return capture_tool_contract(tool.native_tool, connection_name=caller.name,
+            url=caller.connection.url, protocol=caller.connection.protocol_version).digest
 
     def _lookup(self, record):
         for batch in self._registrations.values():
