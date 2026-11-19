@@ -165,8 +165,8 @@ async def test_every_frozen_binding_field_isolated(owners, binding, tokens, fiel
             (other.principal_id, other.identifier, store._binding_json(other)))
     else:
         await databases[0].execute('INSERT INTO mcp_oauth_credential_slots '
-            '(agent_did, principal_id, slot_id, binding_id, binding, revision, state, ciphertext) '
-            'SELECT agent_did, ?, ?, ?, ?, revision, state, ciphertext FROM mcp_oauth_credential_slots',
+            '(agent_did, principal_id, slot_id, binding_id, binding, revision, state, ciphertext, generation) '
+            'SELECT agent_did, ?, ?, ?, ?, revision, state, ciphertext, generation FROM mcp_oauth_credential_slots',
             (other.principal_id, other.slot_id, other.identifier, store._binding_json(other)))
     with pytest.raises(DecryptionError):
         await read_payload(store, other)
@@ -418,7 +418,7 @@ async def test_custody_state_and_revision_authenticated(owners, binding, tokens,
         await databases[0].execute('UPDATE mcp_oauth_credential_slots SET state = ?, claim_hash = ?',
                                   (value, hashlib.sha256(secret.encode()).hexdigest()))
         with pytest.raises(DecryptionError):
-            await store.finish_refresh(OAuthRefreshClaim(binding, snapshot.revision, secret, tokens), tokens)
+            await store.finish_refresh(OAuthRefreshClaim(binding, snapshot.revision, secret, tokens, snapshot.generation), tokens)
     else:
         await databases[0].execute('UPDATE mcp_oauth_credential_slots SET revision = ?', (value,))
         with pytest.raises(DecryptionError):

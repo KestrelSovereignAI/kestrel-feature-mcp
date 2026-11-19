@@ -44,6 +44,17 @@ def _text(value):
         raise OAuthGrantRejected("OAuth grant fields require nonempty control-free strings")
 
 
+def _generation(value):
+    if type(value) is not str or len(value) != 64 or any(c not in '0123456789abcdef' for c in value):
+        raise OAuthGrantRejected('OAuth authorization generation is invalid')
+
+
+def _same_revision(actual, expected, state):
+    return (actual is not None and actual.binding == expected.binding
+            and actual.revision == expected.revision and actual.state == state
+            and actual.generation == expected.generation)
+
+
 def _scopes(value):
     if (not isinstance(value, frozenset) or not value
             or any(not isinstance(s, str) or not s or any(
@@ -134,6 +145,16 @@ class OAuthGrantSnapshot:
     state: str
     tokens: OAuthGrantTokens | None = field(default=None, repr=False)
     reason: str | None = None
+    generation: str | None = None
+
+    @property
+    def authorization_identity(self):
+        """Attribution only; every token use still requires AEAD and live authority."""
+        if self.generation is None:
+            return None
+        _generation(self.generation)
+        return hashlib.sha256(_json(['kestrel-mcp-oauth-authorization-v1',
+            self.binding.slot_id, self.binding.identifier, self.generation])).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -143,6 +164,7 @@ class OAuthAuthorizationClaim:
     revision: str
     state: str
     secret: str = field(repr=False)
+    generation: str
 
 
 @dataclass(frozen=True)
@@ -152,6 +174,7 @@ class OAuthRefreshClaim:
     revision: str
     secret: str = field(repr=False)
     tokens: OAuthGrantTokens = field(repr=False)
+    generation: str
 
     @property
     def state(self):
@@ -196,7 +219,7 @@ async def initialize_grant_schema(database):
         await database.execute('''CREATE TABLE IF NOT EXISTS mcp_oauth_credential_slots (
             agent_did TEXT NOT NULL, principal_id TEXT NOT NULL, slot_id TEXT NOT NULL,
             binding_id TEXT NOT NULL, binding TEXT NOT NULL,
-            revision TEXT NOT NULL, state TEXT NOT NULL,
+            revision TEXT NOT NULL, state TEXT NOT NULL, generation TEXT,
             ciphertext TEXT, claim_hash TEXT, reason TEXT,
             PRIMARY KEY (agent_did, slot_id),
             CHECK (state IN ('authorizing', 'exchanging', 'active', 'refreshing', 'revoked')),
@@ -207,6 +230,24 @@ async def initialize_grant_schema(database):
             CHECK ((state = 'revoked' AND reason IS NOT NULL AND reason IN ('local', 'abandoned', 'exchange_rejected', 'refresh_rejected'))
                 OR (state != 'revoked' AND reason IS NULL))
         )''')
+        await database.execute('''CREATE TABLE IF NOT EXISTS mcp_oauth_store_schema (
+            component TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK (revision > 0))''')
+        versions = await database.fetch_all('SELECT component, revision FROM mcp_oauth_store_schema')
+        if versions not in ([], [('credentials', 3)]):
+            raise OAuthGrantRejected('OAuth credential schema revision is not supported')
+        if database.backend_type == 'sqlite':
+            column = await database.fetch_one(
+                "SELECT 1 FROM pragma_table_info('mcp_oauth_credential_slots') WHERE name='generation'")
+        else:
+            column = await database.fetch_one("SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='mcp_oauth_credential_slots' "
+                "AND column_name='generation'")
+        if column is None:
+            if versions:
+                raise OAuthGrantRejected('OAuth credential generation schema is incomplete')
+            await database.execute('ALTER TABLE mcp_oauth_credential_slots ADD COLUMN generation TEXT')
+        await database.execute("INSERT INTO mcp_oauth_store_schema (component, revision) "
+            "VALUES ('credentials', 3) ON CONFLICT (component) DO NOTHING")
         await database.execute('CREATE INDEX IF NOT EXISTS idx_mcp_oauth_principal '
             'ON mcp_oauth_credential_slots (agent_did, principal_id, slot_id)')
 
@@ -242,15 +283,16 @@ class OAuthGrantStore:
     def _binding_json(binding):
         return binding.canonical_json().decode()
 
-    def _aad(self, binding, revision, state, claim_hash):
-        return _json(['kestrel-mcp-oauth-credential-v2', self._binding(binding),
-                      binding.identifier, revision, state, claim_hash])
+    def _aad(self, binding, revision, state, claim_hash, generation):
+        _generation(generation)
+        return _json(['kestrel-mcp-oauth-credential-v3', self._binding(binding),
+                      binding.identifier, generation, revision, state, claim_hash])
 
     def _cipher(self):
         # Deliberately lazy: restore/status and revocation need no key access.
         return AEADCipher(get_agent_key(self.agent_did, 'service-keys'))
 
-    def _encode(self, binding, revision, state, tokens, claim_hash):
+    def _encode(self, binding, revision, state, tokens, claim_hash, generation):
         _record(tokens, OAuthGrantTokens)
         if not tokens.scopes <= binding.scopes:
             raise OAuthGrantRejected('OAuth token exceeded approved scopes')
@@ -259,17 +301,31 @@ class OAuthGrantStore:
         raw = _json(payload)
         if len(raw) > self._max_token_bytes:
             raise OAuthGrantRejected('OAuth token exceeded its storage budget')
-        return self._cipher().encrypt(raw, aad=self._aad(binding, revision, state, claim_hash)).decode('ascii')
+        return self._cipher().encrypt(raw, aad=self._aad(binding, revision, state, claim_hash, generation)).decode('ascii')
+
+    def _decode_tokens(self, binding, ciphertext, *, aad):
+        if (type(ciphertext) is not str
+                or len(ciphertext) > 6 + 4 * ((self._max_token_bytes + 29 + 2) // 3)):
+            raise OAuthGrantRejected('OAuth stored token exceeded its storage budget')
+        raw = self._cipher().decrypt(ciphertext.encode('ascii'), aad=aad)
+        payload = json.loads(raw)
+        tokens = OAuthGrantTokens(payload['access_token'], payload['refresh_token'],
+                                  payload['expires_at'], frozenset(payload['scopes']))
+        if not tokens.scopes <= binding.scopes:
+            raise OAuthGrantRejected('OAuth stored token exceeded approved scopes')
+        return tokens
 
     async def _read_slot(self, slot_id, *, secret=None, decrypt=False):
         self._require_top_level()
         payload_column = 'ciphertext' if decrypt else 'NULL'
-        row = await self._db.fetch_one('SELECT principal_id, binding_id, binding, revision, state, claim_hash, reason, '
+        row = await self._db.fetch_one('SELECT principal_id, binding_id, binding, revision, state, generation, claim_hash, reason, '
             'LENGTH(ciphertext), ' + payload_column + ' FROM mcp_oauth_credential_slots '
             'WHERE agent_did = ? AND slot_id = ?', (self.agent_did, slot_id))
         if row is None:
             return None
-        principal_id, binding_id, encoded, revision, state, claim_hash, reason, size, ciphertext = row
+        principal_id, binding_id, encoded, revision, state, generation, claim_hash, reason, size, ciphertext = row
+        if generation is not None:
+            _generation(generation)
         if not isinstance(encoded, str) or len(encoded) > 65_536:
             raise OAuthGrantRejected('OAuth binding metadata is invalid')
         try:
@@ -301,17 +357,13 @@ class OAuthGrantStore:
             raise OAuthGrantChanged('OAuth original claim is no longer current')
         tokens = None
         if decrypt and state in {'active', 'refreshing'}:
+            if generation is None:
+                raise OAuthGrantRejected('Legacy OAuth credentials require foreground generation admission')
             if state == 'refreshing' and secret is None:
                 raise OAuthGrantRejected('OAuth refreshing credentials require their original claim')
-            if size > 6 + 4 * ((self._max_token_bytes + 29 + 2) // 3):
-                raise OAuthGrantRejected('OAuth stored token exceeded its storage budget')
-            raw = self._cipher().decrypt(ciphertext.encode('ascii'), aad=self._aad(binding, revision, state, claim_hash))
-            payload = json.loads(raw)
-            tokens = OAuthGrantTokens(payload['access_token'], payload['refresh_token'],
-                                      payload['expires_at'], frozenset(payload['scopes']))
-            if not tokens.scopes <= binding.scopes:
-                raise OAuthGrantRejected('OAuth stored token exceeded approved scopes')
-        return OAuthGrantSnapshot(binding, revision, state, tokens, reason)
+            tokens = self._decode_tokens(binding, ciphertext,
+                aad=self._aad(binding, revision, state, claim_hash, generation))
+        return OAuthGrantSnapshot(binding, revision, state, tokens, reason, generation)
 
     async def read_slot(self, principal_id, connection_id):
         """Read canonical non-secret metadata, never credential payloads."""
@@ -341,11 +393,44 @@ class OAuthGrantStore:
         if snapshot.state != 'active':
             raise OAuthGrantRejected('OAuth credentials require an active snapshot')
         current = await self.read(snapshot.binding)
-        if current is None or current.revision != snapshot.revision or current.state != 'active':
+        if not _same_revision(current, snapshot, 'active'):
             raise OAuthGrantChanged('OAuth active credential revision changed')
         actual = await self._read_slot(self._binding(snapshot.binding), decrypt=True)
-        if actual is None or actual.binding != snapshot.binding or actual.revision != snapshot.revision or actual.state != 'active':
+        if not _same_revision(actual, snapshot, 'active'):
             raise OAuthGrantChanged('OAuth active credential revision changed')
+        return actual
+
+    async def admit_legacy(self, snapshot, check):
+        """Explicit foreground-only v2 admission under the caller's live Core lease.
+
+        Ordinary token reads never try v2. Only an exact active legacy row can
+        be opened here; stranded acquisition/refresh phases are never resumed.
+        The nullable-generation CAS makes competing admissions single-winner.
+        """
+        self._require_top_level()
+        _record(snapshot, OAuthGrantSnapshot)
+        if snapshot.state != 'active' or snapshot.generation is not None:
+            raise OAuthGrantRejected('Generation admission requires an active legacy grant')
+        if not callable(check):
+            raise TypeError('Legacy OAuth admission requires its original live authority checker')
+        check()
+        current = await self.read(snapshot.binding)
+        check()
+        if not _same_revision(current, snapshot, 'active'):
+            raise OAuthGrantChanged('Legacy OAuth grant changed before foreground admission')
+        row = await self._db.fetch_one('SELECT ciphertext FROM mcp_oauth_credential_slots '
+            "WHERE agent_did=? AND slot_id=? AND binding_id=? AND revision=? AND state='active' AND generation IS NULL",
+            (self.agent_did, self._binding(snapshot.binding), snapshot.binding.identifier, snapshot.revision))
+        check()
+        if row is None:
+            raise OAuthGrantChanged('Legacy OAuth grant changed before foreground admission')
+        tokens = self._decode_tokens(snapshot.binding, row[0], aad=_json([
+            'kestrel-mcp-oauth-credential-v2', self._binding(snapshot.binding),
+            snapshot.binding.identifier, snapshot.revision, 'active', None]))
+        check()
+        actual = await self._replace(snapshot.binding, tokens, 'active', current,
+                                     new_generation=secrets.token_hex(32))
+        check()
         return actual
 
     def _expected(self, expected, binding):
@@ -353,6 +438,10 @@ class OAuthGrantStore:
             raise OAuthGrantRejected('OAuth grant record type is invalid')
         if self._binding(expected.binding) != self._binding(binding):
             raise OAuthGrantRejected('OAuth replacement changed its credential slot')
+        if expected.generation is not None:
+            _generation(expected.generation)
+        elif type(expected) is not OAuthGrantSnapshot:
+            raise OAuthGrantRejected('OAuth claims require their original authorization generation')
 
     @staticmethod
     def _secret(claim):
@@ -360,35 +449,46 @@ class OAuthGrantStore:
             raise OAuthGrantRejected('OAuth operation requires its original claim secret')
         return claim.secret
 
-    async def _replace(self, binding, tokens, state, expected, *, claim_secret=None, expected_secret=None, reason=None):
+    async def _replace(self, binding, tokens, state, expected, *, claim_secret=None, expected_secret=None,
+                       reason=None, new_generation=None):
         self._require_top_level()
         slot_id, revision = self._binding(binding), uuid.uuid4().hex
         if expected is not None:
             self._expected(expected, binding)
+        generation = new_generation if new_generation is not None else expected.generation if expected is not None else None
+        if generation is not None:
+            _generation(generation)
         claim_hash = hashlib.sha256(claim_secret.encode()).hexdigest() if claim_secret is not None else None
-        ciphertext = self._encode(binding, revision, state, tokens, claim_hash) if state in {'active', 'refreshing'} else None
-        fields = (binding.principal_id, binding.identifier, self._binding_json(binding), revision, state, ciphertext, claim_hash, reason)
+        ciphertext = self._encode(binding, revision, state, tokens, claim_hash, generation) if state in {'active', 'refreshing'} else None
+        fields = (binding.principal_id, binding.identifier, self._binding_json(binding), revision, state, ciphertext, claim_hash, reason, generation)
         async with self._db.transaction():
             if expected is None:
                 affected = await self._db.execute('''INSERT INTO mcp_oauth_credential_slots
-                    (principal_id, binding_id, binding, revision, state, ciphertext, claim_hash, reason, agent_did, slot_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (agent_did, slot_id) DO NOTHING''',
+                    (principal_id, binding_id, binding, revision, state, ciphertext, claim_hash, reason, generation, agent_did, slot_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (agent_did, slot_id) DO NOTHING''',
                     fields + (self.agent_did, slot_id))
             else:
                 predicate = '' if expected_secret is None else ' AND claim_hash = ?'
                 parameters = fields + (self.agent_did, slot_id, expected.binding.identifier, expected.revision, expected.state)
                 if expected_secret is not None:
                     parameters += (hashlib.sha256(expected_secret.encode()).hexdigest(),)
+                if expected.generation is None:
+                    predicate += ' AND generation IS NULL'
+                else:
+                    predicate += ' AND generation = ?'
+                    parameters += (expected.generation,)
                 affected = await self._db.execute('''UPDATE mcp_oauth_credential_slots
-                    SET principal_id = ?, binding_id = ?, binding = ?, revision = ?, state = ?, ciphertext = ?, claim_hash = ?, reason = ?
+                    SET principal_id = ?, binding_id = ?, binding = ?, revision = ?, state = ?, ciphertext = ?, claim_hash = ?, reason = ?, generation = ?
                     WHERE agent_did = ? AND slot_id = ? AND binding_id = ? AND revision = ? AND state = ?''' + predicate, parameters)
         if affected != 1:
             raise OAuthGrantChanged('OAuth grant changed before durable custody committed')
         actual = await self._read_slot(slot_id)
-        if actual is None or actual.binding != binding or actual.revision != revision or actual.state != state:
+        if (actual is None or actual.binding != binding or actual.revision != revision
+                or actual.state != state or actual.generation != generation):
             raise OAuthGrantChanged('OAuth grant changed before durable custody was acknowledged')
         actual = await self._read_slot(slot_id, secret=claim_secret, decrypt=tokens is not None)
-        if actual is None or actual.binding != binding or actual.revision != revision or actual.state != state:
+        if (actual is None or actual.binding != binding or actual.revision != revision
+                or actual.state != state or actual.generation != generation):
             raise OAuthGrantChanged('OAuth grant changed before durable custody was acknowledged')
         return actual
 
@@ -405,16 +505,18 @@ class OAuthGrantStore:
             if expected.state == 'exchanging' and not acknowledge_unknown:
                 raise OAuthGrantRejected('OAuth exchange outcome is unknown; explicit acknowledgment is required')
         secret = secrets.token_urlsafe(32)
-        actual = await self._replace(binding, None, 'authorizing', expected, claim_secret=secret)
-        return OAuthAuthorizationClaim(actual.binding, actual.revision, actual.state, secret)
+        actual = await self._replace(binding, None, 'authorizing', expected, claim_secret=secret,
+                                     new_generation=secrets.token_hex(32))
+        return OAuthAuthorizationClaim(actual.binding, actual.revision, actual.state, secret, actual.generation)
 
     async def _authorization(self, claim, state):
         _record(claim, OAuthAuthorizationClaim)
+        _generation(claim.generation)
         self._secret(claim)
         if claim.state != state:
             raise OAuthGrantRejected('OAuth acquisition requires its original phase claim')
         actual = await self._read_slot(self._binding(claim.binding), secret=claim.secret)
-        if actual is None or actual.binding != claim.binding or actual.revision != claim.revision or actual.state != state:
+        if not _same_revision(actual, claim, state):
             raise OAuthGrantChanged('OAuth acquisition claim is no longer current')
         return actual
 
@@ -422,7 +524,7 @@ class OAuthGrantStore:
         current = await self._authorization(claim, 'authorizing')
         actual = await self._replace(claim.binding, None, 'exchanging', current,
                                      claim_secret=claim.secret, expected_secret=claim.secret)
-        return OAuthAuthorizationClaim(actual.binding, actual.revision, actual.state, claim.secret)
+        return OAuthAuthorizationClaim(actual.binding, actual.revision, actual.state, claim.secret, actual.generation)
 
     async def complete_authorization(self, claim, tokens):
         _record(tokens, OAuthGrantTokens)
@@ -446,13 +548,19 @@ class OAuthGrantStore:
             raise OAuthGrantRejected('OAuth grant has no refresh token')
         secret = secrets.token_urlsafe(32)
         actual = await self._replace(original.binding, original.tokens, 'refreshing', original, claim_secret=secret)
-        return OAuthRefreshClaim(actual.binding, actual.revision, secret, actual.tokens)
+        return OAuthRefreshClaim(actual.binding, actual.revision, secret, actual.tokens, actual.generation)
 
     async def _refresh(self, claim):
         _record(claim, OAuthRefreshClaim)
+        _generation(claim.generation)
         self._secret(claim)
+        # Compare attribution before opening a key, then recheck the payload
+        # snapshot after the await so another owner cannot swap the grant.
+        metadata = await self._read_slot(self._binding(claim.binding), secret=claim.secret)
+        if not _same_revision(metadata, claim, 'refreshing'):
+            raise OAuthGrantChanged('OAuth refresh claim is no longer current')
         actual = await self._read_slot(self._binding(claim.binding), secret=claim.secret, decrypt=True)
-        if actual is None or actual.binding != claim.binding or actual.state != 'refreshing' or actual.revision != claim.revision:
+        if not _same_revision(actual, claim, 'refreshing'):
             raise OAuthGrantChanged('OAuth refresh claim is no longer current')
         return actual
 
