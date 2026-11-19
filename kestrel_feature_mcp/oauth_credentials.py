@@ -38,6 +38,13 @@ class OAuthConnectionCredential:
     def slot_id(self):
         return self.lease.slot_id
 
+    @property
+    def authorization_identity(self):
+        identity = self.snapshot.authorization_identity
+        if identity is None:
+            raise GrantRejected('Legacy OAuth credentials need fresh foreground admission')
+        return identity
+
     def withdraw(self, reason):
         if not self._withdrawn:
             self._withdrawn = True
@@ -64,6 +71,10 @@ class OAuthConnectionCredential:
             self.lease.require_principal()
             admitted = False
             try:
+                if self.snapshot.generation is None:
+                    async with self.lease.credential_operation() as check:
+                        snapshot = await self.store.admit_legacy(self.snapshot, check)
+                        self.snapshot = replace(snapshot, tokens=None)
                 payload = await self._payload(self.lease.require_principal)
                 if force_refresh or payload.is_expired(time.time()):
                     async with self.lease.credential_operation() as check:

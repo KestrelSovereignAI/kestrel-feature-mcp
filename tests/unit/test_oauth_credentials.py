@@ -41,8 +41,9 @@ from kestrel_sdk.security.outbound import assert_safe_url
 from kestrel_feature_mcp.connection import bind_tool_caller
 from kestrel_feature_mcp.feature import MCPAgent
 from kestrel_feature_mcp.oauth_credentials import OAuthConnectionCredential
-from kestrel_feature_mcp.oauth_grants import OAuthGrantBinding, OAuthGrantChanged, OAuthGrantStore, OAuthGrantTokens
+from kestrel_feature_mcp.oauth_grants import OAuthGrantBinding, OAuthGrantChanged, OAuthGrantRejected, OAuthGrantStore, OAuthGrantTokens
 from tests.unit.test_oauth_grants import install_grant
+from tests.unit.test_oauth_generation import install_legacy_active
 from tests.unit.test_oauth_acceptance_http import oauth_peers as oauth_peers
 
 pytestmark = [pytest.mark.parametrize('mcp_http_server', [{'tls': True, 'oauth': {}}], indirect=True),
@@ -111,6 +112,8 @@ async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_ke
                     snapshot = await install_grant(store, binding, OAuthGrantTokens(
                         'native-fixture-access', 'native-fixture-refresh',
                         time.time() + (-100 if request.query_params.get('expired') else 3600), frozenset({'read'})))
+                    if request.query_params.get('legacy'):
+                        snapshot = await install_legacy_active(store, snapshot)
                     lease = host.issue_lease(context, connection_id=binding.connection_id, slot_id=binding.slot_id)
                     credential = OAuthConnectionCredential(store, snapshot, lease,
                         host.client_identity(context), close_seconds=2, withdraw=b.withdrawals.append)
@@ -229,6 +232,34 @@ async def test_expired_grant_refreshes_under_the_original_core_connect_task(cred
     result = await b.client.post('/api/owned-credential-call')
     assert result.status_code == 200 and b.peer.resource.witness == ['owned-effect'], result.text
     assert b.peer.requests.count(('POST', '/token')) == 1
+
+
+async def test_original_foreground_core_lease_admits_legacy_credentials_without_reauthorization(credential_boundary):
+    b = credential_boundary
+    result, = await asyncio.gather(b.client.post('/api/owned-credential-connect?legacy=1'), return_exceptions=True)
+    assert not isinstance(result, BaseException), 'The original foreground credential path must admit legacy grants'
+    assert result.status_code == 200, result.text
+    identity = b.credential.authorization_identity
+    assert len(identity) == 64 and b.credential.snapshot.generation is not None
+    assert b.credential.snapshot.tokens is None
+    assert not b.peer.requests
+    result = await b.client.post('/api/owned-credential-call')
+    assert result.status_code == 200 and b.peer.resource.witness == ['owned-effect'], result.text
+    assert b.credential.authorization_identity == identity and not b.peer.requests
+
+
+async def test_actual_background_lease_cannot_migrate_a_legacy_token_bundle(credential_boundary, monkeypatch):
+    b = credential_boundary
+    assert (await b.client.post('/api/owned-credential-connect')).status_code == 200
+    legacy = await install_legacy_active(b.store, b.credential.snapshot)
+    credential = OAuthConnectionCredential(b.store, legacy, b.credential.lease,
+        b.credential.budgets, close_seconds=2, withdraw=b.withdrawals.append)
+    def forbidden_key():
+        raise AssertionError('A background lease must never decrypt legacy tokens')
+    monkeypatch.setattr(b.store, '_cipher', forbidden_key)
+    with pytest.raises(OAuthGrantRejected, match='foreground'):
+        await credential.dispatch_token('background')
+    assert not b.peer.resource.witness and not b.peer.requests
 
 
 async def test_another_native_database_owner_revocation_blocks_before_dispatch(credential_boundary):

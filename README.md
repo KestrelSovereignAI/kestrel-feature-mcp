@@ -157,6 +157,15 @@ key or decrypt credentials. A saved connection restarts dormant: the same
 principal must explicitly connect it under fresh Core authority. Changing the
 client identity requires new consent before using the old grant.
 
+Each authorization has a random generation that survives token refresh and
+changes with replacement consent. Its hashed identity is attribution, never
+permission to use credentials. The generation is authenticated with the token
+bundle and checked during every credential compare-and-swap. Schema/status
+migration is key-free. An active grant from an older release is resealed only
+during an explicit connection under the original principal's fresh Core lease;
+background reads cannot decrypt it. Old unfinished exchange or refresh claims
+remain uncertain and cannot resume through this migration.
+
 **Refresh credentials** refreshes and reconnects under the current principal.
 Recent resource-rejection labels survive connection cleanup without keeping a
 connection open. These diagnostics last for the current feature runtime;
