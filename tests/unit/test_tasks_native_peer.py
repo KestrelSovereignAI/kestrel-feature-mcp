@@ -38,12 +38,19 @@ class NativeTasksPeer(Extension):
 
     def __init__(self):
         self.calls = []
+        self.tool_requests = []
         self.status = "working"
         self.task_id = "opaque/task:1"
         self.ttl_ms = 60000
         self.before_response = None
         self.require_input = False
         self.reject_code = None
+        self.return_ordinary = False
+        self.return_error = False
+        self.tool_reject_code = None
+        self.input_rounds = 1
+        self.omit_complete_discriminator = False
+        self.last_complete_body = None
 
     def state(self):
         return {"resultType": "complete", "taskId": self.task_id,
@@ -54,16 +61,36 @@ class NativeTasksPeer(Extension):
     async def intercept_tool_call(self, params, ctx, call_next):
         if params.name != "echo":
             return await call_next(ctx)
+        self.tool_requests.append(params.model_dump(mode='json', by_alias=True, exclude_unset=True))
+        if self.tool_reject_code is not None:
+            raise MCPError(self.tool_reject_code, 'Owned native tool request rejected')
         if self.require_input:
             if params.request_state is None:
-                return types.InputRequiredResult(request_state='native-mrtr-state', input_requests={
-                    'form': types.ElicitRequest.model_validate({'method': 'elicitation/create', 'params': {
-                        'mode': 'form', 'message': 'Choose a label', 'requestedSchema': {'type': 'object',
-                            'properties': {'label': {'type': 'string'}}, 'required': ['label']}}})})
-            assert params.request_state == 'native-mrtr-state'
+                return self.form('native-mrtr-state')
+            assert params.request_state in {'native-mrtr-state', 'native-mrtr-state-2'}
             assert params.input_responses['form'].content == {'label': 'native input'}
+            if self.input_rounds == 2 and params.request_state == 'native-mrtr-state':
+                return self.form('native-mrtr-state-2')
         self.calls.append("started")
+        if self.return_ordinary:
+            result = await call_next(ctx)
+            if self.omit_complete_discriminator:
+                assert isinstance(result, types.CallToolResult)
+                native = result.model_dump(mode='json', by_alias=True, exclude_none=True)
+                native.pop('resultType', None)
+                self.last_complete_body = native
+                return native
+            return result
+        if self.return_error:
+            return types.CallToolResult(result_type='complete',
+                content=[types.TextContent(type='text', text='Owned native tool error')], is_error=True)
         return {**self.state(), "resultType": "task"}
+
+    def form(self, state):
+        return types.InputRequiredResult(request_state=state, input_requests={
+            'form': types.ElicitRequest.model_validate({'method': 'elicitation/create', 'params': {
+                'mode': 'form', 'message': 'Choose a label', 'requestedSchema': {'type': 'object',
+                    'properties': {'label': {'type': 'string'}}, 'required': ['label']}}})})
 
     async def respond(self, result):
         return result if self.before_response is None else await self.before_response(result)

@@ -91,6 +91,11 @@ class MCPAppsFeatureMixin:
 
     def _new_mcp_connection(self, *args, **kwargs):
         self._require_open()
+        extensions = list(kwargs.pop('extensions', ()))
+        if self._task_runtime is not None:
+            from .oauth_credentials import GrantBearerAuth
+            if isinstance(kwargs.get('auth'), GrantBearerAuth):
+                extensions.append(self._task_runtime.extension())
         if self._input_settings.enabled:
             self._require_inputs_ready()
             endpoint = args[0] if args else kwargs['url']
@@ -100,8 +105,10 @@ class MCPAppsFeatureMixin:
                 connection_id=identifier)
         if self._apps_settings.enabled:
             self._require_apps_ready()
-            kwargs["extensions"] = [advertise(EXTENSION_ID)]
+            extensions.append(advertise(EXTENSION_ID))
             kwargs["before_close"] = self._apps_publications.retire_connection
+        if extensions:
+            kwargs['extensions'] = extensions
         return MCPConnection(*args, **kwargs)
 
     def _manager_connection_settings(self):

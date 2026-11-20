@@ -12,8 +12,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from inspect import (
-    isasyncgen, isasyncgenfunction, isawaitable, isbuiltin, iscoroutine,
-    iscoroutinefunction, isfunction, isgenerator, isgeneratorfunction, ismethod,
+    isasyncgenfunction, isbuiltin, iscoroutinefunction, isfunction, isgeneratorfunction, ismethod,
 )
 from types import MappingProxyType
 from typing import Callable, Mapping, TYPE_CHECKING
@@ -28,6 +27,7 @@ from kestrel_sdk.tools import (
 from .connection import BoundMCPCaller, _rejected_before_execution
 from .oauth_grants import OAuthGrantChanged
 from .apps_resources import AppResource, read_app_resource
+from ._lifecycle import call_synchronous_callback
 
 if TYPE_CHECKING:
     from .dynamic_tools import MCPToolWrapper
@@ -50,16 +50,6 @@ def require_synchronous_callback(callback, *, label: str, allow_builtin: bool = 
     if (not (isfunction(callback) or ismethod(callback) or (allow_builtin and isbuiltin(callback)))
             or iscoroutinefunction(callback) or isasyncgenfunction(callback) or isgeneratorfunction(callback)):
         raise TypeError(f"MCP Apps {label} requires a synchronous function or method")
-
-
-def call_synchronous_callback(callback, *args, label: str):
-    """Reject deferred work returned by an otherwise ordinary host callback."""
-    value = callback(*args)
-    if isawaitable(value) or isgenerator(value) or isasyncgen(value):
-        if iscoroutine(value) or isgenerator(value):
-            value.close()
-        raise TypeError(f"MCP Apps {label} must complete synchronously")
-    return value
 
 
 class MCPAppResultWithheld(ResourceOutcomeUnknown):

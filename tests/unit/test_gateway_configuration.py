@@ -111,3 +111,46 @@ async def test_empty_docker_config_uses_the_native_home_directory(tmp_path, monk
         assert not (working / "mcp").exists()
     finally:
         await gateway.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_exited", [False, True], ids=["running", "exited"])
+async def test_original_output_pipe_is_closed_after_process_and_drainer_join(already_exited):
+    import asyncio
+    import os
+    import signal
+    import subprocess
+    import sys
+    import threading
+
+    gateway = DockerMCPGateway()
+    code = "import sys,time; sys.stdout.write('owned output\\n'); sys.stdout.flush()"
+    if not already_exited:
+        code += "; time.sleep(60)"
+    process = subprocess.Popen(
+        [sys.executable, "-I", "-c", code], stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, start_new_session=True,
+    )
+    gateway.process = process
+    gateway._startup_queue = asyncio.Queue()
+    drainer = threading.Thread(
+        target=gateway._drain_stdout,
+        args=(process, asyncio.get_running_loop(), gateway._startup_queue),
+        daemon=True,
+    )
+    gateway._stdout_thread = drainer
+    drainer.start()
+    try:
+        if already_exited:
+            await asyncio.to_thread(process.wait, timeout=5)
+        await gateway._stop_process()
+        assert process.poll() is not None and not drainer.is_alive()
+        assert process.stdout.closed, "Retirement acknowledged while its original pipe remained open"
+        assert gateway.process is None and gateway._stdout_thread is None
+        await gateway._stop_process()
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        await asyncio.to_thread(process.wait, timeout=5)
+        await asyncio.to_thread(drainer.join, 5)
+        process.stdout.close()

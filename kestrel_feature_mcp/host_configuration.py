@@ -16,6 +16,7 @@ from .apps_execution import require_owned_call_host
 from .oauth_grants import initialize_grant_schema
 from .oauth_runtime import OAuthRuntime, OAuthSettings
 from .input_runtime import InputSettings, MCPInputRuntime
+from .task_runtime import TaskSettings, MCPTaskRuntime
 
 
 class MCPHostFeatureMixin(MCPAppsFeatureMixin):
@@ -26,6 +27,52 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
         self._host_router = None
         self._input_settings = InputSettings()
         self._input_host = self._input_runtime = None
+        self._task_host = self._task_runtime = self._task_maintenance = None
+
+    async def _start_tasks(self, settings):
+        """Private composition; public Tasks configuration remains unavailable."""
+        settings = TaskSettings.model_validate(settings)
+        self._require_inputs_ready()
+        if self._task_host is not None:
+            raise ResourceConflict('Close the original Task host before replacement')
+        generation = self._lifecycle_generation
+        def current():
+            return (not self._closing and self._lifecycle_generation == generation
+                and self._task_host is host
+                and (self._task_maintenance is None or not self._task_maintenance.done()))
+        host = self.agent.create_mcp_task_host(self, input_host=self._input_host,
+            configuration=settings.host, is_current=current)
+        self._task_host = host
+        try:
+            await host.initialize()
+            self._task_runtime = MCPTaskRuntime(self, host, self._input_runtime)
+            async def maintain():
+                try:
+                    while True:
+                        await asyncio.sleep(settings.maintenance_seconds)
+                        await host.maintain()
+                finally:
+                    host.withdraw()
+            self._task_maintenance = asyncio.create_task(maintain(), context=contextvars.Context(),
+                name='mcp-task-local-custody')
+        except BaseException as error:
+            await run_cleanup_steps([(True, self._close_tasks)], failure=error)
+            raise
+
+    async def _close_tasks(self):
+        host = self._task_host
+        if host is None:
+            return
+        maintenance = self._task_maintenance
+        host.withdraw()
+        if maintenance is not None and not maintenance.done():
+            maintenance.cancel()
+        try:
+            await run_cleanup_steps([(True, lambda: join_maintenance(maintenance, 'MCP Task')),
+                (True, host.close)])
+        finally:
+            if host.retired and (maintenance is None or maintenance.done()):
+                self._task_host = self._task_runtime = self._task_maintenance = None
 
     @property
     def config_schema(self):
@@ -125,6 +172,7 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
             raise
 
     async def _close_inputs(self):
+        await self._close_tasks()
         host = self._input_host
         if host is None:
             return

@@ -3,11 +3,22 @@
 import asyncio
 from collections.abc import Callable
 from contextlib import AsyncExitStack
+from inspect import isasyncgen, isawaitable, iscoroutine, isgenerator
 from anyio.lowlevel import checkpoint_if_cancelled
 
 
 class MCPFeatureClosingError(RuntimeError):
     """A connection start belongs to a feature generation that is closing."""
+
+
+def call_synchronous_callback(callback, *args, label: str):
+    """Reject escaped deferred work at an inline MCP lifecycle boundary."""
+    value = callback(*args)
+    if isawaitable(value) or isgenerator(value) or isasyncgen(value):
+        if iscoroutine(value) or isgenerator(value):
+            value.close()
+        raise TypeError(f"MCP {label} must complete synchronously")
+    return value
 
 
 async def run_cleanup_steps(steps: list[tuple[bool, Callable]], *, failure: BaseException | None = None) -> None:

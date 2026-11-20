@@ -21,6 +21,7 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import Observabili
 from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import FeatureEnablementStore
 from kestrel_sovereign.auth import caller_context_scope
 from kestrel_sovereign.agent.invocation import bind_async_invocation
+from kestrel_sovereign.agent.parts import part_collector
 from kestrel_sovereign.tools.effect_invocation import journal_async_invocation
 from kestrel_sovereign.api_errors import register_api_error_handlers, tool_effect_api_error
 from kestrel_sdk.resources import ResourceOutcomeUnknown
@@ -125,7 +126,9 @@ async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_ke
                     owned.push_async_callback(connection.close)
                     tools = await connection.connect()
                     caller = bind_tool_caller(connection, lambda: connection.is_connected,
-                        binding.connection_id, tool_names=[tool.name for tool in tools], admit=credential.admit)
+                        binding.connection_id, tool_names=[tool.name for tool in tools], admit=credential.admit,
+                        continuation_check=credential.lease.require_principal,
+                        authorization_identity=lambda: credential.authorization_identity)
                     feature._mount_tools('mcp:credential', 'owned_credential',
                         [tool.model_dump(mode='json', by_alias=True) for tool in tools], caller)
                     handle = next(name for name in agent._tool_to_feature
@@ -158,7 +161,8 @@ async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_ke
 
         @app.post('/api/owned-credential-call')
         async def call(request: Request):
-            with service.bind(request) as authentication, caller_context_scope(authentication.caller):
+            with service.bind(request) as authentication, caller_context_scope(authentication.caller), \
+                    part_collector(host=agent, session_id='credential-chat'):
                 try:
                     b.callers.append(authentication.caller)
                     return await governed_dispatch(agent, 'owned-effect', invocation_id=uuid4().hex,

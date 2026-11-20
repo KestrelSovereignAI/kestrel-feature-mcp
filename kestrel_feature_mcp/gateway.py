@@ -678,6 +678,8 @@ class DockerMCPGateway:
                 await asyncio.to_thread(self._stdout_thread.join, HTTP_TIMEOUT_SHORT)
                 if self._stdout_thread.is_alive():
                     raise DockerMCPGatewayError("MCP gateway output owner did not physically retire")
+            if process.stdout is not None:
+                process.stdout.close()
             self._stdout_thread = None
             self._startup_queue = None
             self.process = None

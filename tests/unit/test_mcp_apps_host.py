@@ -135,7 +135,7 @@ async def native_apps_host(request, mcp_http_server, tmp_path, monkeypatch, apps
         @app.post("/api/owned-turn")
         async def initial(request: Request):
             with caller_context_scope(request.state.caller), part_collector(host=agent, session_id="original-chat"):
-                return await source.binding.invoke({"text": "initial-once"}, session_id="original-chat", source="chat", operation_id=uuid4().hex)
+                return await source.binding.invoke({"text": "initial-once"}, session_id="original-chat", source="external", operation_id=uuid4().hex)
 
         client = await owned.enter_async_context(httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app),
             base_url="https://composition.test", headers={"X-API-Key": key}))
