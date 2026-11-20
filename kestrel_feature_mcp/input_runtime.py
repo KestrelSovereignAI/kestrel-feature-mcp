@@ -173,6 +173,18 @@ class MCPInputRuntime:
             'resumable': available, 'forms': {key: request.params.model_dump(mode='json',
                 by_alias=True, exclude_none=True) for key, request in plan.operator_requests.items()}}
 
+    async def _local_retirement(self, context, projected, error):
+        if context.received or self.feature._task_runtime is None:
+            return None
+        current = await self.host.current_record(context.record, retirement_error=error)
+        if (current is None or current.state != 'NON_RESUMABLE' or (context.claim is not None
+                and current.revision != context.claim.record.revision + 1)):
+            return None
+        result = {'request_id': current.request_id, 'state': current.state}
+        if projected is not None:
+            result['tool_result'] = projected
+        return result
+
     async def respond(self, record, responses, *, operation_id):
         registered = self._lookup(record)
         native = types.InputRequiredResult.model_validate(record.payload['native'])
@@ -185,6 +197,7 @@ class MCPInputRuntime:
             raise ResourceConflict('Nested MCP input continuation is unavailable')
         token = self._resuming.set(context)
         app_result = None
+        projected = None
         try:
             view_token = record.payload.get('app_view')
             if view_token is None:
@@ -221,6 +234,15 @@ class MCPInputRuntime:
                 result['app_result'] = app_result
             return result
         except (ResourceError, ValueError, TimeoutError) as error:
+            try:
+                retired = await self._local_retirement(context, projected, error)
+            except Exception as observation:
+                # A failed metadata read is not a known execution outcome.
+                # Preserve both explicit error graphs, including native control.
+                raise ResourceOutcomeUnknown('MCP continuation and local retirement are unconfirmed') from ExceptionGroup(
+                    'Original MCP continuation and failed retirement observation', [error, observation])
+            if retired is not None:
+                return retired
             if context.claim is not None:
                 # Validation ended before the durable claim. Later failures
                 # can follow a completed native effect; never invite resubmit.

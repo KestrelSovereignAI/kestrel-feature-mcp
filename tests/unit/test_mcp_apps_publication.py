@@ -88,7 +88,7 @@ BOB = CallerContext.authenticated("bob")
 async def execute_initial(peer, *, text="once", chat="original-chat", caller=ALICE):
     tool = await allow(peer, "app_mutate")
     with caller_context_scope(caller), part_collector(host=peer.host, session_id=chat):
-        result = await tool.binding.invoke({"text": text}, session_id=chat, source="chat", operation_id=uuid4().hex)
+        result = await tool.binding.invoke({"text": text}, session_id=chat, source="external", operation_id=uuid4().hex)
     return result
 
 
@@ -750,7 +750,7 @@ async def test_non_view_initial_tool_stale_after_construction_is_definite_failur
     tool = await allow(peer, "app_mutate")
     await peer.connection.close()
     with caller_context_scope(ALICE), part_collector(host=peer.host, session_id="original-chat"):
-        result = await tool.binding.invoke({"text": "never-sent"}, session_id="original-chat", source="chat", operation_id=uuid4().hex)
+        result = await tool.binding.invoke({"text": "never-sent"}, session_id="original-chat", source="external", operation_id=uuid4().hex)
     assert result["status"] == "error" and "rediscover" in result["error"]
     assert not mcp_http_server.witness
     rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
@@ -814,7 +814,7 @@ async def test_faulty_source_is_isolated_and_drain_joins_its_required_audit(app_
     tool = next(item for item in isolated if item.tool.native_tool.name == "app_mutate")
     await peer.permissions.set_permission("mcp:isolated", tool.binding.name, PermissionLevel.ALLOW)
     with caller_context_scope(BOB), part_collector(host=peer.host, session_id="isolated-chat"):
-        result = await tool.binding.invoke({"text": "isolated-source"}, session_id="isolated-chat", source="chat", operation_id=uuid4().hex)
+        result = await tool.binding.invoke({"text": "isolated-source"}, session_id="isolated-chat", source="external", operation_id=uuid4().hex)
     reference = next(part for part in result["parts"] if part["type"] == "mcp_app")["data"]["reference"]
     reader_chat[1] = "isolated-chat"
     fault[0] = True
@@ -889,7 +889,7 @@ async def test_unbound_interactive_publisher_retains_no_private_result(app_bound
     registry, _, _ = publications
     tool = await allow(app_boundary, "app_mutate")
     with caller_context_scope(caller), part_collector(host=app_boundary.host, session_id="original-chat"):
-        result = await tool.binding.invoke({"text": "unbound"}, session_id="original-chat", source="chat", operation_id=uuid4().hex)
+        result = await tool.binding.invoke({"text": "unbound"}, session_id="original-chat", source="external", operation_id=uuid4().hex)
     assert not registry._publications and '"mcp_app"' not in json.dumps(result)
     assert mcp_http_server.witness == ["unbound"]
 

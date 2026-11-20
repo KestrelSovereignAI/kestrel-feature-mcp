@@ -506,6 +506,35 @@ integration is still required before enabling the capability.
 `MCPConnection.supports_task_claims` diagnoses the capability adopted by the
 current connection; later extension-object mutations do not change that session.
 
+The private Task runtime now composes with Core's live registered-handler proof
+and joint Input custody. It admits the actual OAuth credential before capturing
+its immutable authorization generation, retains original decided arguments and
+the canonical Tool contract, and reserves custody before a declaring call.
+Native complete results (including `isError`), Task creation claims, and
+original-method Input waits remain distinct. A continuation consumes its linked
+Input and Task issuance in one commit under fresh original tool governance;
+Task custody settles before its preceding Input response. Reopened hosts require
+a fresh eligible binding and permission, never an old execution credential.
+A proven unsent continuation retires both claims in one transaction. The input
+surface reports that local NON_RESUMABLE disposition only from authenticated
+storage; it never fabricates a remote result or clears a post-send uncertainty.
+
+Local maintenance reconciles uncertain reservation acknowledgements and closes
+expired Input waits without polling or issuing remote Task commands. Unknown
+wire outcomes retain custody and cannot trigger automatic replay. Known native
+pre-execution rejections retain their actual error evidence. Owner retention is
+bounded, and completed dispatches release their hold after audit and publication.
+
+This composition is not public configuration: `set_config` still rejects
+`tasks`, and Core does not advertise `supports_mcp_task_host`. Observation,
+wait-provider/actions, pending Apps/final delivery and full native/browser
+acceptance remain required before activation. The published official MCP SDK
+must also preserve native retention semantics; its
+[TTL normalization defect](https://github.com/modelcontextprotocol/python-sdk/issues/3866)
+is not patched locally. Component and wire tests use isolated native Core,
+encrypted fixture grants and real SDK HTTPS peers; they do not claim vendor
+consent or a complete production deployment.
+
 ## Optional MCP Apps host
 
 The optional host composes native AppBridge rendering, Core-authenticated View
@@ -560,10 +589,9 @@ An unfinished close retains its original owner and is retried before re-enable.
 Version 0.8.0 introduced the native components described below; 0.9.0 added
 completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
-Version 0.18 requires Core 0.66.4 or newer and SDK 0.52.1 or newer for native
-Apps, OAuth and durable tool outcome contracts. The test profile uses the same
-minimums. `uv sync --locked --extra test` resolves the host and the feature's
-runtime dependencies from the public package index.
+Version 0.20 uses Core 0.66.7 or newer and SDK 0.52.1 or newer for native
+Apps, OAuth and durable tool outcome contracts. `uv sync --locked --extra test`
+installs the same host profile and runtime dependencies from the public package index.
 Initial publication and result associations are detailed below.
 An unsupported host is refused before connecting or saving enablement.
 The host must declare `supports_durable_tool_effects` as exactly `True`.

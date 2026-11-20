@@ -280,9 +280,9 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
             raise MCPHostCapabilityError("MCP Apps require the original active native Core feature registration")
         wrappers = build_wrappers(handle_prefix, tool_dicts, caller,
             app_executor=publications.executor if publications is not None else None,
-            input_runtime=self._input_runtime)
+            input_runtime=self._input_runtime, task_runtime=self._task_runtime)
         self._unmount_tools(owner)
-        if publications is None and self._input_runtime is None:
+        if publications is None and self._input_runtime is None and self._task_runtime is None:
             return self.agent.register_dynamic_tools(owner, wrappers)
         registered = []
         count = self.agent.register_dynamic_tools(owner, wrappers,
@@ -291,6 +291,8 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
             publications.register(owner, registered, is_current=app_registration_current)
         if self._input_runtime is not None:
             self._input_runtime.register(owner, registered)
+        if self._task_runtime is not None:
+            self._task_runtime.register(owner, registered)
         return count
 
     def _unmount_tools(self, owner: str) -> int:
@@ -299,6 +301,8 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
             self._apps_publications.retire(owner)
         if self._input_runtime is not None:
             self._input_runtime.unregister(owner)
+        if self._task_runtime is not None:
+            self._task_runtime.unregister(owner)
         if not self._host_supports_dynamic_tools():
             return 0
         return self.agent.unregister_dynamic_tools(owner)
@@ -593,6 +597,7 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
                     name,
                     admit=None if credential is None else credential.admit,
                     continuation_check=None if credential is None else credential.lease.require_principal,
+                    authorization_identity=None if credential is None else lambda: credential.authorization_identity,
                 )
                 mounted = self._mount_tools(
                     owner, f"remote_{name[-12:]}", record.tool_descriptions(), caller,

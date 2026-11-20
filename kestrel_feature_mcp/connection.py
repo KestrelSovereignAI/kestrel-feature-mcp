@@ -28,7 +28,7 @@ from .constants import CALL_TOOL_TIMEOUT, SESSION_CONNECT_TIMEOUT_DEFAULT, SESSI
 from .constants import STATE_ONLY_MAX_ROUNDS_DEFAULT, STATE_ONLY_BACKOFF_INITIAL_DEFAULT, STATE_ONLY_BACKOFF_MAX_DEFAULT
 from .http_limits import MCPResponseBudget, MCPResponseLimitError, identity_accept_encoding
 from .tool_contract import MCPToolContractError, validate_tool_contract
-from ._lifecycle import run_cleanup_steps
+from ._lifecycle import call_synchronous_callback, run_cleanup_steps
 from .input_requests import MCPInputResume, MCPInputSuspension
 from .tasks_protocol import (
     EXTENSION_ID as TASKS_EXTENSION_ID, PROTOCOL_VERSIONS as TASKS_PROTOCOL_VERSIONS,
@@ -124,6 +124,7 @@ class BoundMCPCaller:
     tool_names: frozenset[str] | None = None
     _admit: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
     _continuation_check: Callable[[], None] | None = field(default=None, repr=False)
+    _authorization_identity: Callable[[], str] | None = field(default=None, repr=False)
 
     @property
     def is_current(self) -> bool:
@@ -139,6 +140,19 @@ class BoundMCPCaller:
             await self._admit()
             self.require_current()
 
+    async def admit(self):
+        """Admit the actual credential before reading its durable generation."""
+        await self._admitted()
+
+    @property
+    def authorization_identity(self):
+        self.require_current()
+        if self._authorization_identity is None:
+            raise ResourceUnsupported('MCP Tasks require an admitted OAuth authorization generation')
+        identity = self._authorization_identity()
+        self.require_current()
+        return identity
+
     def _require_round(self, require_authority):
         self.require_current()
         if self._continuation_check is not None:
@@ -148,7 +162,8 @@ class BoundMCPCaller:
         self.require_current()
 
     async def __call__(self, tool_name: str, arguments: dict | None = None, *, require_authority=None,
-                       input_handler=None, resume: MCPInputResume | None = None, allow_claimed: bool = False):
+                       input_handler=None, resume: MCPInputResume | None = None, allow_claimed: bool = False,
+                       before_send=None):
         if allow_claimed is True and not callable(require_authority):
             raise ResourceUnsupported('MCP Task claims require current host authority')
         await self._admitted()
@@ -156,7 +171,8 @@ class BoundMCPCaller:
             raise ValueError(f"Unknown tool: {tool_name}. Available: {sorted(self.tool_names)}")
         return await self.connection.call_tool(tool_name, arguments or {},
             round_check=partial(self._require_round, require_authority), input_handler=input_handler,
-            resume=resume, allow_claimed=allow_claimed)
+            resume=resume, allow_claimed=allow_claimed,
+            **({} if before_send is None else {'before_send': before_send}))
 
     async def request_task(self, request: GetTaskRequest | UpdateTaskRequest | CancelTaskRequest, *, require_authority):
         """One native Task verb on the original connection, under fresh authority.
@@ -182,7 +198,7 @@ class BoundMCPCaller:
 
 
 def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, tool_names=None,
-                     admit=None, continuation_check=None):
+                     admit=None, continuation_check=None, authorization_identity=None):
     """Bind the advertised connection, never a later replacement's transport."""
     incarnation = connection.incarnation
     if incarnation is None:
@@ -193,6 +209,7 @@ def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, t
         tool_names=frozenset(tool_names) if tool_names is not None else None,
         _admit=admit,
         _continuation_check=continuation_check,
+        _authorization_identity=authorization_identity,
     )
 
 
@@ -445,7 +462,7 @@ class MCPConnection:
         return await asyncio.wait_for(collect(), timeout=self._call_timeout)
 
     async def _complete(self, invoke, *, incarnation, round_check, progress,
-                        input_handler=None, resume: MCPInputResume | None = None):
+                        input_handler=None, resume: MCPInputResume | None = None, before_send=None):
         """Drive native rounds, or return promptly after a durable host pause."""
         if resume is not None and (type(resume) is not MCPInputResume or round_check is None):
             raise ResourceUnsupported('MCP resume requires fresh host authority')
@@ -459,6 +476,8 @@ class MCPConnection:
                 self.require_incarnation(incarnation)
                 if round_check is not None:
                     round_check()
+                if not progress.sent and before_send is not None:
+                    call_synchronous_callback(before_send, label='request admission')
                 progress.sent = True
                 result = await invoke(state, responses)
                 if isinstance(result, types.InputRequiredResult):
@@ -563,7 +582,10 @@ class MCPConnection:
             ) from error
 
     async def call_tool(self, name: str, arguments: dict | None = None, *, round_check=None,
-                        input_handler=None, resume: MCPInputResume | None = None, allow_claimed: bool = False):
+                        input_handler=None, resume: MCPInputResume | None = None, allow_claimed: bool = False,
+                        before_send=None):
+        if before_send is not None and not callable(before_send):
+            raise TypeError('MCP request admission requires a synchronous callback')
         client = self._require_client()
         if type(allow_claimed) is not bool:
             raise TypeError('Native claimed-result handling must be explicit')
@@ -591,7 +613,8 @@ class MCPConnection:
         # than treating an unreadable result as proof the tool did not run.
         try:
             return await self._complete(invoke, incarnation=incarnation,
-                round_check=round_check, progress=progress, input_handler=input_handler, resume=resume)
+                round_check=round_check, progress=progress, input_handler=input_handler, resume=resume,
+                before_send=before_send)
         except (ExceptionGroup, *MCP_REQUEST_ERRORS) as error:
             if not progress.sent:
                 raise

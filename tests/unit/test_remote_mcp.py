@@ -4,6 +4,7 @@ import asyncio
 import json
 import socket
 import sqlite3
+from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -636,7 +637,7 @@ async def test_restore_reads_existing_enablement_without_rewriting_it(
          {"mode": "container", "image": "org/img:1", "args": None}),
     ]
     path = tmp_path / "enablement.sqlite"
-    with sqlite3.connect(path) as setup:
+    with closing(sqlite3.connect(path)) as setup, setup:
         setup.execute("CREATE TABLE enablement (name TEXT PRIMARY KEY, state TEXT, metadata TEXT)")
         setup.executemany("INSERT INTO enablement VALUES (?, ?, ?)",
                           [(name, state, json.dumps(metadata)) for name, state, metadata in rows])

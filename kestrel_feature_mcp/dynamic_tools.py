@@ -24,6 +24,7 @@ from typing import Any, Awaitable, Callable, Dict, List, TYPE_CHECKING
 from mcp import types
 
 from kestrel_sdk.tools.result import ToolResult
+from kestrel_sdk.resources import ResourceError, ResourceOutcomeUnknown
 from .connection import MCPCallOutcomeUnknownError, MCP_CONNECTION_ERRORS
 from .oauth_grants import OAuthGrantChanged
 from .tool_contract import validate_tool_contract
@@ -103,6 +104,7 @@ class MCPToolWrapper:
         caller: MCPCaller,
         app_executor: AppExecutor | None = None,
         input_runtime=None,
+        task_runtime=None,
     ):
         self.name = handle_name
         self._native_tool = tool.model_copy(deep=True)
@@ -110,6 +112,7 @@ class MCPToolWrapper:
         self._caller = caller
         self.app_executor = app_executor
         self.input_runtime = input_runtime
+        self.task_runtime = task_runtime
         self.schema = _MCPToolSchema(handle_name, self._native_tool)
         if app_executor is not None:
             app_executor.require_initial_tool(self)
@@ -137,7 +140,7 @@ class MCPToolWrapper:
         the ``ToolResult.failed`` *classmethod* (always truthy) and record every
         call as an error. (Caught by the #1979 DB-grounded dogfood.)
         """
-        invocation = None
+        invocation = task_round = None
         try:
             invocation = self.app_executor.admit(self) if self.app_executor is not None else None
             if invocation is None and not self.schema.model_visible:
@@ -145,12 +148,23 @@ class MCPToolWrapper:
                     "MCP app-only tool requires a live authorized view",
                 ).to_dict()
             options = {} if invocation is None else {"require_authority": invocation.view.require_current}
+            if self.task_runtime is not None:
+                task_round = await self.task_runtime.begin(self)
+            if task_round is not None:
+                kwargs = task_round.arguments
+                options['require_authority'] = self.task_runtime.authority(
+                    task_round, self._caller, options.get('require_authority'))
+                options['allow_claimed'] = True
+                options['before_send'] = task_round.start_wire
             if self.input_runtime is not None:
                 options.update(await self.input_runtime.before_call(self, kwargs, invocation))
             result = await self._caller(self._real_name, kwargs, **options)
             if self.input_runtime is not None:
                 self.input_runtime.received(self, result)
+            task_handle = (None if task_round is None else await self.task_runtime.received(task_round, result))
         except OAuthGrantChanged as error:
+            if task_round is not None:
+                await self.task_runtime.rejected(task_round, error)
             if invocation is not None:
                 self.app_executor.capture_refusal(invocation, error)
             raise
@@ -160,19 +174,33 @@ class MCPToolWrapper:
             # The host must settle its admitted effect before any model-visible
             # error projection. Preserve the SDK outcome type and native cause.
             raise
+        except ResourceOutcomeUnknown:
+            raise
         except (ExceptionGroup, ValueError, *MCP_CONNECTION_ERRORS) as e:
             if isinstance(e, ExceptionGroup):
                 _, unexpected = e.split((*MCP_CONNECTION_ERRORS, ValueError))
                 if unexpected is not None:
                     raise
+            if task_round is not None:
+                await self.task_runtime.rejected(task_round, e)
             if invocation is not None:
                 self.app_executor.capture_refusal(invocation, e)
             logger.error(
                 "MCP tool '%s' execution failed: %s", self._real_name, e, exc_info=True
             )
             return ToolResult.failed(f"MCP tool '{self._real_name}' failed: {e}").to_dict()
+        except ResourceError as error:
+            if task_round is not None:
+                await self.task_runtime.rejected(task_round, error)
+            raise
 
         from .input_requests import MCPInputSuspension
+        if task_handle is not None:
+            # A Task creation claim is pending custody, never a completed
+            # native result or an Apps publication. Final delivery is H3.
+            return ToolResult.partial('MCP tool is running as a Task',
+                'No final result has been received. Do not repeat the original call.',
+                data={'mcp_tool': self._real_name, 'mcp_task': task_handle}).to_dict()
         if isinstance(result, MCPInputSuspension):
             projected = ToolResult.partial('MCP tool is waiting for operator input',
                 'No final result has been received. Use the MCP input card; do not repeat the original call.',
@@ -207,6 +235,7 @@ def build_wrappers(
     caller: MCPCaller,
     *, app_executor: AppExecutor | None = None,
     input_runtime=None,
+    task_runtime=None,
 ) -> List[MCPToolWrapper]:
     """Build wrappers from native SDK Tool records with host connection labels.
 
@@ -224,6 +253,7 @@ def build_wrappers(
                 caller=caller,
                 app_executor=app_executor,
                 input_runtime=input_runtime,
+                task_runtime=task_runtime,
             )
         )
     return wrappers
