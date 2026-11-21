@@ -135,7 +135,7 @@ class AuthorizationOperation:
             raise GrantRejected('The original OAuth authorization was withdrawn')
         self._phase_check()
 
-    async def storage_rejection(self):
+    async def storage_rejection(self, _code, _definite):
         await self.storage.reject_exchange()
 
     async def _begin_exchange(self):

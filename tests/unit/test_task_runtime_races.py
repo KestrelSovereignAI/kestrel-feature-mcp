@@ -7,6 +7,41 @@ from tests.unit.test_oauth_credentials import credential_boundary as credential_
 from tests.unit.test_oauth_acceptance_http import oauth_peers as oauth_peers
 from tests.unit.test_task_runtime import start, pytestmark
 
+
+async def test_shutdown_cancels_task_maintenance_before_waiting_for_feature_gate(
+        credential_boundary, monkeypatch):
+    b = credential_boundary
+    host = await start(b)
+    original = host.maintain
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def scheduled(*, observe):
+        started.set()
+        await release.wait()
+        return await original(observe=observe)
+
+    monkeypatch.setattr(host, 'maintain', scheduled)
+    maintenance = b.feature._task_maintenance
+    await asyncio.wait_for(started.wait(), 5)
+    shutdown = None
+    try:
+        async with b.feature._lifecycle_transition:
+            shutdown = asyncio.create_task(b.feature.shutdown())
+            while not b.feature._closing:
+                await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(maintenance), 5)
+            assert not shutdown.done()
+    finally:
+        release.set()
+        if shutdown is not None:
+            await asyncio.gather(shutdown, return_exceptions=True)
+    await shutdown
+    assert host.retired
+    assert b.feature._task_host is None and b.feature._input_host is None
+
+
 @pytest.mark.parametrize('ordinary', [False, True])
 async def test_postcommit_registration_retirement_cannot_be_a_known_tool_failure(
         credential_boundary, mcp_http_server, monkeypatch, ordinary):
@@ -99,9 +134,9 @@ async def test_an_admitted_response_winning_expiry_does_not_withdraw_the_native_
         expiring.set()
         await let_expire.wait()
         return await original_expire(*args, **kwargs)
-    async def observed_maintain():
+    async def observed_maintain(*, observe):
         try:
-            return await original_maintain()
+            return await original_maintain(observe=observe)
         finally:
             if expiring.is_set():
                 cycle.set()

@@ -6,13 +6,16 @@ import socket
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock
 
+import httpx2
 import pytest
 from mcp.shared.exceptions import MCPError
 from mcp import types
 from pydantic import Field
 from typing import Annotated
 
-from kestrel_feature_mcp.connection import MCPConnection, MCPCallOutcomeUnknownError, bind_tool_caller
+from kestrel_feature_mcp.connection import (
+    MCPCallOutcomeUnknownError, MCPConnection, MCPPeerNegotiationError, bind_tool_caller,
+)
 from mcp_types.version import LATEST_PROTOCOL_VERSION
 from kestrel_feature_mcp.manager import DockerMCPGatewayError, MCPGatewayManager, MCPToolManager
 
@@ -735,6 +738,24 @@ async def test_no_common_revision_fails_without_a_private_fallback(mcp_http_serv
     assert connection._task is None
     assert not connection.is_connected
     assert [json.loads(body)["method"] for _, body in requests if body] == ["server/discover"]
+
+
+@pytest.mark.asyncio
+async def test_local_runtime_failure_is_not_a_peer_negotiation_refusal(mcp_http_server):
+    failure = RuntimeError("Original HTTP auth implementation failed")
+
+    class FailingAuth(httpx2.Auth):
+        def auth_flow(self, request):
+            yield request
+            raise failure
+
+    connection = MCPConnection(mcp_http_server.url, auth=FailingAuth())
+    with pytest.raises((RuntimeError, ExceptionGroup)) as caught:
+        await connection.connect()
+    failures = tuple(explicit_errors(caught.value))
+    assert failure in failures
+    assert not any(isinstance(error, MCPPeerNegotiationError) for error in failures)
+    assert not connection.owns_transport
 
 
 @pytest.mark.asyncio

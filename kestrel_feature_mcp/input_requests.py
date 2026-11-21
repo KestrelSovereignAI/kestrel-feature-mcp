@@ -3,13 +3,13 @@
 from dataclasses import dataclass, field
 import json
 
-from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from mcp import types
 from pydantic import TypeAdapter
 from pydantic_core import to_jsonable_python
-from referencing import Registry
 from referencing.exceptions import Unresolvable
+
+from .schema_validation import matches_schema
 
 
 @dataclass(frozen=True)
@@ -141,11 +141,7 @@ def validate_form_responses(plan: MCPInputPlan, value: dict) -> dict[str, types.
         if raw['action'] == 'accept':
             schema = requests[key].params.requested_schema
             try:
-                Draft202012Validator.check_schema(schema)
-                # Server schemas cannot cause validator network retrieval.
-                validator = Draft202012Validator(schema, registry=Registry(),
-                    format_checker=Draft202012Validator.FORMAT_CHECKER)
-                valid = validator.is_valid(raw.get('content', {}))
+                valid = matches_schema(schema, raw.get('content', {}))
             except (SchemaError, Unresolvable):
                 raise ValueError('MCP form schema is invalid or requires an unavailable reference') from None
             if not valid:

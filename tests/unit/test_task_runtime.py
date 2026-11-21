@@ -14,6 +14,7 @@ from datetime import timedelta
 import time
 import os
 from mcp import types
+from kestrel_sdk.resources import ResourceConflict
 from kestrel_sdk.security.outbound import assert_safe_url
 from kestrel_sovereign.features.security.permissions import PermissionLevel
 from kestrel_feature_mcp.connection import bind_tool_caller
@@ -58,10 +59,42 @@ async def test_declaring_native_call_reserves_before_wire_and_retains_the_exact_
     assert record.envelope['native']['resultType'] == 'task'
     assert record.envelope['native']['ttlMs'] == peer.ttl_ms
     assert record.binding.origin.kind == 'interactive'
-    assert (await host.store.open_submission(record)).arguments == {'text': 'owned-effect'}
+    submission = await host.store.open_submission(record)
+    assert submission.arguments == {'text': 'owned-effect'}
+    assert submission.authorization.connection_name == b.credential.lease.connection_id
+    assert submission.authorization.principal_digest == b.credential.lease.principal_id
+    assert submission.authorization.slot_id == b.credential.lease.slot_id
     assert response.json()['status'] == 'partial' and response.json()['data']['mcp_task'] == record.handle
     assert not b.feature.config_schema['properties'].get('tasks')
     assert not getattr(b.agent, 'supports_mcp_task_host', False)
+
+
+async def test_declaring_task_requires_the_bound_connections_exact_oauth_lease(
+        credential_boundary, mcp_http_server, monkeypatch):
+    b = credential_boundary
+    peer = mcp_http_server.settings['extensions'][0]
+    peer.calls.clear()
+    host = await start(b)
+    registered = next(item for item in b.feature._task_runtime._registrations['mcp:credential']
+        if item.binding.name == b.handle)
+    original = registered.tool.bound_caller
+    monkeypatch.setattr(registered.tool, '_caller', replace(original, name='foreign-connection'))
+    admit = b.feature._task_runtime.begin
+    refused = []
+
+    async def record_refusal(tool):
+        try:
+            return await admit(tool)
+        except ResourceConflict as error:
+            refused.append(str(error))
+            raise
+
+    monkeypatch.setattr(b.feature._task_runtime, 'begin', record_refusal)
+    response = await b.client.post('/api/owned-credential-call')
+    assert response.status_code == 200, response.text
+    assert response.json().get('error'), response.text
+    assert refused == ['Original Task connection does not match its OAuth lease']
+    assert await host.store.list_retained() == () and peer.calls == []
 
 
 @pytest.mark.parametrize('ordinary', [False, True])
@@ -269,7 +302,8 @@ async def test_reopened_hosts_resume_original_sql_custody_on_a_fresh_binding_and
                 caller = bind_tool_caller(connection, lambda: connection.is_connected, 'original-connection',
                     tool_names=[tool.name for tool in tools], admit=b.credential.admit,
                     continuation_check=b.credential.lease.require_principal,
-                    authorization_identity=lambda: b.credential.authorization_identity)
+                    authorization_identity=lambda: b.credential.authorization_identity,
+                    authorization_lease=b.credential.lease)
                 b.feature._mount_tools('mcp:credential', 'owned_credential',
                     [tool.model_dump(mode='json', by_alias=True) for tool in tools], caller)
                 return {'restored': True}

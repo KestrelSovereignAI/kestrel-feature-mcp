@@ -16,11 +16,17 @@ from mcp.client.auth.utils import (
     extract_resource_metadata_from_www_auth,
 )
 from mcp.shared.auth import OAuthMetadata, OAuthToken, ProtectedResourceMetadata
-from mcp_types import JSONRPCNotification, JSONRPCRequest, client_notification_adapter, jsonrpc_message_adapter
+from mcp_types import (
+    JSONRPCMessage, JSONRPCNotification, JSONRPCRequest, client_notification_adapter, jsonrpc_message_adapter,
+)
 from mcp.shared.auth_utils import check_resource_allowed, resource_url_from_server_url
 from pydantic import ValidationError
 
 DEFAULT_RESPONSE_MAX_BYTES = 65536
+_TOKEN_ERRORS = frozenset({
+    'invalid_request', 'invalid_client', 'invalid_grant', 'unauthorized_client',
+    'unsupported_grant_type', 'invalid_scope',
+})
 
 
 class GrantRejected(ValueError):
@@ -29,6 +35,14 @@ class GrantRejected(ValueError):
 
 class ResourceGrantRejected(GrantRejected):
     """The resource refused a grant already committed by its authorization server."""
+
+
+class TaskObservationBlocked(GrantRejected):
+    """A local grant disposition that leaves the remote Task outcome open."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
 
 
 def response_budget(value: int) -> int:
@@ -46,7 +60,7 @@ def positive_seconds(value):
 
 def metadata_document(body: bytes) -> dict:
     try:
-        document = json.loads(body)
+        document = json.loads(body, object_pairs_hook=_unique_json_fields)
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise GrantRejected("OAuth metadata is not valid JSON") from None
     if not isinstance(document, dict):
@@ -351,16 +365,23 @@ class BootstrapPolicy:
         return self._verified.redirect(url)
 
 
-async def resource_lane(request: httpx2.Request, server_url: str) -> str:
-    """Classify the original native envelope without rewriting its contents."""
+def _unique_json_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise GrantRejected('Protocol envelopes require unique JSON object fields')
+    return fields
+
+
+async def resource_envelope(request: httpx2.Request, server_url: str) -> JSONRPCMessage | None:
+    """Validate the original SDK envelope and retain the exact request bytes."""
     if str(request.url) != server_url:
         raise GrantRejected('Credentials cannot leave the selected resource')
     if request.method in {'GET', 'DELETE'}:
-        return 'background'
+        return None
     if request.method != 'POST':
         raise GrantRejected('Unsupported MCP resource HTTP method')
     try:
-        message = json.loads(await request.aread())
+        message = json.loads(await request.aread(), object_pairs_hook=_unique_json_fields)
         envelope = jsonrpc_message_adapter.validate_python(message)
     except (UnicodeDecodeError, json.JSONDecodeError, ValidationError):
         raise GrantRejected('MCP requests require a valid JSON-RPC envelope') from None
@@ -371,6 +392,12 @@ async def resource_lane(request: httpx2.Request, server_url: str) -> str:
             client_notification_adapter.validate_python(message)
         except ValidationError:
             raise GrantRejected('Only native client notifications may use background authority') from None
+    return envelope
+
+
+async def resource_lane(request: httpx2.Request, server_url: str) -> str:
+    """Classify the authority required by the original native envelope."""
+    envelope = await resource_envelope(request, server_url)
     return 'principal' if isinstance(envelope, JSONRPCRequest) else 'background'
 
 
@@ -412,6 +439,9 @@ async def reject_token_response(response, on_rejection):
         return
     if response.status_code in {400, 401}:
         document = metadata_document(await response.aread())
-        if isinstance(document.get('error'), str) and document['error'] and on_rejection is not None:
-            await on_rejection()
+        code = document.get('error')
+        if isinstance(code, str) and code and on_rejection is not None:
+            definite = (code in _TOKEN_ERRORS and (response.status_code == 400 or code == 'invalid_client')
+                and not {'access_token', 'refresh_token'}.intersection(document))
+            await on_rejection(code, definite)
     raise GrantRejected('OAuth token request failed; do not replay the exchange')

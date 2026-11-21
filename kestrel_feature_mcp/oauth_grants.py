@@ -34,6 +34,10 @@ class OAuthGrantChanged(ResourceConflict):
     """The exact grant revision is no longer current; do not replay HTTP."""
 
 
+class OAuthRefreshPending(OAuthGrantChanged):
+    """The same original grant is waiting for an existing refresh outcome."""
+
+
 def _record(value, expected):
     if type(value) is not expected:
         raise OAuthGrantRejected("OAuth grant record type is invalid")
@@ -42,6 +46,12 @@ def _record(value, expected):
 def _text(value):
     if not isinstance(value, str) or not value or any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise OAuthGrantRejected("OAuth grant fields require nonempty control-free strings")
+
+
+def _token(value):
+    # RFC 6749 Appendix A.12 and A.17 both define one or more VSCHARs.
+    if not isinstance(value, str) or not value or any(not 0x20 <= ord(c) <= 0x7e for c in value):
+        raise OAuthGrantRejected("OAuth tokens require nonempty printable ASCII")
 
 
 def _generation(value):
@@ -124,9 +134,9 @@ class OAuthGrantTokens:
     scopes: frozenset[str]
 
     def __post_init__(self):
-        _text(self.access_token)
+        _token(self.access_token)
         if self.refresh_token is not None:
-            _text(self.refresh_token)
+            _token(self.refresh_token)
         if self.expires_at is not None and (
                 type(self.expires_at) not in (int, float) or self.expires_at < 0
                 or self.expires_at > sys.float_info.max or not math.isfinite(self.expires_at)):
@@ -577,6 +587,12 @@ class OAuthGrantStore:
         original = await self._refresh(claim)
         return await self._replace(claim.binding, None, 'revoked', original,
                                    expected_secret=claim.secret, reason='refresh_rejected')
+
+    async def abandon_refresh(self, claim):
+        """Retain the original tokens and generation after a definite client error."""
+        original = await self._refresh(claim)
+        return await self._replace(claim.binding, original.tokens, 'active', original,
+                                   expected_secret=claim.secret)
 
     async def revoke_local(self, snapshot):
         self._expected(snapshot, snapshot.binding if type(snapshot) in {OAuthGrantSnapshot, OAuthAuthorizationClaim, OAuthRefreshClaim} else None)

@@ -7,7 +7,7 @@ import httpx2
 import pytest
 
 from kestrel_feature_mcp.oauth_policy import (
-    BootstrapPolicy, ClientIdentity, GrantRejected, RefreshPolicy, resource_lane,
+    BootstrapPolicy, ClientIdentity, GrantRejected, RefreshPolicy, resource_envelope, resource_lane,
 )
 from tests.unit.test_oauth_acceptance_policy import selection, discover, authorization
 
@@ -127,6 +127,8 @@ async def test_actual_native_envelope_shape_determines_authority_lane(selection,
     request = httpx2.Request('POST', selection.server_url, json=envelope)
     original = request.content
     assert await resource_lane(request, selection.server_url) == lane
+    parsed = await resource_envelope(request, selection.server_url)
+    assert parsed.model_dump(mode='json', by_alias=True, exclude_unset=True) == envelope
     assert request.content == original
 
 
@@ -138,6 +140,17 @@ async def test_actual_native_envelope_shape_determines_authority_lane(selection,
 async def test_malformed_or_ambiguous_envelope_cannot_use_background_lane(selection, envelope):
     with pytest.raises(GrantRejected):
         await resource_lane(httpx2.Request('POST', selection.server_url, json=envelope), selection.server_url)
+
+
+@pytest.mark.parametrize('content', [
+    b'{"jsonrpc":"2.0","id":7,"id":8,"method":"tasks/get","params":{"taskId":"owned"}}',
+    b'{"jsonrpc":"2.0","id":7,"method":"tasks/get","params":{"taskId":"owned","taskId":"owned"}}',
+])
+async def test_resource_policy_refuses_duplicate_fields_in_native_envelopes(selection, content):
+    request = httpx2.Request('POST', selection.server_url, content=content)
+    with pytest.raises(GrantRejected, match='unique JSON object fields'):
+        await resource_envelope(request, selection.server_url)
+    assert request.content == content
 
 
 async def test_refresh_is_separate_from_interactive_consent_and_runs_once(selection):

@@ -4,7 +4,12 @@ from dataclasses import dataclass
 import hashlib
 import json
 
+from jsonschema.exceptions import SchemaError
 from mcp import types
+from pydantic import ValidationError
+from referencing.exceptions import Unresolvable
+
+from .schema_validation import matches_schema
 
 
 class MCPToolContractError(ValueError):
@@ -47,6 +52,24 @@ class MCPToolContractSnapshot:
     def descriptor(self):
         """A detached original Tool descriptor for custody and validation."""
         return json.loads(self.canonical_json)['tool']
+
+    @property
+    def connection(self) -> tuple[str, str | None, str | None]:
+        """The original connection name, resource URL and negotiated revision."""
+        value = json.loads(self.canonical_json)
+        return value['connection'], value['url'], value['protocol']
+
+    def completion_conforms(self, result: dict) -> bool:
+        """Check a completed Task against the descriptor that started it."""
+        schema = self.descriptor.get('outputSchema')
+        try:
+            native = types.CallToolResult.model_validate(result, by_alias=True, by_name=False)
+            if schema is None or native.is_error:
+                return True
+            return ('structured_content' in native.model_fields_set
+                and matches_schema(schema, native.structured_content))
+        except (ValidationError, SchemaError, Unresolvable):
+            return False
 
 
 def capture_tool_contract(native_tool: types.Tool, *, connection_name: str,
