@@ -18,10 +18,7 @@ from kestrel_feature_mcp.oauth_refresh import OAuthRefresher
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 
-async def with_store(config, store, binding):
-    resource = config['resource']
-    server_url = config['server_url']
-    issuer = config['issuer']
+def install_owned_tls(server_url, issuer, certificate):
     authorities = {(urlsplit(url).hostname, urlsplit(url).port) for url in (server_url, issuer)}
     assert {name for name, _ in authorities} == {'remote.example', 'issuer.example'}
     ports = {port for _, port in authorities}
@@ -37,8 +34,13 @@ async def with_store(config, store, binding):
 
     socket.getaddrinfo = resolve
     httpcore2.AnyIOBackend.connect_tcp = dial
-    os.environ['SSL_CERT_FILE'] = config['certificate']
+    os.environ['SSL_CERT_FILE'] = certificate
     os.environ.pop('SSL_CERT_DIR', None)
+
+
+async def with_store(config, store, binding):
+    server_url = config['server_url']
+    install_owned_tls(server_url, config['issuer'], config['certificate'])
     metadata = await store.read(binding)
     snapshot = await store.read_tokens(metadata)
     assert snapshot is not None and snapshot.state == 'active'

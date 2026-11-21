@@ -81,6 +81,7 @@ test.beforeAll(async () => {
         bundle: true, platform: 'browser', format: 'esm', minify: true, write: false })).outputFiles[0].text;
     hostBundle = await bundle(`export { OriginBoundTransport } from './src/origin-transport.js';
         export { approveSandboxPolicy } from './src/sandbox-proxy.js';
+        export { mountMCPApp } from './src/parent-view.js';
         export { AppBridge } from '@modelcontextprotocol/ext-apps/app-bridge';`);
     proxyBundle = await bundle(`export { startSandboxProxy } from './src/sandbox-proxy.js';`);
     appBundle = await bundle(`import { App } from '@modelcontextprotocol/ext-apps';
@@ -89,7 +90,8 @@ test.beforeAll(async () => {
         app.ontoolinput = params => received.push({ input: params });
         app.ontoolresult = params => received.push({ result: params });
         app.onteardown = async () => { received.push({ teardown: true }); return {}; };
-        await app.connect(); window.nativeConnected = true;`);
+        await app.connect(); window.nativeConnected = true;
+        window.callNativeTool = (name, args) => app.callServerTool({ name, arguments: args });`);
     expect(Buffer.byteLength(appBundle)).toBeLessThan(1024 * 1024);
     hostOrigin = await listen();
     sandboxOrigin = await listen();
@@ -208,6 +210,64 @@ test('native App and AppBridge initialize through the mandatory proxy and opaque
     await expect.poll(() => view.evaluate(() => window.received.some(item => item.teardown))).toBe(true);
     await page.evaluate(() => bridge.close());
     expect(await proxy.evaluate(() => window.proxyErrors)).toEqual([]);
+});
+
+test('a native App tool call receives only its final Task result through the original View', async ({ page }) => {
+    const reference = 'a'.repeat(43), viewId = 'b'.repeat(43);
+    const task = { handle: '00000000-0000-4000-8000-000000000001', reference: 'c'.repeat(64) };
+    const result = { content: [{ type: 'text', text: 'Original deferred result' }],
+        structuredContent: { completed: true }, _meta: { 'example.com/proof': 'original' } };
+    await page.goto(hostOrigin);
+    await page.evaluate(async ({ html, sandboxUrl, reference, viewId, task, result }) => {
+        const { mountMCPApp } = await import('/host.js');
+        window.toolPosts = [];
+        window.taskReads = [];
+        const complete = new Promise(resolve => { window.completeTask = resolve; });
+        const app = mountMCPApp({ root: document.body, reference,
+            sessionId: 'original-chat', isCurrentChat: () => true,
+            async request(path, options) {
+                const url = new URL(path, location.origin);
+                if (url.searchParams.get('session_id') !== 'original-chat') throw new Error('Wrong conversation');
+                if (url.pathname === '/api/mcp/apps/publications/' + reference + '/views') {
+                    return { view_id: viewId, arguments: {}, result: { content: [] },
+                        resource: { html }, sandbox_url: sandboxUrl, host_origin: location.origin,
+                        max_message_bytes: 2 * 1024 * 1024, policy: {} };
+                }
+                const original = '/api/mcp/apps/views/' + viewId;
+                if (url.pathname === original + '/tools/call') {
+                    toolPosts.push(JSON.parse(options.body));
+                    return { task };
+                }
+                if (url.pathname === original + '/tasks/' + task.handle) {
+                    taskReads.push(options.headers['X-Kestrel-Task-Result']);
+                    await complete;
+                    return { status: 'completed', result: { resultType: 'complete', ...result } };
+                }
+                if (url.pathname === original && options.method === 'DELETE') return { closed: true };
+                throw new Error('Unexpected App request');
+            },
+        });
+        window.closeTaskApp = app.dispose;
+        await app.ready;
+    }, { html: '<script type="module">' + appBundle + '</script>',
+        sandboxUrl: productionSandboxOrigin + '/proxy', reference, viewId, task, result });
+    await expect(page.getByRole('status')).toHaveText('App ready.');
+    const view = page.frame({ url: productionSandboxOrigin + '/proxy' }).childFrames()[0];
+    expect(await view.evaluate(() => self.origin)).toBe('null');
+    await view.evaluate(() => {
+        window.finalTaskResult = undefined;
+        void window.callNativeTool('deferred', { label: 'once' }).then(value => { window.finalTaskResult = value; },
+            error => { window.finalTaskResult = { error: error.message }; });
+    });
+    await expect.poll(() => page.evaluate(() => window.taskReads)).toEqual([task.reference]);
+    expect(await view.evaluate(() => window.finalTaskResult)).toBeUndefined();
+    await page.evaluate(() => window.completeTask());
+    await expect.poll(() => view.evaluate(() => window.finalTaskResult)).toEqual(result);
+    expect(await page.evaluate(() => window.toolPosts)).toEqual([{
+        name: 'deferred', arguments: { label: 'once' }, operation_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+    }]);
+    await page.evaluate(() => window.closeTaskApp());
+    await expect(page.getByRole('status')).toHaveText('App closed.');
 });
 
 test('CSP denies undeclared and unapproved network domains in the actual View', async ({ page }) => {

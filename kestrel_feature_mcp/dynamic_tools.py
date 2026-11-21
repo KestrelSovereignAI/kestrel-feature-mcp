@@ -122,6 +122,10 @@ class MCPToolWrapper:
         return self._caller
 
     @property
+    def native_actions(self):
+        return {} if self.task_runtime is None else self.task_runtime.native_actions(self)
+
+    @property
     def native_tool(self) -> types.Tool:
         return self._native_tool.model_copy(deep=True)
 
@@ -196,11 +200,12 @@ class MCPToolWrapper:
 
         from .input_requests import MCPInputSuspension
         if task_handle is not None:
-            # A Task creation claim is pending custody, never a completed
-            # native result or an Apps publication. Final delivery is H3.
-            return ToolResult.partial('MCP tool is running as a Task',
+            projected = ToolResult.partial('MCP tool is running as a Task',
                 'No final result has been received. Do not repeat the original call.',
                 data={'mcp_tool': self._real_name, 'mcp_task': task_handle}).to_dict()
+            if invocation is not None:
+                return self.app_executor.capture_task(invocation, task_round, projected)
+            return self.task_runtime.defer_result(task_round, projected)
         if isinstance(result, MCPInputSuspension):
             projected = ToolResult.partial('MCP tool is waiting for operator input',
                 'No final result has been received. Use the MCP input card; do not repeat the original call.',

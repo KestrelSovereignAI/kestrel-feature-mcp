@@ -2,6 +2,7 @@ import { AppBridge, buildAllowAttribute } from '@modelcontextprotocol/ext-apps/a
 import { OriginBoundTransport } from './origin-transport.js';
 import { approveSandboxPolicy } from './sandbox-proxy.js';
 import { isInputReference, mountMCPInput } from './input-card.js';
+import { isTaskReference, mountMCPTask } from './task-card.js';
 
 /** One physical View. request() is the original authenticated host HTTP lane. */
 export function mountMCPApp({ root, reference, sessionId, request, isCurrentChat,
@@ -92,10 +93,11 @@ export function mountMCPApp({ root, reference, sessionId, request, isCurrentChat
                 throw new TypeError('This App host supports ordinary governed tool calls; Tasks require separate host support');
             }
             const operationId = eventWindow.crypto.randomUUID();
+            const signal = AbortSignal.any([calls.signal, extra.mcpReq.signal]);
             const result = await request(viewPath() + '/tools/call' + query, {
                 method: 'POST', body: JSON.stringify({ name: params.name,
                     arguments: params.arguments ?? {}, operation_id: operationId }),
-                signal: AbortSignal.any([calls.signal, extra.mcpReq.signal]),
+                signal,
             });
             current();
             if (result?.input_required) {
@@ -117,6 +119,28 @@ export function mountMCPApp({ root, reference, sessionId, request, isCurrentChat
                         if (completed.state === 'RESOLVED' && !completed.next_request_id) inputPending = false;
                     } });
                 throw new Error('The tool is waiting for operator input. Review the form in the host; do not repeat the call.');
+            }
+            if (result?.task) {
+                if (!isTaskReference(result.task)) throw new TypeError('Host returned no original App Task reference');
+                const taskRoot = eventWindow.document.createElement('div');
+                taskRoot.className = 'mcp-input-card'; root.append(taskRoot);
+                const task = mountMCPTask({ root: taskRoot, task: result.task,
+                    basePath: viewPath() + '/tasks', sessionId, request, browser: eventWindow,
+                    isCurrent: () => !retired && !signal.aborted && isCurrentChat() });
+                const abort = () => task.dispose();
+                signal.addEventListener('abort', abort, { once: true });
+                if (signal.aborted) abort();
+                try {
+                    const settled = await task.completed;
+                    current(); signal.throwIfAborted();
+                    if (!settled?.result) {
+                        throw new Error('The original MCP Task ended without an available App result.');
+                    }
+                    return settled.result;
+                } finally {
+                    signal.removeEventListener('abort', abort);
+                    task.dispose(); taskRoot.remove();
+                }
             }
             return result;
         };

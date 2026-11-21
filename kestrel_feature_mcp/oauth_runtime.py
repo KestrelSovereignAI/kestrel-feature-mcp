@@ -78,7 +78,7 @@ class OAuthRuntime:
     def _name(self, server_url, principal_id):
         return remote_name_for_url(server_url, self.feature._connection_owner_did(), principal_id=principal_id)
 
-    async def task_observation_binding(self, lease, check):
+    async def task_grant_binding(self, lease, check, *, pace):
         """Open the grant selected by authenticated Task custody."""
         self._require_open()
         check()
@@ -129,7 +129,8 @@ class OAuthRuntime:
         needs_refresh = original.is_expired(time.time())
         if needs_refresh and lease.remaining_seconds() <= 3 * policy.network_seconds + self.settings.close_seconds:
             raise ResourceConflict('MCP Task refresh has insufficient time for discovery and exchange')
-        await lease.pace()
+        if pace:
+            await lease.pace()
         if needs_refresh:
             refresh = OAuthRefresher(store, policy.model_dump(mode='json'),
                 close_seconds=self.settings.close_seconds, remaining_seconds=lease.remaining_seconds)

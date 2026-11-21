@@ -64,6 +64,12 @@ class MCPAppInputRequired(ResourceConflict):
         self.view, self.suspension = view, suspension
 
 
+class MCPAppTaskPending(ResourceConflict):
+    def __init__(self, view, reference):
+        super().__init__('MCP App tool is running as an original native Task')
+        self.view, self.reference = view, reference
+
+
 @dataclass(frozen=True)
 class RegisteredAppTool:
     tool: MCPToolWrapper
@@ -82,6 +88,7 @@ class _Invocation:
     finished: bool = False
     refusal: BaseException | None = None
     suspension: object | None = None
+    task_reference: dict | None = None
 
 
 @dataclass(eq=False, frozen=True)
@@ -422,6 +429,23 @@ class AppExecutor:
             return []
         return DeferredToolResult(projection, publish=approved)
 
+    @staticmethod
+    def task_pending(error, view):
+        if type(error) is MCPAppTaskPending and error.view is view:
+            return error.reference
+        return None
+
+    def capture_task(self, invocation, task_round, projection):
+        self._require_capture(invocation)
+
+        def approved():
+            self._require_capture(invocation)
+            invocation.view.require_current()
+            invocation.task_reference = task_round.publish_result(None)
+            return []
+
+        return DeferredToolResult(projection, publish=approved)
+
     def capture(self, invocation: _Invocation, native: types.CallToolResult,
                 projection: dict) -> DeferredToolResult:
         self._require_capture(invocation)
@@ -486,6 +510,9 @@ class AppExecutor:
                 if invocation.suspension is not None and invocation.delivery_approved:
                     view.require_current()
                     raise MCPAppInputRequired(view, invocation.suspension)
+                if invocation.task_reference is not None:
+                    view.require_current()
+                    raise MCPAppTaskPending(view, invocation.task_reference)
                 if invocation.native is None:
                     if invocation.refusal is not None:
                         view.require_current()

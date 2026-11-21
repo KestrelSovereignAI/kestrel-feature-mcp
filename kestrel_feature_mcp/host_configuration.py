@@ -260,6 +260,9 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
                 router.include_router(self.agent.create_mcp_oauth_router(self, resolve_host=lambda: self._oauth_host))
             if inputs:
                 router.include_router(self.agent.create_mcp_input_router(self, resolve_host=lambda: self._input_host))
+            result_router = getattr(self.agent, 'create_mcp_task_result_router', None)
+            if callable(result_router):
+                router.include_router(result_router(self, resolve_host=lambda: self._task_host))
             self._host_router = router
         return self._host_router
 

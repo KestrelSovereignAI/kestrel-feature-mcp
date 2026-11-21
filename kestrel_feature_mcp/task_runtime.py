@@ -12,16 +12,20 @@ from mcp import types
 from mcp.shared.exceptions import MCPError
 from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceOutcomeUnknown, ResourceUnsupported, observed_outcome_unknown
 from kestrel_sdk.security.exceptions import SSRFError
+from kestrel_sdk.tools import DeferredToolResult, NativeAction, ToolResult
 from pydantic import BaseModel, ConfigDict, Field
 
 from ._lifecycle import MCPFeatureClosingError, run_cleanup_steps
 from .connection import (
     MCP_CONNECTION_ERRORS, BoundMCPCaller, MCPConnection, connection_lifecycle, _rejected_before_execution,
 )
-from .input_requests import MCPInputSuspension
-from .oauth_credentials import TaskObservationAuth
+from .input_requests import MCPInputSuspension, plan_mcp_inputs, validate_form_responses
+from .oauth_credentials import TaskOperationAuth
 from .oauth_policy import GrantRejected, TaskObservationBlocked
-from .tasks_protocol import CreateTaskResult, TasksExtension
+from .tasks_protocol import (
+    CancelTaskRequest, CreateTaskResult, GetTaskRequest, TaskIdParams, TasksExtension,
+    UpdateTaskParams, UpdateTaskRequest,
+)
 from .tool_contract import capture_tool_contract
 
 
@@ -87,39 +91,140 @@ class MCPTaskRuntime:
                     *MCP_CONNECTION_ERRORS) as error:
                 logger.debug('MCP Task observation did not finish (%s)', type(error).__name__)
 
+    @staticmethod
+    def defer_result(task_round, projection):
+        def publish():
+            reference = task_round.publish_result(deferred.publication_context)
+            return [] if reference is None else [{'type': 'mcp_task', 'data': reference}]
+
+        deferred = DeferredToolResult(projection, publish=publish)
+        return deferred
+
+    def native_actions(self, tool):
+        caller = tool.bound_caller
+        if not isinstance(caller, BoundMCPCaller) or not caller.connection.supports_task_claims:
+            return {}
+        handler = partial(self.mutate, tool)
+        return {
+            'update': NativeAction('update', 'tasks/update',
+                b'{"type":"object","properties":{"inputResponses":{"type":"object","minProperties":1}},'
+                b'"required":["inputResponses"],"additionalProperties":false}', handler),
+            'cancel': NativeAction('cancel', 'tasks/cancel',
+                b'{"type":"object","additionalProperties":false}', handler),
+        }
+
+    async def invoke_mutation(self, tool, handle, *, session_id, operation_id, kind, arguments):
+        registered = self._registered(tool)
+        caller = tool.bound_caller
+        caller.require_current()
+        contract = capture_tool_contract(tool.native_tool, connection_name=caller.name,
+            url=caller.connection.url, protocol=caller.connection.protocol_version)
+        return await self.host.actions.invoke(registered.binding, handle=handle, session_id=session_id,
+            operation_id=operation_id, contract_digest=contract.digest, kind=kind, arguments=arguments)
+
+    def action_tool(self, record):
+        for batch in self._registrations.values():
+            for registered in batch:
+                if registered.binding.name == record.binding.tool_name and registered.binding.is_current:
+                    return registered.tool
+        raise ResourceConflict('Original MCP Task tool registration is unavailable')
+
+    @staticmethod
+    def describe_inputs(record):
+        plan = plan_mcp_inputs(record.pending_inputs, allow_blocking=True)
+        return {key: request.params.model_dump(mode='json', by_alias=True, exclude_none=True)
+            for key, request in plan.operator_requests.items()}
+
+    async def mutate(self, tool, context, arguments):
+        self.feature._require_oauth_ready()
+        oauth = self.feature._oauth_runtime
+        registered = self._registered(tool)
+        mutation = self.host.actions.round(registered.binding, context, arguments)
+        async with oauth.host.borrow_task_mutation(mutation) as lease:
+            async with lease.operation() as check:
+                request = self._mutation_request(mutation, context.action, arguments)
+                connection, auth, contract, current_grant = await self._prepare_task_connection(
+                    context.task_handle, lease, oauth, check, request, pace=False)
+                close = partial(self._retire_observation, context.task_handle, connection)
+                try:
+                    await self._connect_task(connection, contract, check)
+                    await current_grant()
+                    await mutation.reserve()
+                    mutation.start_wire()
+                    auth.arm()
+                    result = await connection.request_task(auth.request,
+                        incarnation=connection.incarnation, round_check=check)
+                    try:
+                        await current_grant()
+                        await mutation.acknowledge(
+                            result.model_dump(mode='json', by_alias=True, exclude_unset=True))
+                    except ResourceConflict as error:
+                        raise ResourceOutcomeUnknown(
+                            'MCP Task mutation acknowledgement could not be confirmed; do not replay'
+                        ) from error
+                except BaseException as error:
+                    await run_cleanup_steps([(True, close)], failure=error)
+                    raise
+                await close()
+                check()
+                return ToolResult.ok('MCP Task request acknowledged', data={'acknowledged': True}).to_dict()
+
+    @staticmethod
+    def _mutation_request(mutation, kind, arguments):
+        original = mutation.record
+        task_id = original.remote_task_id
+        if kind == 'cancel':
+            return CancelTaskRequest(params=TaskIdParams(task_id=task_id))
+        requested = arguments['inputResponses']
+        pending = original.pending_inputs
+        if not requested.keys() <= pending.keys():
+            raise ResourceConflict('Original MCP Task input requests are unavailable')
+        plan = plan_mcp_inputs({key: pending[key] for key in requested}, allow_blocking=True)
+        responses = validate_form_responses(plan, requested)
+        return UpdateTaskRequest(params=UpdateTaskParams(task_id=task_id, input_responses=responses))
+
+    async def _prepare_task_connection(self, handle, lease, oauth, check, request, *, pace):
+        policy = lease.policy
+        if handle in self._observations or len(self._observations) >= policy.max_operations:
+            raise ResourceConflict('Original MCP Task transports still need retirement')
+        self._observations[handle] = None
+        try:
+            endpoint, contract, token, current_grant = await oauth.task_grant_binding(lease, check, pace=pace)
+            auth = TaskOperationAuth(endpoint.url, request, read_access_token=token, check_current=check)
+            connection = MCPConnection(endpoint, auth=auth, extensions=[self.extension()],
+                connect_timeout=policy.network_seconds, call_timeout=policy.network_seconds,
+                close_timeout=oauth.settings.close_seconds)
+            self._observations[handle] = connection
+            return connection, auth, contract, current_grant
+        finally:
+            if self._observations[handle] is None:
+                del self._observations[handle]
+
+    @staticmethod
+    async def _connect_task(connection, contract, check):
+        await connection.connect()
+        check()
+        if connection.protocol_version != contract.connection[2]:
+            raise ResourceConflict('Original MCP Task revision was not negotiated')
+
     async def observe(self, handle, *, scheduled=False):
         """Read and retain one native Task result on a dedicated connection."""
         self.feature._require_oauth_ready()
         oauth = self.feature._oauth_runtime
         async with oauth.host.borrow_task_observation(self.host, handle, scheduled=scheduled) as lease:
             async with lease.operation() as check:
-                if scheduled and lease.expired():
+                if scheduled and lease.scheduled_observation_expired():
                     return await lease.block('remote_expired')
-                policy = lease.policy
-                if handle in self._observations or len(self._observations) >= policy.max_operations:
-                    raise ResourceConflict('Original MCP Task observation transports still need retirement')
-                self._observations[handle] = None
+                request = GetTaskRequest(params=TaskIdParams(task_id=lease.remote_task_id))
                 try:
-                    try:
-                        endpoint, contract, token, current_grant = await oauth.task_observation_binding(lease, check)
-                    except TaskObservationBlocked as blocked:
-                        await lease.block(blocked.reason)
-                        raise
-                    auth = TaskObservationAuth(endpoint.url, lease.remote_task_id,
-                        read_access_token=token, check_current=check)
-                    connection = MCPConnection(endpoint, auth=auth, extensions=[self.extension()],
-                        connect_timeout=policy.network_seconds, call_timeout=policy.network_seconds,
-                        close_timeout=oauth.settings.close_seconds)
-                    self._observations[handle] = connection
-                finally:
-                    if self._observations[handle] is None:
-                        del self._observations[handle]
+                    connection, auth, contract, current_grant = await self._prepare_task_connection(
+                        handle, lease, oauth, check, request, pace=True)
+                except TaskObservationBlocked as blocked:
+                    await lease.block(blocked.reason)
+                    raise
                 close = partial(self._retire_observation, handle, connection)
                 try:
-                    await connection.connect()
-                    check()
-                    if connection.protocol_version != contract.connection[2]:
-                        raise ResourceConflict('Original MCP Task revision was not negotiated')
+                    await self._connect_task(connection, contract, check)
                     auth.arm()
                     try:
                         result = await connection.request_task(auth.request,

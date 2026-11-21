@@ -244,6 +244,9 @@ jobs:
               --output-dir "tests/conformance/results/$scenario"
           done
         timeout-minutes: 10
+      - name: Verify native Tasks against the published Everything server
+        run: .venv-test/bin/python -m tests.conformance.everything_tasks
+        timeout-minutes: 2
       - name: Preserve official conformance reports
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

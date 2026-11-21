@@ -3,6 +3,7 @@ import { registerRenderer } from '/js/ui-ext/renderers.js';
 import { bus } from '/js/ui-ext/bus.js';
 import { appendMessagePart } from '/js/chat.js';
 import { isInputReference, mountMCPInput } from './input-card.js';
+import { isTaskReference, mountMCPTask } from './task-card.js';
 import './input-card.css';
 
 registerRenderer({
@@ -46,5 +47,41 @@ registerRenderer({
         const off = ['agent:switch', 'session:change', 'auth:change'].map(event => bus.on(event, clear));
         return () => { retired = true; clear(); button.removeEventListener('click', open);
             close.removeEventListener('click', clear); for (const unsubscribe of off) unsubscribe(); };
+    },
+});
+
+registerRenderer({
+    id: 'mcp-original-task', match: { contentType: 'mcp_task' },
+    render(data, context) {
+        if (!isTaskReference(data) || typeof context.isCurrentChat !== 'function') return '';
+        return '<div class="mcp-input-card"><button type="button" data-task-handle="' + data.handle
+            + '" value="' + data.reference + '">View Task</button><div class="mcp-task-content"></div></div>';
+    },
+    mount(root, context) {
+        const button = root.querySelector('[data-task-handle]'), content = root.querySelector('.mcp-task-content');
+        if (!button || !content) return;
+        let card;
+        function clear() { card?.dispose(); card = undefined; content.replaceChildren(); button.disabled = false; }
+        function open() {
+            if (card || !context.isCurrentChat()) return;
+            const current = mountMCPTask({ root: content,
+                task: { handle: button.dataset.taskHandle, reference: button.value },
+                basePath: '/api/mcp/task-results', sessionId: context.sessionId,
+                isCurrent: context.isCurrentChat,
+                request: (path, options) => API.requestForAgent(path, options, context.ownerAgent, true) });
+            card = current; button.disabled = true;
+            void current.completed.then(row => {
+                if (card !== current || !context.isCurrentChat() || !row?.result) return;
+                const result = content.ownerDocument.createElement('pre');
+                const text = (row.result.content ?? []).filter(part => part.type === 'text').map(part => part.text);
+                if (row.result.structuredContent !== undefined) {
+                    text.push(JSON.stringify(row.result.structuredContent, null, 2));
+                }
+                if (text.length) { result.textContent = text.join('\n'); content.append(result); }
+            });
+        }
+        button.addEventListener('click', open);
+        const off = ['agent:switch', 'session:change', 'auth:change'].map(event => bus.on(event, clear));
+        return () => { clear(); button.removeEventListener('click', open); for (const stop of off) stop(); };
     },
 });
