@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ._lifecycle import run_cleanup_steps
 from .connection import connection_lifecycle
+from .connector_catalog import ConnectorPreset
 from .oauth_acquisition import AuthorizationOperation
 from .oauth_credentials import OAuthConnectionCredential
 from .oauth_grants import OAuthGrantRejected, OAuthGrantStore, OAuthRefreshPending
@@ -33,11 +34,14 @@ class OAuthSettings(BaseModel):
     max_connections: int = Field(default=64, gt=0, le=1024)
     max_status_entries: int = Field(default=256, gt=0, le=10000)
     max_connections_per_principal: int = Field(default=8, gt=0, le=128)
+    connector_presets: list[ConnectorPreset] = Field(default_factory=list, max_length=32)
 
     @model_validator(mode='after')
     def bounded_principal(self):
         if self.max_connections_per_principal > self.max_connections:
             raise ValueError('OAuth principal connection quota exceeds the feature quota')
+        if len({(preset.name, preset.url) for preset in self.connector_presets}) != len(self.connector_presets):
+            raise ValueError('Connector preset names and endpoints must form unique pairs')
         return self
 
 

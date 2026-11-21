@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from functools import cache
 from importlib.resources import files
 import json
 import math
@@ -22,6 +23,18 @@ from kestrel_sdk.security.outbound import (
 
 class OfficialRegistryError(RuntimeError):
     """The selected registry could not supply valid discovery metadata."""
+
+
+@cache
+def _registry_components():
+    resource = files("kestrel_feature_mcp").joinpath("registry_openapi_2025_12_01.json")
+    with resource.open("r", encoding="utf-8") as stream:
+        return json.load(stream)["components"]
+
+
+@cache
+def registry_server_name_validator():
+    return Draft202012Validator(_registry_components()["schemas"]["ServerDetail"]["properties"]["name"])
 
 
 def _reject_json_constant(value: str) -> None:
@@ -176,10 +189,7 @@ class OfficialRegistryClient:
 
     def __init__(self, settings: RegistrySettings | None = None):
         self.settings = settings if settings is not None else RegistrySettings.from_environment()
-        resource = files("kestrel_feature_mcp").joinpath("registry_openapi_2025_12_01.json")
-        with resource.open("r", encoding="utf-8") as stream:
-            contract = json.load(stream)
-        self._components = contract["components"]
+        self._components = _registry_components()
         self._schemas = self._components["schemas"]
         self._validators = {
             component: Draft202012Validator({
@@ -187,10 +197,8 @@ class OfficialRegistryClient:
             })
             for component in ("ServerList", "ServerResponse")
         }
-        self._validators.update({
-            field: Draft202012Validator(self._schemas["ServerDetail"]["properties"][field])
-            for field in ("name", "version")
-        })
+        self._validators["name"] = registry_server_name_validator()
+        self._validators["version"] = Draft202012Validator(self._schemas["ServerDetail"]["properties"]["version"])
 
     def _validate(self, payload: Any, component: str) -> tuple[RegistryProblem, ...]:
         problems = []

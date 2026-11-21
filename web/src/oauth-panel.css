@@ -28,6 +28,11 @@
     color: var(--text-secondary);
 }
 .mcp-connectors-panel form > button { justify-self: start; }
+.mcp-connectors-panel .mcp-connector-search {
+    grid-template-columns: minmax(0, 25rem) max-content max-content;
+    align-items: end;
+}
+.mcp-connector-catalog { max-height: 26rem; overflow-y: auto; }
 .mcp-connector-card {
     margin-top: 1.25rem;
     padding: 1.25rem;
@@ -39,6 +44,8 @@
 .mcp-connector-card h3 { margin: 0 0 0.75rem; }
 .mcp-connector-card p { margin: 0.5rem 0; }
 .mcp-connector-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem; }
+.mcp-connector-card + button { margin-top: 1rem; }
 @media (max-width: 42rem) {
-    .mcp-connectors-panel form { grid-template-columns: minmax(0, 1fr); }
+    .mcp-connectors-panel form,
+    .mcp-connectors-panel .mcp-connector-search { grid-template-columns: minmax(0, 1fr); }
 }

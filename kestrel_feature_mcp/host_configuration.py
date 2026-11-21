@@ -95,9 +95,16 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
 
     @property
     def config_schema(self):
-        return {'type': 'object', 'additionalProperties': False, 'properties': {
+        properties = {
             'apps': AppsSettings.model_json_schema(), 'oauth': OAuthSettings.model_json_schema(),
-            'inputs': InputSettings.model_json_schema()}}
+            'inputs': InputSettings.model_json_schema(),
+        }
+        # Each nested Pydantic model generates document-relative references.
+        definitions = {}
+        for schema in properties.values():
+            definitions.update(schema.pop('$defs', {}))
+        return {'type': 'object', 'additionalProperties': False, 'properties': properties,
+                '$defs': definitions}
 
     async def get_config(self):
         return {'apps': self._apps_settings.model_dump(mode='json'),
@@ -204,6 +211,19 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
                 or self._oauth_maintenance is None or self._oauth_maintenance.done()):
             raise MCPFeatureClosingError('MCP OAuth maintenance owner is unavailable')
 
+    def _connector_catalog_host_check(self, request):
+        generation = self._lifecycle_generation
+        host = self._oauth_host
+
+        def check():
+            self._require_open(generation)
+            self._require_oauth_ready()
+            if self._oauth_host is not host:
+                raise MCPFeatureClosingError('Original MCP OAuth host has been replaced')
+            host._require_live(request)
+
+        return check
+
     async def _start_oauth(self):
         generation = self._lifecycle_generation
         def current():
@@ -257,6 +277,12 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
             if apps:
                 router.include_router(self.agent.create_mcp_apps_router(self, resolve_host=lambda: self._apps_host))
             if oauth:
+                from .connector_catalog import connector_catalog_router
+
+                router.include_router(connector_catalog_router(
+                    self._get_official_registry, lambda: self._oauth_settings.connector_presets,
+                    self._connector_catalog_host_check,
+                ))
                 router.include_router(self.agent.create_mcp_oauth_router(self, resolve_host=lambda: self._oauth_host))
             if inputs:
                 router.include_router(self.agent.create_mcp_input_router(self, resolve_host=lambda: self._input_host))

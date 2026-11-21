@@ -23,8 +23,44 @@ try {
         await page.getByRole('button', { name: 'Refresh connections', exact: true }).click();
     }
     await expect(page.getByRole('status')).toHaveText('No saved connectors for your account.');
-    await page.getByLabel('MCP server URL', { exact: true }).fill(configuration.server);
-    await page.getByLabel('Scopes', { exact: true }).fill('read');
+    const endpoint = page.getByLabel('MCP server URL', { exact: true });
+    const scopes = page.getByLabel('Scopes', { exact: true });
+    if (!configuration.mode) {
+        const choose = page.getByRole('article').filter({ hasText: 'Owned test connector' })
+            .getByRole('button', { name: 'Use connector' });
+        await choose.click();
+        await expect(endpoint).toHaveValue(configuration.server);
+        await expect(scopes).toHaveValue('read');
+        const search = page.getByRole('searchbox', { name: 'Find a connector' });
+        await search.fill(' owned ');
+        await page.getByRole('button', { name: 'Search MCP Registry' }).click();
+        await expect(page.getByText('MCP Registry results', { exact: true })).toBeVisible();
+        await choose.click();
+        await expect(scopes).toHaveValue('read');
+        await page.getByRole('button', { name: 'Next page' }).click();
+        await expect(page.getByRole('heading', { name: 'Second Registry connector' })).toBeVisible();
+        await search.fill('broken');
+        await page.getByRole('button', { name: 'Search MCP Registry' }).click();
+        await expect(page.getByText('Connector search is unavailable.', { exact: false })).toBeVisible();
+        await expect(page.getByRole('heading', { name: 'Second Registry connector' })).toHaveCount(0);
+        await endpoint.fill(configuration.server + '/other');
+        await scopes.fill('read');
+        await expect(page.getByRole('button', { name: 'Authorize connector' })).toBeEnabled();
+        await page.getByRole('button', { name: 'Clear search' }).click();
+        await choose.click();
+        await expect(endpoint).toHaveValue(configuration.server);
+        await expect(scopes).toHaveValue('read');
+        await expect(page.getByRole('button', { name: 'Authorize connector' })).toBeFocused();
+        expect(requests.filter(request => request.method === 'POST')).toHaveLength(0);
+        await endpoint.fill(configuration.server + '/other');
+        await expect(scopes).toHaveValue('');
+        await choose.click();
+        await expect(endpoint).toHaveValue(configuration.server);
+        await expect(scopes).toHaveValue('read');
+    } else {
+        await endpoint.fill(configuration.server);
+        await scopes.fill('read');
+    }
     await page.getByRole('button', { name: 'Authorize connector', exact: true }).click();
     await page.waitForURL(url => url.origin === origin && url.pathname === '/oauth/mcp/callback');
     if (configuration.mode === 'hosted-consent') {

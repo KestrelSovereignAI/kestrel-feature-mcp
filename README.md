@@ -238,6 +238,16 @@ discovery metadata: they do not install packages, connect to remote endpoints or
 send credentials. SSE definitions remain visible with an unsupported-transport
 label. These discovery tools work without Docker.
 
+In the Console, open **MCP connectors** to search the Registry and select an
+HTTPS endpoint. Host operators can supply quick-setup entries in the MCP feature
+setting <code>oauth.connector_presets</code>. Each entry takes a Registry
+<code>name</code>, a <code>title</code>, a <code>url</code>, the provider's
+<code>scopes</code> as a list, and an optional <code>description</code>. Quick
+setup fills the URL and scopes. Other Registry entries fill the URL and ask for
+the scopes from the provider's documentation. Choose **Authorize connector** to
+start consent, then **Connect** to make the tools available to the selected
+agent. The panel also accepts a custom server URL.
+
 Registry HTTPS requests use the SDK's canonical URL policy and pinned transport,
 with native TLS verification, no redirects and no proxy-environment routing.
 Private registry addresses, malformed page envelopes, failed pagination and
