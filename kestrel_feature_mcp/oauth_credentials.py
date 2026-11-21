@@ -8,7 +8,12 @@ import time
 
 import httpx2
 
-from .oauth_policy import GrantRejected, ResourceGrantRejected, positive_seconds, resource_lane
+from mcp_types import JSONRPCNotification, JSONRPCRequest
+
+from ._lifecycle import run_cleanup_steps
+from .oauth_grants import OAuthGrantChanged, OAuthRefreshPending
+from .oauth_policy import GrantRejected, ResourceGrantRejected, positive_seconds, resource_envelope, resource_lane
+from .tasks_protocol import GetTaskRequest, TaskIdParams
 from .oauth_refresh import OAuthRefresher
 
 
@@ -59,10 +64,35 @@ class OAuthConnectionCredential:
     async def _payload(self, check):
         self._open()
         check()
-        payload = await self.store.read_tokens(self.snapshot)
+        current = await self._current_grant(check)
+        if current.state == 'refreshing':
+            raise OAuthRefreshPending('The original OAuth refresh outcome is still pending')
+        payload = await self.store.read_tokens(current)
         check()
         self._open()
+        self.snapshot = replace(payload, tokens=None)
         return payload.tokens
+
+    async def _current_grant(self, check):
+        check()
+        current = await self.store.read(self.snapshot.binding)
+        check()
+        if (current is None or current.state not in {'active', 'refreshing'}
+                or current.authorization_identity != self.snapshot.authorization_identity):
+            raise OAuthGrantChanged('The original OAuth authorization changed')
+        return current
+
+    async def _retain_after_conflict(self, check):
+        try:
+            await self._current_grant(check)
+        except OAuthGrantChanged:
+            return False
+        return True
+
+    async def _retire_refresh(self):
+        if self._refresh is not None:
+            await self._refresh.retire()
+            self._refresh = None
 
     async def admit(self, *, force_refresh=False):
         # A foreign principal must not withdraw another principal's connection.
@@ -78,14 +108,22 @@ class OAuthConnectionCredential:
                 payload = await self._payload(self.lease.require_principal)
                 if force_refresh or payload.is_expired(time.time()):
                     async with self.lease.credential_operation() as check:
+                        if self._refresh is not None:
+                            raise GrantRejected('The original OAuth refresh still needs retirement')
                         self._refresh = OAuthRefresher(self.store, self.budgets, close_seconds=self.close_seconds)
-                        snapshot = await self._refresh.run(self.snapshot, check)
-                        await self._refresh.retire()
-                        self._refresh = None
+                        try:
+                            snapshot = await self._refresh.run(self.snapshot, check)
+                        except BaseException as error:
+                            await run_cleanup_steps([(True, self._retire_refresh)], failure=error)
+                            raise
+                        await self._retire_refresh()
                         self.snapshot = snapshot
                 self.lease.require_principal()
                 self._open()
                 admitted = True
+            except OAuthGrantChanged:
+                admitted = await self._retain_after_conflict(self.lease.require_principal)
+                raise
             finally:
                 if not admitted:
                     self.withdraw('reauthorization_required')
@@ -107,6 +145,9 @@ class OAuthConnectionCredential:
                     raise GrantRejected('OAuth credentials expired before dispatch; request not sent')
                 admitted = True
                 return payload.access_token
+            except OAuthGrantChanged:
+                admitted = await self._retain_after_conflict(check)
+                raise
             finally:
                 if not admitted:
                     self.withdraw('reauthorization_required')
@@ -116,9 +157,7 @@ class OAuthConnectionCredential:
 
     async def retire(self):
         self.withdraw('revoked')
-        if self._refresh is not None:
-            await self._refresh.retire()
-            self._refresh = None
+        await self._retire_refresh()
         self.retired = True
 
 
@@ -141,3 +180,77 @@ class GrantBearerAuth(httpx2.Auth):
         if response.is_redirect or response.status_code in {401, 403}:
             self.credential.withdraw('resource_rejected')
             raise ResourceGrantRejected('The resource rejected this authorization; do not replay the request')
+
+
+class TaskObservationAuth(httpx2.Auth):
+    """One Task read on an independently authorized native MCP connection."""
+
+    requires_request_body = True
+
+    def __init__(self, server_url, task_id, *, read_access_token, check_current):
+        self._server_url = server_url
+        self._read_access_token = read_access_token
+        self._check_current = check_current
+        self._task_id = task_id
+        original = self.request
+        self._method = original.method
+        self._params = original.params.model_dump(mode='json', by_alias=True, exclude_none=True)
+        self._spent = False
+        self._armed = False
+        self._rejected = False
+
+    @property
+    def request(self) -> GetTaskRequest:
+        return GetTaskRequest(params=TaskIdParams(task_id=self._task_id))
+
+    @property
+    def resource_rejected(self) -> bool:
+        return self._rejected
+
+    def sync_auth_flow(self, request):
+        raise GrantRejected('MCP Task observations require the asynchronous transport')
+
+    def require_resource(self) -> None:
+        """Retain a definite HTTP refusal across native SDK transport teardown."""
+        if self._rejected:
+            raise ResourceGrantRejected('The resource refused this MCP Task observation')
+
+    def arm(self):
+        self._check_current()
+        self.require_resource()
+        if self._armed or self._spent:
+            raise GrantRejected('The original MCP Task observation already owns its one read')
+        self._armed = True
+
+    def _authorize(self, envelope):
+        if envelope is None or isinstance(envelope, JSONRPCNotification):
+            return
+        if isinstance(envelope, JSONRPCRequest):
+            if (not self._armed and not self._spent
+                    and envelope.method in {'server/discover', 'initialize', 'tools/list'}):
+                return
+            params = {key: value for key, value in (envelope.params or {}).items() if key != '_meta'}
+            if self._armed and envelope.method == self._method and params == self._params:
+                # Reserve the only read before any credential or transport await.
+                self._armed, self._spent = False, True
+                return
+        raise GrantRejected('This MCP connection may only observe its original Task')
+
+    async def async_auth_flow(self, request):
+        self._check_current()
+        self.require_resource()
+        if request.headers.get('Authorization'):
+            raise GrantRejected('MCP Task credentials must come from the original observation owner')
+        envelope = await resource_envelope(request, self._server_url)
+        self._check_current()
+        self.require_resource()
+        self._authorize(envelope)
+        token = await self._read_access_token()
+        self._check_current()
+        self.require_resource()
+        request.headers['Authorization'] = 'Bearer ' + token
+        response = yield request
+        if response.is_redirect or response.status_code in {401, 403}:
+            self._rejected = True
+        self._check_current()
+        self.require_resource()

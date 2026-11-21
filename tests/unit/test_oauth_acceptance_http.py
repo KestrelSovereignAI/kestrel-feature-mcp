@@ -100,6 +100,8 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
 
     async def metadata(_request):
         state.requests.append(("GET", "/.well-known/oauth-authorization-server"))
+        if options.get('before_metadata') is not None:
+            await options['before_metadata']()
         if options.get("oversized") == "authorization":
             return StreamingResponse(held_body(b"X" * 65537), media_type=options.get('oversize_media_type', 'application/json'))
         document = {
@@ -150,7 +152,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
 
     def token_response(result):
         if options.get('token_error_status'):
-            return JSONResponse({'error': 'invalid_grant',
+            return JSONResponse({'error': options.get('token_error_code', 'invalid_grant'),
                 'error_description': 'owned-sensitive-AS-error-marker'}, status_code=options['token_error_status'])
         if options.get('stall_token'):
             return StreamingResponse(held_body(json.dumps(result).encode()), media_type='application/json')
@@ -178,6 +180,9 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             assert "authorization" not in request.headers
             if options.get("refresh_rotate"):
                 result["refresh_token"] = "native-fixture-rotated"
+            if options.get('refresh_receipt_fields'):
+                result.update(options['refresh_receipt_fields'])
+                return Response(json.dumps(result, ensure_ascii=True), media_type='application/json')
             return token_response(result)
         assert fields["grant_type"] == ["authorization_code"]
         assert fields["client_id"] == [state.client_id]

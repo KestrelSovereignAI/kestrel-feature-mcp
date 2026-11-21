@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import gzip
+import json
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -284,6 +285,13 @@ async def mcp_http_server(request, tmp_path, app_resource_html):
             return message
 
         async def write(message):
+            if settings.get("initialize_version") and b'"initialize"' in body:
+                if message["type"] == "http.response.start":
+                    return
+                if message["type"] == "http.response.body":
+                    result = json.loads(message["body"])
+                    result["result"]["protocolVersion"] = settings["initialize_version"]
+                    return await JSONResponse(result)(scope, receive, send)
             wire_mode = settings.get("resource_wire_mode")
             wire_method = settings.get("resource_wire_method", "resources/read")
             if wire_mode and ('"' + wire_method + '"').encode() in body:

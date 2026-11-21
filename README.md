@@ -520,20 +520,21 @@ surface reports that local NON_RESUMABLE disposition only from authenticated
 storage; it never fabricates a remote result or clears a post-send uncertainty.
 
 Local maintenance reconciles uncertain reservation acknowledgements and closes
-expired Input waits without polling or issuing remote Task commands. Unknown
-wire outcomes retain custody and cannot trigger automatic replay. Known native
-pre-execution rejections retain their actual error evidence. Owner retention is
-bounded, and completed dispatches release their hold after audit and publication.
+expired Input waits. Unknown wire outcomes retain custody and prevent automatic
+replay. Known pre-execution rejections preserve the native error evidence.
+Completed dispatches release their bounded owner hold after audit and publication.
 
-This composition is not public configuration: `set_config` still rejects
-`tasks`, and Core does not advertise `supports_mcp_task_host`. Observation,
-wait-provider/actions, pending Apps/final delivery and full native/browser
-acceptance remain required before activation. The published official MCP SDK
-must also preserve native retention semantics; its
-[TTL normalization defect](https://github.com/modelcontextprotocol/python-sdk/issues/3866)
-is not patched locally. Component and wire tests use isolated native Core,
-encrypted fixture grants and real SDK HTTPS peers; they do not claim vendor
-consent or a complete production deployment.
+The private observation path uses a separate SDK connection for a bounded
+`tasks/get` under the original OAuth authorization. Core rechecks that grant
+before storing a result and can publish status-only waits to the original chat.
+A stopped watch stays stopped.
+
+Public Task configuration stays disabled while governed update and cancel,
+private chat and App delivery, and native acceptance are completed. Activation
+also requires the published SDK fix for the
+[TTL normalization defect](https://github.com/modelcontextprotocol/python-sdk/issues/3866).
+Current tests use isolated Core instances, encrypted fixture grants and native
+SDK HTTPS peers.
 
 ## Optional MCP Apps host
 
@@ -589,7 +590,7 @@ An unfinished close retains its original owner and is retried before re-enable.
 Version 0.8.0 introduced the native components described below; 0.9.0 added
 completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
-Version 0.20 uses Core 0.66.7 or newer and SDK 0.52.1 or newer for native
+Version 0.21 uses Core 0.66.8 or newer and SDK 0.55.0 or newer for native
 Apps, OAuth and durable tool outcome contracts. `uv sync --locked --extra test`
 installs the same host profile and runtime dependencies from the public package index.
 Initial publication and result associations are detailed below.

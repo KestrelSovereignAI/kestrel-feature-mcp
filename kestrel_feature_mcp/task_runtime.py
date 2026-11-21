@@ -5,20 +5,34 @@ It shares the confirmed tool batch and original-method Input runtime; there
 is no alternative tool registry, response route or MCP wire adapter.
 """
 
+from functools import partial
+import logging
+
 from mcp import types
-from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, ResourceUnsupported, observed_outcome_unknown
+from mcp.shared.exceptions import MCPError
+from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceOutcomeUnknown, ResourceUnsupported, observed_outcome_unknown
+from kestrel_sdk.security.exceptions import SSRFError
 from pydantic import BaseModel, ConfigDict, Field
 
-from .connection import BoundMCPCaller, _rejected_before_execution
+from ._lifecycle import MCPFeatureClosingError, run_cleanup_steps
+from .connection import (
+    MCP_CONNECTION_ERRORS, BoundMCPCaller, MCPConnection, connection_lifecycle, _rejected_before_execution,
+)
 from .input_requests import MCPInputSuspension
+from .oauth_credentials import TaskObservationAuth
+from .oauth_policy import GrantRejected, TaskObservationBlocked
 from .tasks_protocol import CreateTaskResult, TasksExtension
 from .tool_contract import capture_tool_contract
+
+
+logger = logging.getLogger(__name__)
 
 
 class TaskSettings(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True, frozen=True, allow_inf_nan=False)
     host: dict = Field(default_factory=dict)
     maintenance_seconds: float = Field(default=1.0, gt=0, le=60)
+    observe: bool = False
 
 
 class MCPTaskRuntime:
@@ -27,6 +41,8 @@ class MCPTaskRuntime:
             raise TypeError('Native Tasks require the same original-method Input runtime')
         self.feature, self.host, self.input_runtime = feature, host, input_runtime
         self._registrations = {}
+        self._observations = {}
+        self._observation_lifecycle = {}
 
     def register(self, owner, registered):
         self._registrations[owner] = tuple(registered)
@@ -53,12 +69,102 @@ class MCPTaskRuntime:
             return None
         registered = self._registered(tool)
         await caller.admit()
+        lease = caller.authorization_lease
+        if lease.connection_id != caller.name:
+            raise ResourceConflict('Original Task connection does not match its OAuth lease')
         identity = caller.authorization_identity
         registered.binding.require_current()
         contract = capture_tool_contract(tool.native_tool, connection_name=caller.name,
             url=caller.connection.url, protocol=caller.connection.protocol_version)
-        return await self.host.admit(registered.binding, connection_name=caller.name,
+        return await self.host.admit(registered.binding, authorization_lease=lease,
             authorization_id=identity, contract=contract.canonical_json)
+
+    async def maintain(self, *, observe):
+        for handle in await self.host.maintain(observe=observe):
+            try:
+                await self.observe(handle, scheduled=True)
+            except* (ResourceError, MCPFeatureClosingError, GrantRejected, SSRFError,
+                    *MCP_CONNECTION_ERRORS) as error:
+                logger.debug('MCP Task observation did not finish (%s)', type(error).__name__)
+
+    async def observe(self, handle, *, scheduled=False):
+        """Read and retain one native Task result on a dedicated connection."""
+        self.feature._require_oauth_ready()
+        oauth = self.feature._oauth_runtime
+        async with oauth.host.borrow_task_observation(self.host, handle, scheduled=scheduled) as lease:
+            async with lease.operation() as check:
+                if scheduled and lease.expired():
+                    return await lease.block('remote_expired')
+                policy = lease.policy
+                if handle in self._observations or len(self._observations) >= policy.max_operations:
+                    raise ResourceConflict('Original MCP Task observation transports still need retirement')
+                self._observations[handle] = None
+                try:
+                    try:
+                        endpoint, contract, token, current_grant = await oauth.task_observation_binding(lease, check)
+                    except TaskObservationBlocked as blocked:
+                        await lease.block(blocked.reason)
+                        raise
+                    auth = TaskObservationAuth(endpoint.url, lease.remote_task_id,
+                        read_access_token=token, check_current=check)
+                    connection = MCPConnection(endpoint, auth=auth, extensions=[self.extension()],
+                        connect_timeout=policy.network_seconds, call_timeout=policy.network_seconds,
+                        close_timeout=oauth.settings.close_seconds)
+                    self._observations[handle] = connection
+                finally:
+                    if self._observations[handle] is None:
+                        del self._observations[handle]
+                close = partial(self._retire_observation, handle, connection)
+                try:
+                    await connection.connect()
+                    check()
+                    if connection.protocol_version != contract.connection[2]:
+                        raise ResourceConflict('Original MCP Task revision was not negotiated')
+                    auth.arm()
+                    try:
+                        result = await connection.request_task(auth.request,
+                            incarnation=connection.incarnation, round_check=check)
+                    except MCPError as error:
+                        if error.code == types.INVALID_PARAMS:
+                            await lease.block('remote_unavailable')
+                        raise
+                    await current_grant()
+                    withheld = ('contract_drift' if result.status == 'completed'
+                        and not contract.completion_conforms(result.result) else None)
+                    retained = await lease.record(
+                        result.model_dump(mode='json', by_alias=True, exclude_unset=True), withheld=withheld)
+                except BaseException as error:
+                    steps = [(True, close)]
+                    if auth.resource_rejected and isinstance(error, Exception):
+                        steps.append((True, partial(lease.block, 'resource_rejected')))
+                    if isinstance(error, TaskObservationBlocked):
+                        steps.append((True, partial(lease.block, error.reason)))
+                    await run_cleanup_steps(steps, failure=error)
+                    raise
+                await close()
+                check()
+                return retained
+
+    @property
+    def has_observation_owners(self):
+        return bool(self._observations)
+
+    async def _retire_observation(self, handle, connection):
+        async with connection_lifecycle(self._observation_lifecycle, handle):
+            if self._observations.get(handle) is not connection:
+                return
+            try:
+                await connection.close()
+            finally:
+                if not connection.owns_transport:
+                    del self._observations[handle]
+
+    async def close_observations(self):
+        await run_cleanup_steps([
+            (True, partial(self._retire_observation, handle, connection))
+            for handle, connection in tuple(self._observations.items())
+            if connection is not None
+        ])
 
     def authority(self, round, caller, original_check):
         identity = round.authorization_identity

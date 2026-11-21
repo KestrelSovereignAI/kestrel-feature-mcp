@@ -57,6 +57,14 @@ class MCPCallOutcomeUnknownError(ResourceOutcomeUnknown):
     """A call returned no valid result; its external effects are unconfirmed."""
 
 
+class MCPPeerNegotiationError(RuntimeError, ResourceError):
+    """The native SDK rejected the peer's protocol revision."""
+
+
+class MCPToolCatalogError(MCPToolContractError, ResourceError):
+    """A connected peer returned an unusable tool catalog."""
+
+
 def _task_request_snapshot(request: GetTaskRequest | UpdateTaskRequest | CancelTaskRequest):
     """Validate and detach a closed native request before credential admission."""
     if type(request) not in (GetTaskRequest, UpdateTaskRequest, CancelTaskRequest):
@@ -125,6 +133,7 @@ class BoundMCPCaller:
     _admit: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
     _continuation_check: Callable[[], None] | None = field(default=None, repr=False)
     _authorization_identity: Callable[[], str] | None = field(default=None, repr=False)
+    _authorization_lease: object | None = field(default=None, repr=False)
 
     @property
     def is_current(self) -> bool:
@@ -152,6 +161,13 @@ class BoundMCPCaller:
         identity = self._authorization_identity()
         self.require_current()
         return identity
+
+    @property
+    def authorization_lease(self):
+        self.require_current()
+        if self._authorization_lease is None:
+            raise ResourceUnsupported('MCP Tasks require their original OAuth connection lease')
+        return self._authorization_lease
 
     def _require_round(self, require_authority):
         self.require_current()
@@ -198,7 +214,8 @@ class BoundMCPCaller:
 
 
 def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, tool_names=None,
-                     admit=None, continuation_check=None, authorization_identity=None):
+                     admit=None, continuation_check=None, authorization_identity=None,
+                     authorization_lease=None):
     """Bind the advertised connection, never a later replacement's transport."""
     incarnation = connection.incarnation
     if incarnation is None:
@@ -210,6 +227,7 @@ def bind_tool_caller(connection, is_current: Callable[[], bool], name: str, *, t
         _admit=admit,
         _continuation_check=continuation_check,
         _authorization_identity=authorization_identity,
+        _authorization_lease=authorization_lease,
     )
 
 
@@ -323,6 +341,11 @@ class MCPConnection:
         )
 
     @property
+    def owns_transport(self) -> bool:
+        """Whether this connection still retains its original transport task."""
+        return self._task is not None
+
+    @property
     def protocol_version(self) -> str | None:
         """The published revision selected by the SDK's standard negotiation."""
         return self._client.protocol_version if self.is_connected else None
@@ -380,7 +403,7 @@ class MCPConnection:
                 # at construction. Later metadata changes cannot revoke its ad.
                 tasks_registered = any(extension.identifier == TASKS_EXTENSION_ID
                     for extension in self._extensions)
-                client = await resources.enter_async_context(Client(
+                client_context = Client(
                     transport,
                     cache=None,
                     extensions=self._extensions,
@@ -388,7 +411,21 @@ class MCPConnection:
                     # The host owns state-only rounds and authority checks.
                     # Operator inputs require a separate governed surface.
                     input_required_max_rounds=0,
-                ))
+                )
+                try:
+                    client = await resources.enter_async_context(client_context)
+                except* RuntimeError as errors:
+                    # The SDK currently reports these negotiation verdicts
+                    # as plain RuntimeError. Preserve other runtime failures.
+                    _, unexpected = errors.split(lambda error: type(error) is RuntimeError
+                        and len(error.args) == 1 and isinstance(error.args[0], str)
+                        and error.args[0].startswith((
+                            "Unsupported protocol version from the server: ",
+                            "No mutually supported modern protocol version (server: ",
+                        )))
+                    if unexpected is not None:
+                        raise
+                    raise MCPPeerNegotiationError("MCP peer offered an unsupported protocol revision") from None
                 self._task_extension_registered = tasks_registered
                 self._client = client
                 if self._ready is not None and not self._ready.done():
@@ -447,11 +484,14 @@ class MCPConnection:
                 result = await self._require_client().list_tools(cursor=cursor)
                 next_cursor = result.next_cursor
                 if next_cursor is not None and next_cursor in seen:
-                    raise ValueError("MCP server repeated its tools/list cursor")
+                    raise MCPToolCatalogError("MCP server repeated its tools/list cursor")
                 for tool in result.tools:
-                    validate_tool_contract(tool)
+                    try:
+                        validate_tool_contract(tool)
+                    except MCPToolContractError as error:
+                        raise MCPToolCatalogError(str(error)) from error
                     if tool.name in seen_names:
-                        raise MCPToolContractError(f"Duplicate MCP tool name {tool.name!r} in catalog")
+                        raise MCPToolCatalogError(f"Duplicate MCP tool name {tool.name!r} in catalog")
                     seen_names.add(tool.name)
                 tools.extend(result.tools)
                 cursor = next_cursor

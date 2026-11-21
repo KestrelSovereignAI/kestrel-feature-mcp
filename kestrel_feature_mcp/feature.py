@@ -185,12 +185,13 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
         owner_did = require_owner_did(self.agent.agent_id)
         async with self._lifecycle_transition:
             if (not self._closing and any(task is not None and task.done()
-                    for task in (self._apps_maintenance, self._oauth_maintenance))):
+                    for task in (self._apps_maintenance, self._oauth_maintenance, self._task_maintenance))):
                 self._closing = True
                 self._lifecycle_generation += 1
             if self._closing:
                 # A soft disable retains this instance. Finish failed cleanup
                 # before reopening; live initialization retains its resources.
+                self._withdraw_tasks()
                 await self._shutdown_connections()
                 async with self._docker_initialization:
                     self.manager = None
@@ -598,6 +599,7 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
                     admit=None if credential is None else credential.admit,
                     continuation_check=None if credential is None else credential.lease.require_principal,
                     authorization_identity=None if credential is None else lambda: credential.authorization_identity,
+                    authorization_lease=None if credential is None else credential.lease,
                 )
                 mounted = self._mount_tools(
                     owner, f"remote_{name[-12:]}", record.tool_descriptions(), caller,
@@ -1525,6 +1527,7 @@ class MCPAgent(MCPHostFeatureMixin, Feature):
         """Attempt every owned cleanup, then propagate any cleanup failure."""
         self._closing = True
         self._lifecycle_generation += 1
+        self._withdraw_tasks()
         if self._apps_host is not None:
             self._apps_host.withdraw_private_data()
         if self._oauth_host is not None:

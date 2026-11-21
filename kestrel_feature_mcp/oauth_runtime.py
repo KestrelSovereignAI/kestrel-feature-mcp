@@ -7,18 +7,22 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
+import time
 
 from kestrel_sdk.operator import OperatorAuthorizationError
 from kestrel_sdk.resources import ResourceConflict
+from kestrel_sdk.security.outbound import assert_safe_url
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ._lifecycle import run_cleanup_steps
 from .connection import connection_lifecycle
 from .oauth_acquisition import AuthorizationOperation
 from .oauth_credentials import OAuthConnectionCredential
-from .oauth_grants import OAuthGrantStore
-from .oauth_policy import ClientIdentity, GrantRejected
+from .oauth_grants import OAuthGrantRejected, OAuthGrantStore, OAuthRefreshPending
+from .oauth_policy import ClientIdentity, GrantRejected, TaskObservationBlocked
+from .oauth_refresh import OAuthRefresher
 from .remote import remote_name_for_url, remote_owner
+from .tool_contract import MCPToolContractSnapshot
 
 
 class OAuthSettings(BaseModel):
@@ -73,6 +77,88 @@ class OAuthRuntime:
 
     def _name(self, server_url, principal_id):
         return remote_name_for_url(server_url, self.feature._connection_owner_did(), principal_id=principal_id)
+
+    async def task_observation_binding(self, lease, check):
+        """Open the grant selected by authenticated Task custody."""
+        self._require_open()
+        check()
+        locator, policy = lease.authorization, lease.policy
+        contract = MCPToolContractSnapshot(lease.contract)
+        connection, original_url, _ = contract.connection
+        store = self._store(policy.model_dump(mode='json'))
+
+        async def require_current_grant():
+            self._require_open()
+            check()
+            try:
+                current = await store.read_slot(locator.principal_digest, locator.connection_name)
+            except OAuthGrantRejected:
+                raise TaskObservationBlocked('credential_unavailable',
+                    'The original MCP Task OAuth authorization is invalid') from None
+            check()
+            if current is None or current.generation is None:
+                raise TaskObservationBlocked('credential_unavailable', 'The original MCP Task OAuth authorization is unavailable')
+            if (current.binding.slot_id != locator.slot_id
+                    or current.authorization_identity != lease.authorization_id):
+                raise TaskObservationBlocked('authorization_changed', 'The original MCP Task OAuth authorization changed')
+            if current.state == 'refreshing':
+                raise OAuthRefreshPending('The original MCP Task refresh outcome is still pending')
+            if current.state != 'active':
+                reason = 'authorization_revoked' if current.state == 'revoked' else 'credential_unavailable'
+                raise TaskObservationBlocked(reason, 'The original MCP Task OAuth authorization is unavailable')
+            return current
+
+        async def read_original_tokens(snapshot):
+            try:
+                payload = await store.read_tokens(snapshot)
+            except OAuthGrantRejected:
+                raise TaskObservationBlocked('credential_unavailable',
+                    'The original MCP Task OAuth tokens are invalid') from None
+            check()
+            return payload.tokens
+
+        snapshot = await require_current_grant()
+        binding = snapshot.binding
+        if (binding.server_url != original_url or connection != locator.connection_name
+                or self._name(binding.server_url, locator.principal_digest) != connection
+                or remote_owner(connection) != locator.owner or binding.client_id != policy.client_id
+                or binding.redirect_uri != policy.redirect_uri):
+            raise TaskObservationBlocked('authorization_changed', 'The original MCP Task OAuth resource identity changed')
+
+        original = await read_original_tokens(snapshot)
+        needs_refresh = original.is_expired(time.time())
+        if needs_refresh and lease.remaining_seconds() <= 3 * policy.network_seconds + self.settings.close_seconds:
+            raise ResourceConflict('MCP Task refresh has insufficient time for discovery and exchange')
+        await lease.pace()
+        if needs_refresh:
+            refresh = OAuthRefresher(store, policy.model_dump(mode='json'),
+                close_seconds=self.settings.close_seconds, remaining_seconds=lease.remaining_seconds)
+            try:
+                await refresh.run(snapshot, check)
+            except GrantRejected as error:
+                await refresh.retire()
+                try:
+                    await require_current_grant()
+                except (TaskObservationBlocked, OAuthRefreshPending) as current:
+                    raise current from error
+                raise TaskObservationBlocked('credential_unavailable', 'The original MCP Task refresh failed') from error
+            except BaseException as error:
+                await run_cleanup_steps([(True, refresh.retire)], failure=error)
+                raise
+            await refresh.retire()
+            check()
+
+        async def read_access_token():
+            tokens = await read_original_tokens(await require_current_grant())
+            if tokens.is_expired(time.time()):
+                raise GrantRejected('The original MCP Task access token has expired')
+            return tokens.access_token
+
+        endpoint = await assert_safe_url(binding.server_url, allowed_schemes=('https',))
+        check()
+        if endpoint.url != binding.server_url:
+            raise GrantRejected('The original MCP Task OAuth resource URL changed')
+        return endpoint, contract, read_access_token, require_current_grant
 
     async def begin(self, context, check, value, identity, *, authorization_handle):
         self._require_open()

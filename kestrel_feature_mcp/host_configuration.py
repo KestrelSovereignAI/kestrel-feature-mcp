@@ -7,6 +7,7 @@ import contextvars
 from copy import deepcopy
 from pathlib import Path
 
+from kestrel_sdk.features.contributions import WaitProviderRegistration
 from kestrel_sdk.features.ui import UIContributions
 from kestrel_sdk.resources import ResourceConflict
 
@@ -28,6 +29,14 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
         self._input_settings = InputSettings()
         self._input_host = self._input_runtime = None
         self._task_host = self._task_runtime = self._task_maintenance = None
+        create_wait_provider = getattr(self.agent, 'create_mcp_task_wait_provider', None)
+        self._task_wait = (create_wait_provider(self)
+            if callable(create_wait_provider) else None)
+
+    def get_wait_provider_registrations(self):
+        if self._task_wait is None:
+            return ()
+        return (WaitProviderRegistration(self.contribution_owner, self._task_wait.kind, self._task_wait),)
 
     async def _start_tasks(self, settings):
         """Private composition; public Tasks configuration remains unavailable."""
@@ -45,12 +54,13 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
         self._task_host = host
         try:
             await host.initialize()
-            self._task_runtime = MCPTaskRuntime(self, host, self._input_runtime)
+            runtime = MCPTaskRuntime(self, host, self._input_runtime)
+            self._task_runtime = runtime
             async def maintain():
                 try:
                     while True:
                         await asyncio.sleep(settings.maintenance_seconds)
-                        await host.maintain()
+                        await runtime.maintain(observe=settings.observe)
                 finally:
                     host.withdraw()
             self._task_maintenance = asyncio.create_task(maintain(), context=contextvars.Context(),
@@ -59,19 +69,28 @@ class MCPHostFeatureMixin(MCPAppsFeatureMixin):
             await run_cleanup_steps([(True, self._close_tasks)], failure=error)
             raise
 
+    def _withdraw_tasks(self):
+        host = self._task_host
+        maintenance = self._task_maintenance
+        if host is not None:
+            host.withdraw()
+        if maintenance is not None and not maintenance.done() and not maintenance.cancelling():
+            maintenance.cancel()
+
     async def _close_tasks(self):
         host = self._task_host
         if host is None:
             return
+        runtime = self._task_runtime
         maintenance = self._task_maintenance
-        host.withdraw()
-        if maintenance is not None and not maintenance.done():
-            maintenance.cancel()
+        self._withdraw_tasks()
         try:
             await run_cleanup_steps([(True, lambda: join_maintenance(maintenance, 'MCP Task')),
+                (runtime is not None, lambda: runtime.close_observations()),
                 (True, host.close)])
         finally:
-            if host.retired and (maintenance is None or maintenance.done()):
+            if (host.retired and (maintenance is None or maintenance.done())
+                    and (runtime is None or not runtime.has_observation_owners)):
                 self._task_host = self._task_runtime = self._task_maintenance = None
 
     @property

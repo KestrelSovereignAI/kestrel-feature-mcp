@@ -13,8 +13,10 @@ from mcp.server.extension import Extension, MethodBinding
 from pydantic import TypeAdapter, ValidationError
 
 from kestrel_feature_mcp.input_requests import plan_mcp_inputs, validate_form_responses
-from kestrel_feature_mcp.connection import MCPConnection, MCPCallOutcomeUnknownError, bind_tool_caller
+from kestrel_feature_mcp.connection import MCPConnection, MCPCallOutcomeUnknownError, MCP_REQUEST_ERRORS, bind_tool_caller
 from kestrel_feature_mcp.input_requests import MCPInputResume, MCPInputSuspension
+from kestrel_feature_mcp.oauth_credentials import TaskObservationAuth
+from kestrel_feature_mcp.oauth_policy import GrantRejected, ResourceGrantRejected
 from kestrel_sdk.resources import ResourceConflict, ResourceUnsupported
 from mcp.shared.exceptions import MCPError
 
@@ -42,6 +44,7 @@ class NativeTasksPeer(Extension):
         self.status = "working"
         self.task_id = "opaque/task:1"
         self.ttl_ms = 60000
+        self.poll_interval_ms = 100
         self.before_response = None
         self.require_input = False
         self.reject_code = None
@@ -56,7 +59,7 @@ class NativeTasksPeer(Extension):
         return {"resultType": "complete", "taskId": self.task_id,
             "status": self.status, "createdAt": "2026-11-04T00:00:00Z",
             "lastUpdatedAt": "2026-11-04T00:00:01Z", "ttlMs": self.ttl_ms,
-            "pollIntervalMs": 100}
+            "pollIntervalMs": self.poll_interval_ms}
 
     async def intercept_tool_call(self, params, ctx, call_next):
         if params.name != "echo":
@@ -146,6 +149,166 @@ class IndependentTasksExtension(ClientExtension):
 
     def claims(self):
         return TasksExtension(no_implicit_resolution).claims()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"extensions": [NativeTasksPeer()]}], indirect=True)
+async def test_task_observation_auth_has_one_original_sdk_read(mcp_http_server):
+    peer = mcp_http_server.settings["extensions"][0]
+    fetched = []
+
+    async def access_token():
+        fetched.append(True)
+        return "synthetic-observation"
+
+    auth = TaskObservationAuth(mcp_http_server.url, peer.task_id,
+        read_access_token=access_token, check_current=lambda: None)
+    connection = MCPConnection(mcp_http_server.url, auth=auth,
+        extensions=[TasksExtension(no_implicit_resolution)])
+    try:
+        assert "echo" in {tool.name for tool in await connection.connect()}
+        async with httpx2.AsyncClient(auth=auth, trust_env=False) as direct:
+            before = len(fetched), len(mcp_http_server.requests)
+            with pytest.raises(GrantRejected, match="cannot leave the selected resource"):
+                await direct.get(mcp_http_server.url + "/other")
+            assert (len(fetched), len(mcp_http_server.requests)) == before
+            for message in (
+                {"method": "tasks/get", "params": {"taskId": peer.task_id}},
+                {"method": "tools/call", "params": {"name": "echo", "arguments": {"text": "refused"}}},
+                {"result": {}},
+            ):
+                before = len(fetched), len(mcp_http_server.requests)
+                with pytest.raises(GrantRejected, match="only observe its original Task"):
+                    await direct.post(mcp_http_server.url, json={"jsonrpc": "2.0", "id": 5, **message})
+                assert (len(fetched), len(mcp_http_server.requests)) == before
+            auth.arm()
+            before = len(fetched), len(mcp_http_server.requests)
+            with pytest.raises(GrantRejected, match="unique JSON object fields"):
+                await direct.post(mcp_http_server.url, content=(
+                    b'{"jsonrpc":"2.0","id":8,"method":"tasks/get","params":{"taskId":"owned","taskId":"owned"}}'))
+            assert (len(fetched), len(mcp_http_server.requests)) == before
+            foreign = auth.request
+            foreign.params.task_id = "another-task"
+            for message in (
+                foreign.model_dump(mode="json", by_alias=True, exclude_none=True),
+                {"method": "tasks/cancel", "params": {"taskId": peer.task_id}},
+                {"method": "tasks/update", "params": {"taskId": peer.task_id, "inputResponses": {}}},
+                {"method": "tasks/get", "params": {"taskId": peer.task_id, "unexpected": "field"}},
+            ):
+                before = len(fetched), len(mcp_http_server.requests)
+                with pytest.raises(GrantRejected, match="only observe its original Task"):
+                    await direct.post(mcp_http_server.url, json={"jsonrpc": "2.0", "id": 7, **message})
+                assert (len(fetched), len(mcp_http_server.requests)) == before
+
+            observed = await connection.request_task(auth.request, incarnation=connection.incarnation,
+                round_check=lambda: None)
+            assert observed.task_id == peer.task_id and observed.status == "working"
+            request, = [(scope, json.loads(body)) for scope, body in mcp_http_server.requests
+                if body and json.loads(body).get("method") == "tasks/get"]
+            scope, message = request
+            assert dict(scope["headers"])[b"authorization"] == b"Bearer synthetic-observation"
+            assert message["params"]["taskId"] == peer.task_id
+            capabilities = message["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+            assert set(capabilities["extensions"]) == {TasksExtension.identifier}
+            assert not capabilities.get("elicitation")
+            with pytest.raises(GrantRejected, match="one read"):
+                auth.arm()
+            before = len(fetched), len(mcp_http_server.requests)
+            with pytest.raises(GrantRejected, match="only observe its original Task"):
+                await direct.post(mcp_http_server.url, json=message)
+            assert (len(fetched), len(mcp_http_server.requests)) == before
+    finally:
+        await connection.close()
+    assert peer.calls == ["get"] and not mcp_http_server.witness
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"extensions": [NativeTasksPeer()]}], indirect=True)
+async def test_concurrent_task_reads_cannot_share_one_observation_borrow(mcp_http_server):
+    peer = mcp_http_server.settings["extensions"][0]
+    entered, release = asyncio.Event(), asyncio.Event()
+    hold_token = False
+
+    async def access_token():
+        if hold_token:
+            entered.set()
+            await release.wait()
+        return "synthetic-observation"
+
+    auth = TaskObservationAuth(mcp_http_server.url, peer.task_id,
+        read_access_token=access_token, check_current=lambda: None)
+    connection = MCPConnection(mcp_http_server.url, auth=auth,
+        extensions=[TasksExtension(no_implicit_resolution)])
+    try:
+        await connection.connect()
+        auth.arm()
+        hold_token = True
+        before = len(mcp_http_server.requests)
+        first = asyncio.create_task(connection.request_task(auth.request,
+            incarnation=connection.incarnation, round_check=lambda: None))
+        async with httpx2.AsyncClient(auth=auth, trust_env=False) as client:
+            try:
+                async with asyncio.timeout(5):
+                    await entered.wait()
+                message = {"jsonrpc": "2.0", "id": 16,
+                    **auth.request.model_dump(mode="json", by_alias=True, exclude_none=True)}
+                with pytest.raises(GrantRejected, match="only observe its original Task"):
+                    await client.post(mcp_http_server.url, json=message)
+                assert len(mcp_http_server.requests) == before
+            finally:
+                release.set()
+                observed = await first
+        assert observed.task_id == peer.task_id and observed.status == "working"
+    finally:
+        await connection.close()
+    assert peer.calls == ["get"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [307, 401, 403])
+@pytest.mark.parametrize("mcp_http_server", [{"extensions": [NativeTasksPeer()]}], indirect=True)
+async def test_task_resource_rejection_fences_only_its_observation_auth(mcp_http_server, status):
+    peer = mcp_http_server.settings["extensions"][0]
+    fetched = []
+
+    async def access_token():
+        fetched.append(True)
+        return "synthetic-observation"
+
+    auth = TaskObservationAuth(mcp_http_server.url, peer.task_id,
+        read_access_token=access_token, check_current=lambda: None)
+    connection = MCPConnection(mcp_http_server.url, auth=auth,
+        extensions=[TasksExtension(no_implicit_resolution)], call_timeout=2)
+    try:
+        await connection.connect()
+        transport = connection._task
+        auth.arm()
+        mcp_http_server.settings["http_status"] = status
+        sent_before = len(mcp_http_server.requests)
+        with pytest.raises((*MCP_REQUEST_ERRORS, ExceptionGroup)):
+            await connection.request_task(auth.request, incarnation=connection.incarnation,
+                round_check=lambda: None)
+        assert len(mcp_http_server.requests) == sent_before + 1
+        assert peer.calls == []
+        with pytest.raises(ResourceGrantRejected):
+            auth.require_resource()
+        with pytest.raises(ResourceGrantRejected):
+            auth.arm()
+        before = len(fetched), len(mcp_http_server.requests)
+        async with httpx2.AsyncClient(auth=auth, trust_env=False) as client:
+            with pytest.raises(ResourceGrantRejected):
+                await client.get(mcp_http_server.url)
+        assert (len(fetched), len(mcp_http_server.requests)) == before
+    finally:
+        try:
+            await connection.close()
+        except* ResourceGrantRejected:
+            pass
+    assert connection._task is None and transport.done()
+    failure = transport.exception()
+    assert isinstance(failure, ExceptionGroup)
+    refused, unexpected = failure.split(ResourceGrantRejected)
+    assert refused is not None and unexpected is None
 
 
 @pytest.mark.asyncio

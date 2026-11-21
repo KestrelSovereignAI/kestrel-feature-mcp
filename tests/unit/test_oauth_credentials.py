@@ -128,7 +128,8 @@ async def credential_boundary(oauth_peers, tmp_path, monkeypatch, owned_oauth_ke
                     caller = bind_tool_caller(connection, lambda: connection.is_connected,
                         binding.connection_id, tool_names=[tool.name for tool in tools], admit=credential.admit,
                         continuation_check=credential.lease.require_principal,
-                        authorization_identity=lambda: credential.authorization_identity)
+                        authorization_identity=lambda: credential.authorization_identity,
+                        authorization_lease=credential.lease)
                     feature._mount_tools('mcp:credential', 'owned_credential',
                         [tool.model_dump(mode='json', by_alias=True) for tool in tools], caller)
                     handle = next(name for name in agent._tool_to_feature

@@ -157,6 +157,16 @@ def test_peer_schema_cannot_trigger_network_resolution_or_echo_private_content(s
     assert '11434' not in str(caught.value) and 'private answer' not in str(caught.value)
 
 
+def test_form_refuses_a_validator_failure_without_disclosing_the_answer():
+    request = form()
+    request['params']['requestedSchema']['properties']['city']['format'] = 'regex'
+    plan = plan_mcp_inputs(checkpoint({'form': request}).input_requests, allow_blocking=True)
+    with pytest.raises(ValueError, match='original schema') as caught:
+        validate_form_responses(plan, {'form': {'action': 'accept',
+            'content': {'city': 'private-answer{4294967295}'}}})
+    assert 'private-answer' not in str(caught.value)
+
+
 @pytest.mark.parametrize('requests', [
     {'private-key': None},
     {'private-key': {'method': 'invented/private', 'private': 'private-input-secret'}},
