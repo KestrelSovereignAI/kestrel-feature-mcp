@@ -18,12 +18,12 @@
     "package-lock.json": "86ab8c6bb16dc9c4d445ef3e6e0bc32c38409053475381e0f3bb4b81b121f478",
     "package.json": "5e09ea1a34316cd25005db422ebb0b2e11ccec6029f37dc99f56658fd5ba664b",
     "src/input-card.js": "19621900c4a435aee7feb9898f3bf06d2b39d42a6edbdfeb6a8182be4d7b16fc",
-    "src/input-entry.js": "5d22f9cca6f48739c21dd501e90f8da4eadc7b382faee0ac0c8b5ec3dc791765",
+    "src/input-entry.js": "ca6916da80ef23a8c185e5c6f0b435397c7e792e837b0ba1f68f8ea8d93db949",
     "src/oauth-panel.css": "f927cdfefa34ff25d936603370e04d99cc019357949dd5600befbee450d692c5",
     "src/oauth-panel.js": "24dec056217773a985e413b95602394239eb04e0c37296ec9d95d39eac1442f8",
     "src/origin-transport.js": "7df4d94e870edd9a73ba34f5ce0773e07709aa6809a4111c6534eccb7f459689",
     "src/parent-entry.js": "99baa8d1679c944d345915893db6993da9186265d6a4841c7cde73fa4a89bee6",
-    "src/parent-view.js": "85308e947cc6c3d0d39f8b735a8ec0627ef2ae7bcd4af093be5c2feb8420605e",
+    "src/parent-view.js": "8d4162705cc980266ee0fd5ff4621a76919446dd4bba6bce698748fa5d7549ae",
     "src/sandbox-assets.js": "1fdcbb42c664d237302ac1db36ec260c0163ee88a17e8affa94f99a86d87d380",
     "src/sandbox-cli.js": "fd5040123976a121a34a8e8349f8d8ddb8f33cb942992da81156488058f46050",
     "src/sandbox-config.js": "05cb572ecdd4675f089279a77dd6b8abd038c6bb5ec4143b03fa34bc8c03040d",
@@ -31,6 +31,7 @@
     "src/sandbox-proxy.js": "b4d078e715c8b261ab730bfd9b96e5eb3bc7d8537e309d0ef50cddb70b116d3a",
     "src/sandbox-server-entry.js": "e3cb9be441c1eb03069c3951cf9dfab68c90a154d932e86d1dbac5350e9f792b",
     "src/sandbox-service.js": "3e106fca45ab84557471e3c7e7db0b0fb617895500333f1f1bb44a38dfbde9df",
+    "src/task-card.js": "2921d3868fe46571a3d0f7ab41d5d0118d3253978084a368ef578e1bb4432645",
     "vendor-notices.json": "937d0d016eefe6d25ce4016e42f6c342927ab8b1aa587762703013cd5d710b6d"
   },
   "bundledInputs": {
@@ -197,18 +198,19 @@
     "node_modules/zod/v4/locales/zh-TW.js": "01d9b119e318d8b9f1a8fa720d06424457429425a61d0730984b750e6a5edf7d",
     "src/input-card.css": "608ab8ae76816aa90e2747ca43f4d60e7b9a3bd397e12a71d45e0b5d53cea224",
     "src/input-card.js": "19621900c4a435aee7feb9898f3bf06d2b39d42a6edbdfeb6a8182be4d7b16fc",
-    "src/input-entry.js": "5d22f9cca6f48739c21dd501e90f8da4eadc7b382faee0ac0c8b5ec3dc791765",
+    "src/input-entry.js": "ca6916da80ef23a8c185e5c6f0b435397c7e792e837b0ba1f68f8ea8d93db949",
     "src/oauth-panel.js": "24dec056217773a985e413b95602394239eb04e0c37296ec9d95d39eac1442f8",
     "src/origin-transport.js": "7df4d94e870edd9a73ba34f5ce0773e07709aa6809a4111c6534eccb7f459689",
     "src/parent-entry.js": "99baa8d1679c944d345915893db6993da9186265d6a4841c7cde73fa4a89bee6",
-    "src/parent-view.js": "85308e947cc6c3d0d39f8b735a8ec0627ef2ae7bcd4af093be5c2feb8420605e",
+    "src/parent-view.js": "8d4162705cc980266ee0fd5ff4621a76919446dd4bba6bce698748fa5d7549ae",
     "src/sandbox-assets.js": "1fdcbb42c664d237302ac1db36ec260c0163ee88a17e8affa94f99a86d87d380",
     "src/sandbox-cli.js": "fd5040123976a121a34a8e8349f8d8ddb8f33cb942992da81156488058f46050",
     "src/sandbox-config.js": "05cb572ecdd4675f089279a77dd6b8abd038c6bb5ec4143b03fa34bc8c03040d",
     "src/sandbox-entry.js": "644ef47a17025c0b71c9ef627d36a2b30d81995774783786757bb26abda58288",
     "src/sandbox-proxy.js": "b4d078e715c8b261ab730bfd9b96e5eb3bc7d8537e309d0ef50cddb70b116d3a",
     "src/sandbox-server-entry.js": "e3cb9be441c1eb03069c3951cf9dfab68c90a154d932e86d1dbac5350e9f792b",
-    "src/sandbox-service.js": "3e106fca45ab84557471e3c7e7db0b0fb617895500333f1f1bb44a38dfbde9df"
+    "src/sandbox-service.js": "3e106fca45ab84557471e3c7e7db0b0fb617895500333f1f1bb44a38dfbde9df",
+    "src/task-card.js": "2921d3868fe46571a3d0f7ab41d5d0118d3253978084a368ef578e1bb4432645"
   },
   "embeddedSourceMaps": {
     "node_modules/@modelcontextprotocol/client/dist/ajvProvider-BIwGVY6G.mjs.map": "e58ea0c58f1330afdab89de9eeb7380dc64e7867669e8602c7430f68a6e96296",
@@ -360,10 +362,10 @@
   ],
   "assets": {
     "input-entry.css": "a1f38b8dd19254a5fcdd9bf9954105f8a55325ae32b45a5d576f7398c08d7ca7",
-    "input-entry.js": "be2cb04fc41b95bd72c076babdc997ac8acec1a71f135575f776808098fef8fd",
+    "input-entry.js": "7d0b42ec2393eef39d0f78db0ab8808dfe4f72690d4b54db466210894a14cc37",
     "oauth-panel.css": "f927cdfefa34ff25d936603370e04d99cc019357949dd5600befbee450d692c5",
     "oauth-panel.js": "699d27d30c927591fe50c4c576951cfd110b1f0828249c657c88465d687fc1c5",
-    "parent-entry.js": "572b2540e31704896d34034162dae067628d1ec07d889c7ddf036aa663b9e743",
+    "parent-entry.js": "c132fbea72b93abea012dff04b33d2a42916e5568c3eb5273bf8631c46cc65a4",
     "sandbox-entry.js": "9d10d2cc095a19b63e907f5e73871fb9d18e12809bc23e1742842778ec40fcf1",
     "sandbox-service.mjs": "bc2c6476a280daa45e857d101f434d0dc14ee5fc96dcd2fd92f0445409e12d19",
     "THIRD_PARTY_NOTICES.txt": "5176f1d103deea45d829e91f31e0d683425bd7eee067c37c135130f20829863f"

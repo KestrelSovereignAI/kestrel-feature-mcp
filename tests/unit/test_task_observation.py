@@ -47,6 +47,7 @@ async def start_task(b, *, clock=None, schema=None, operation_seconds=None, task
     await connect(b, name)
     reply = await b.client.post('/api/owned-credential-call')
     assert reply.status_code == 200 and reply.json().get('status') == 'partial', reply.text
+    b.task_parts = [part for part in reply.json().get('parts', []) if part['type'] == 'mcp_task']
     old_host = b.feature._task_host
     original, = await old_host.store.list_retained()
     assert original.phase == 'ATTACHED'
@@ -504,16 +505,18 @@ async def test_observation_startup_refusal_preserves_host_and_retries_after_paci
     assert peer.calls == ['started', 'get']
 
 
-@pytest.mark.parametrize('case', ['paced', 'expired', 'not-found'])
+@pytest.mark.parametrize('case', ['paced', 'expired', 'expiry-before-poll', 'unlimited', 'not-found'])
 async def test_native_observation_pacing_and_remote_availability(oauth_runtime, case):
     b = oauth_runtime
     peer = b.peer.resource.settings['extensions'][0]
-    peer.poll_interval_ms = 5000
+    peer.poll_interval_ms = 120_000 if case in {'expiry-before-poll', 'unlimited'} else 5000
+    if case == 'unlimited':
+        peer.ttl_ms = None
     now = [datetime(2026, 11, 4, 0, 0, 2, tzinfo=UTC)]
     name, original = await start_task(b, clock=lambda: now[0])
     b.runtime._credentials[name].lease.revoke()
     runtime = b.feature._task_runtime
-    assert original.local['poll_not_before'] == now[0].timestamp() + 5
+    assert original.local['poll_not_before'] == now[0].timestamp() + peer.poll_interval_ms / 1000
 
     async def sweep():
         await runtime.maintain(observe=True)
@@ -522,13 +525,34 @@ async def test_native_observation_pacing_and_remote_availability(oauth_runtime, 
 
     assert await sweep() == original
     assert peer.calls == ['started']
-    if case == 'expired':
-        now[0] += timedelta(seconds=60)
+    if case in {'expired', 'expiry-before-poll'}:
+        if case == 'expiry-before-poll':
+            now[0] += timedelta(seconds=57)
+            assert await sweep() == original
+            now[0] += timedelta(seconds=1)
+            async with b.host.borrow_task_observation(runtime.host, original.handle, scheduled=True) as lease:
+                now[0] -= timedelta(seconds=1)
+                async with lease.operation():
+                    with pytest.raises(ResourceConflict, match='not due for observation'):
+                        lease.scheduled_observation_expired()
+                now[0] += timedelta(seconds=1)
+        else:
+            now[0] += timedelta(seconds=60)
         before = len(b.peer.resource.requests)
         expired = await sweep()
         assert expired.phase == 'ATTACHED' and expired.envelope == original.envelope
-        assert expired.local['observation_block']['reason'] == 'remote_expired'
+        block = expired.local['observation_block']
+        assert block is not None and block['reason'] == 'remote_expired'
         assert len(b.peer.resource.requests) == before and peer.calls == ['started']
+        return
+    if case == 'unlimited':
+        now[0] += timedelta(seconds=60)
+        assert await sweep() == original
+        assert peer.calls == ['started']
+        now[0] += timedelta(seconds=60)
+        peer.status = 'completed'
+        assert (await sweep()).phase == 'SETTLED'
+        assert peer.calls == ['started', 'get']
         return
     if case == 'not-found':
         peer.reject_code = types.INVALID_PARAMS

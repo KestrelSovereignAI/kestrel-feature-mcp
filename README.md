@@ -529,12 +529,19 @@ The private observation path uses a separate SDK connection for a bounded
 before storing a result and can publish status-only waits to the original chat.
 A stopped watch stays stopped.
 
-Public Task configuration stays disabled while governed update and cancel,
-private chat and App delivery, and native acceptance are completed. Activation
-also requires the published SDK fix for the
+Through the private Task host, an operator can answer the original Task form
+and an authenticated sovereign operator can request cancellation. Core applies
+the original tool permission and journals the native request before sending.
+The original chat or physical App View can receive the final result. Closing a
+View ends its local interaction and preserves the remote Task.
+
+Public Task configuration stays disabled. Activation requires the published
+SDK fix for the
 [TTL normalization defect](https://github.com/modelcontextprotocol/python-sdk/issues/3866).
-Current tests use isolated Core instances, encrypted fixture grants and native
-SDK HTTPS peers.
+Tests cover encrypted fixture grants with native SDK HTTPS peers, result
+recovery in a fresh process, and browser delivery through the official
+AppBridge. The conformance workflow exercises native Tasks against the
+published MCP Everything server in a separate wire interoperability check.
 
 ## Optional MCP Apps host
 
@@ -590,7 +597,7 @@ An unfinished close retains its original owner and is retried before re-enable.
 Version 0.8.0 introduced the native components described below; 0.9.0 added
 completed post-tool policy, 0.10.0 added private initial result associations,
 and 0.10.1 added ownership through physical HTTP delivery.
-Version 0.21 uses Core 0.66.8 or newer and SDK 0.55.0 or newer for native
+Version 0.22 uses Core 0.66.9 or newer and SDK 0.55.0 or newer for native
 Apps, OAuth and durable tool outcome contracts. `uv sync --locked --extra test`
 installs the same host profile and runtime dependencies from the public package index.
 Initial publication and result associations are detailed below.

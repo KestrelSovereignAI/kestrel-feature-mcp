@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import json
 import time
 
 import httpx2
@@ -13,7 +14,7 @@ from mcp_types import JSONRPCNotification, JSONRPCRequest
 from ._lifecycle import run_cleanup_steps
 from .oauth_grants import OAuthGrantChanged, OAuthRefreshPending
 from .oauth_policy import GrantRejected, ResourceGrantRejected, positive_seconds, resource_envelope, resource_lane
-from .tasks_protocol import GetTaskRequest, TaskIdParams
+from .tasks_protocol import CancelTaskRequest, GetTaskRequest, UpdateTaskRequest
 from .oauth_refresh import OAuthRefresher
 
 
@@ -182,44 +183,48 @@ class GrantBearerAuth(httpx2.Auth):
             raise ResourceGrantRejected('The resource rejected this authorization; do not replay the request')
 
 
-class TaskObservationAuth(httpx2.Auth):
-    """One Task read on an independently authorized native MCP connection."""
+class TaskOperationAuth(httpx2.Auth):
+    """Authorize one exact native Task request on a dedicated connection."""
 
     requires_request_body = True
 
-    def __init__(self, server_url, task_id, *, read_access_token, check_current):
+    def __init__(self, server_url, request, *, read_access_token, check_current):
+        if type(request) not in {GetTaskRequest, UpdateTaskRequest, CancelTaskRequest}:
+            raise TypeError('MCP Task credentials require a typed original request')
         self._server_url = server_url
         self._read_access_token = read_access_token
         self._check_current = check_current
-        self._task_id = task_id
-        original = self.request
+        self._request = request.model_copy(deep=True)
+        original = self._request
         self._method = original.method
-        self._params = original.params.model_dump(mode='json', by_alias=True, exclude_none=True)
+        self._params = json.dumps(
+            original.params.model_dump(mode='json', by_alias=True, exclude_none=True),
+            sort_keys=True, allow_nan=False)
         self._spent = False
         self._armed = False
         self._rejected = False
 
     @property
-    def request(self) -> GetTaskRequest:
-        return GetTaskRequest(params=TaskIdParams(task_id=self._task_id))
+    def request(self):
+        return self._request.model_copy(deep=True)
 
     @property
     def resource_rejected(self) -> bool:
         return self._rejected
 
     def sync_auth_flow(self, request):
-        raise GrantRejected('MCP Task observations require the asynchronous transport')
+        raise GrantRejected('MCP Task operations require the asynchronous transport')
 
     def require_resource(self) -> None:
         """Retain a definite HTTP refusal across native SDK transport teardown."""
         if self._rejected:
-            raise ResourceGrantRejected('The resource refused this MCP Task observation')
+            raise ResourceGrantRejected('The resource refused this MCP Task operation')
 
     def arm(self):
         self._check_current()
         self.require_resource()
         if self._armed or self._spent:
-            raise GrantRejected('The original MCP Task observation already owns its one read')
+            raise GrantRejected('The original MCP Task operation already owns its one request')
         self._armed = True
 
     def _authorize(self, envelope):
@@ -230,17 +235,18 @@ class TaskObservationAuth(httpx2.Auth):
                     and envelope.method in {'server/discover', 'initialize', 'tools/list'}):
                 return
             params = {key: value for key, value in (envelope.params or {}).items() if key != '_meta'}
-            if self._armed and envelope.method == self._method and params == self._params:
-                # Reserve the only read before any credential or transport await.
+            if (self._armed and envelope.method == self._method
+                    and json.dumps(params, sort_keys=True, allow_nan=False) == self._params):
+                # Spend the permit before any credential or transport await.
                 self._armed, self._spent = False, True
                 return
-        raise GrantRejected('This MCP connection may only observe its original Task')
+        raise GrantRejected('This MCP connection may only send its original Task request')
 
     async def async_auth_flow(self, request):
         self._check_current()
         self.require_resource()
         if request.headers.get('Authorization'):
-            raise GrantRejected('MCP Task credentials must come from the original observation owner')
+            raise GrantRejected('MCP Task credentials must come from the original operation owner')
         envelope = await resource_envelope(request, self._server_url)
         self._check_current()
         self.require_resource()

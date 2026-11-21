@@ -5,6 +5,7 @@
     "node": ">=24"
   },
   "dependencies": {
-    "@modelcontextprotocol/conformance": "0.2.0-alpha.12"
+    "@modelcontextprotocol/conformance": "0.2.0-alpha.12",
+    "@modelcontextprotocol/server-everything": "2.3.1"
   }
 }
