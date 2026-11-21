@@ -18,6 +18,7 @@ from kestrel_sovereign.security.capability_authority import HostCapabilityAccess
 
 from kestrel_feature_mcp.oauth_grants import OAuthGrantStore
 from kestrel_feature_mcp.oauth_runtime import OAuthRuntime, OAuthSettings
+from kestrel_feature_mcp.official_registry import OfficialRegistryClient, RegistrySettings
 from kestrel_feature_mcp.remote import remote_owner
 from tests.http_peers import serve_http
 from tests.unit.test_oauth_acceptance_http import oauth_peers as oauth_peers
@@ -34,8 +35,17 @@ async def oauth_runtime(credential_boundary, tmp_path):
     b = credential_boundary
     b.app.include_router(public_oauth_router)
     await b.host.close()
-    await b.feature.set_config({'oauth': {'enabled': True, 'close_seconds': 2.0}})
+    b.catalog_preset = {
+        'name': 'example.com/owned', 'title': 'Owned test connector',
+        'description': 'Reads synthetic test data.',
+        'url': b.peer.selection.server_url, 'scopes': ['read'],
+    }
+    await b.feature.set_config({'oauth': {'enabled': True, 'close_seconds': 2.0,
+        'connector_presets': [b.catalog_preset]}})
     b.host, b.runtime = b.feature._oauth_host, b.feature._oauth_runtime
+    b.feature._official_registry = OfficialRegistryClient(RegistrySettings(
+        api_url=b.peer.selection.issuer + '/v0.1',
+    ))
     b.app.include_router(b.feature.get_router())
     async with AsyncExitStack() as owned:
         console = await owned.enter_async_context(serve_http(b.app, tmp_path / 'console', certificate_host='console.example'))
@@ -98,6 +108,24 @@ async def test_actual_core_consent_connect_governed_call_and_opaque_enablement(o
     assert len(rows) == 1 and rows[0]['state'] == 'connected'
 
 
+async def test_catalog_quick_setup_is_available_without_starting_consent(oauth_runtime):
+    b = oauth_runtime
+    before = list(b.peer.requests), list(b.peer.resource.requests)
+    response = await b.client.get('/api/mcp/connectors/catalog')
+    assert response.status_code == 200
+    assert response.json()['connectors'] == [b.catalog_preset]
+    assert response.json()['next_cursor'] is None
+    assert (await b.client.get('/api/mcp/connectors/catalog', headers={'X-API-Key': ''})).status_code in {401, 403}
+    for params in ({'q': ' a '}, {'cursor': 'missing-query'}):
+        assert (await b.client.get('/api/mcp/connectors/catalog', params=params)).status_code == 422
+    assert (b.peer.requests, b.peer.resource.requests) == before
+    assert not await b.host.database.fetch_all('SELECT * FROM mcp_oauth_credential_slots')
+    await b.feature.set_config({'oauth': {'enabled': False, 'connector_presets': [b.catalog_preset]}})
+    disabled = await b.client.get('/api/mcp/connectors/catalog')
+    assert disabled.status_code == 404
+    assert disabled.headers['cache-control'] == 'private, no-store'
+
+
 async def test_foreign_core_principal_cannot_list_connect_disconnect_or_retire_owner(oauth_runtime):
     b = oauth_runtime
     name = await authorize(b)
@@ -114,6 +142,31 @@ async def test_foreign_core_principal_cannot_list_connect_disconnect_or_retire_o
     assert b.runtime._credentials[name].withdrawal_reason is None
     assert (await b.client.post('/api/owned-credential-call')).status_code == 200
     assert b.peer.resource.witness == ['owned-effect']
+
+
+@pytest.mark.parametrize('withdrawal', ['reconfigured', 'unrouted'])
+async def test_pending_catalog_search_cannot_return_withdrawn_host_presets(oauth_runtime, withdrawal):
+    b = oauth_runtime
+    wire = b.peer.wire.state
+    request = asyncio.create_task(b.client.get('/api/mcp/connectors/catalog', params={'q': 'delayed'}))
+    try:
+        await asyncio.wait_for(wire.registry_started.wait(), 3)
+        replacement = b.catalog_preset
+        if withdrawal == 'reconfigured':
+            replacement = {**replacement, 'scopes': ['read_other']}
+            await b.feature.set_config({'oauth': {'enabled': True, 'close_seconds': 2.0,
+                'connector_presets': [replacement]}})
+        else:
+            b.app.state.agent = None
+    finally:
+        wire.registry_release.set()
+        result = await asyncio.wait_for(request, 3)
+        b.app.state.agent = b.agent
+    assert result.status_code == (404 if withdrawal == 'reconfigured' else 403)
+    assert result.headers['cache-control'] == 'private, no-store'
+    fresh = await b.client.get('/api/mcp/connectors/catalog', params={'q': 'owned'})
+    assert fresh.status_code == 200
+    assert fresh.json()['connectors'] == [replacement]
 
 
 async def test_durable_grant_restarts_dormant_then_explicitly_refreshes_without_consent(oauth_runtime, monkeypatch):

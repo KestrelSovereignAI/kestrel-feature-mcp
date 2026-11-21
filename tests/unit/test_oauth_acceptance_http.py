@@ -76,7 +76,8 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
     callback_port = reservation.getsockname()[1]
     callback = f"http://127.0.0.1:{callback_port}/oauth/callback"
     state = SimpleNamespace(issuer=None, client_id=None, access_token="native-fixture-access",
-                            codes={}, requests=[], release_body=asyncio.Event())
+                            codes={}, requests=[], release_body=asyncio.Event(),
+                            registry_requests=[], registry_started=asyncio.Event(), registry_release=asyncio.Event())
 
     async def held_body(content):
         # Only the test/fixture releases EOF; refusal must finish first.
@@ -197,7 +198,29 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         result["refresh_token"] = "native-fixture-refresh"
         return token_response(result)
 
+    async def registry(request):
+        assert "authorization" not in request.headers and "x-api-key" not in request.headers
+        search = request.query_params["search"]
+        cursor = request.query_params.get("cursor")
+        state.registry_requests.append((search, cursor))
+        assert request.query_params["version"] == "latest"
+        if search == "broken":
+            return JSONResponse({"error": "Registry is temporarily unavailable."}, status_code=503)
+        if search == "delayed":
+            state.registry_started.set()
+            await state.registry_release.wait()
+        if cursor is not None:
+            assert cursor == "owned cursor:+/?&="
+        first = cursor is None
+        return JSONResponse({"servers": [{"server": {
+            "name": "example.com/owned" if first else "example.com/second",
+            "title": "Owned Registry listing" if first else "Second Registry connector",
+            "description": "Serves synthetic test data.", "version": "1.0.0",
+            "remotes": [{"type": "streamable-http", "url": resource_url if first else resource_url + "/other"}],
+        }}], "metadata": {"count": 1, **({"nextCursor": "owned cursor:+/?&="} if first else {})}})
+
     app = Starlette(routes=[Route("/client.json", identity),
+                           Route("/v0.1/servers", registry),
                            Route("/.well-known/oauth-authorization-server", metadata),
                            Route("/authorize", authorize), Route("/token", token, methods=["POST"])])
     async with serve_http(app, tmp_path / "issuer", certificate_host="issuer.example") as issuer_peer:
@@ -262,6 +285,7 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
                 SimpleNamespace(state=state, authorities=authorities, bundle=bundle))
         finally:
             state.release_body.set()
+            state.registry_release.set()
 
 
 async def drive(peers, mode="authorize", *, network_timeout=5):

@@ -92,6 +92,9 @@ async def test_console_panel_native_consent_refresh_governed_effect_and_local_di
         assert [tuple(row) for row in rows] == [('credential-chat', 'success')]
         assert b.peer.requests.count(('GET', '/authorize')) == 1
         assert b.peer.requests.count(('POST', '/token')) == 2
+        assert b.peer.wire.state.registry_requests == [
+            (' owned ', None), (' owned ', 'owned cursor:+/?&='), ('broken', None),
+        ]
         assert not b.feature._remote_connections
         assert (await b.host.database.fetch_one('SELECT ciphertext FROM mcp_oauth_credential_slots'))[0] is None
         assert screenshot.stat().st_size > 0

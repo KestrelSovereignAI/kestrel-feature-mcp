@@ -112,8 +112,8 @@ def _origin(url: str) -> str:
         _ = parsed.port
     except ValueError:
         raise GrantRejected("Malformed OAuth endpoint") from None
-    if (parsed.scheme != "https" or not parsed.hostname or parsed.username
-            or parsed.password or parsed.fragment or parsed.query):
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+            or parsed.password is not None or parsed.fragment or parsed.query):
         raise GrantRejected("Grant endpoints must be exact HTTPS URLs without credentials")
     return parsed.scheme + "://" + parsed.netloc
 
