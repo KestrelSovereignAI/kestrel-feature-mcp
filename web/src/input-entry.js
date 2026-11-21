@@ -54,18 +54,21 @@ registerRenderer({
     id: 'mcp-original-task', match: { contentType: 'mcp_task' },
     render(data, context) {
         if (!isTaskReference(data) || typeof context.isCurrentChat !== 'function') return '';
-        return '<div class="mcp-input-card"><button type="button" data-task-handle="' + data.handle
-            + '" value="' + data.reference + '">View Task</button><div class="mcp-task-content"></div></div>';
+        return '<div class="mcp-input-card"><button type="button" class="mcp-task-open" value="'
+            + data.handle + ':' + data.reference + '">View Task</button><div class="mcp-task-content"></div></div>';
     },
     mount(root, context) {
-        const button = root.querySelector('[data-task-handle]'), content = root.querySelector('.mcp-task-content');
+        const button = root.querySelector('.mcp-task-open'), content = root.querySelector('.mcp-task-content');
         if (!button || !content) return;
+        // The Console sanitizer preserves button values and removes data attributes.
+        const [handle, reference] = button.value.split(':');
+        const task = { handle, reference };
+        if (!isTaskReference(task)) return;
         let card;
         function clear() { card?.dispose(); card = undefined; content.replaceChildren(); button.disabled = false; }
         function open() {
             if (card || !context.isCurrentChat()) return;
-            const current = mountMCPTask({ root: content,
-                task: { handle: button.dataset.taskHandle, reference: button.value },
+            const current = mountMCPTask({ root: content, task,
                 basePath: '/api/mcp/task-results', sessionId: context.sessionId,
                 isCurrent: context.isCurrentChat,
                 request: (path, options) => API.requestForAgent(path, options, context.ownerAgent, true) });

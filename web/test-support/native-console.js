@@ -1,7 +1,7 @@
 import DOMPurify from 'dompurify';
 
 /** Real Console modules, original chat ownership and native HTTP credentials. */
-export async function mountNativeConsole({ getToken, renderer, endpoint, body, partType }) {
+export async function mountNativeConsole({ getToken, renderer, endpoint, body, partType, sessionId = 'original-chat' }) {
     window.DOMPurify = DOMPurify;
     window.KESTREL_UI_CONFIG = { bearerToken: { getToken } };
     for (const file of ['parse.js', 'highlight.js', 'mermaid.js', 'katex.js', 'index.js']) {
@@ -15,7 +15,7 @@ export async function mountNativeConsole({ getToken, renderer, endpoint, body, p
     const { default: api } = await import('/js/api.js');
     const { bus } = await import('/js/ui-ext/bus.js');
     for (const module of Array.isArray(renderer) ? renderer : [renderer]) await import(module);
-    const pane = ui.getOrCreateChatPane(null); pane.sessionId = 'original-chat';
+    const pane = ui.getOrCreateChatPane(null); pane.sessionId = sessionId;
     document.body.append(pane.element); chat.setChatDeps({ markdown: window.SharedMarkdown });
     const envelope = await api.requestForAgent(endpoint, { method: 'POST',
         ...(body === undefined ? {} : { body: JSON.stringify(body) }) }, null, true);
@@ -24,9 +24,9 @@ export async function mountNativeConsole({ getToken, renderer, endpoint, body, p
     function show() { chat.appendMessagePart(part.type, part.data, pane.element); }
     show();
     window.leaveChat = () => { pane.sessionId = 'another-chat'; bus.emit('session:change'); };
-    window.returnToChat = () => { pane.sessionId = 'original-chat'; };
+    window.returnToChat = () => { pane.sessionId = sessionId; };
     window.retireChat = () => chat.wipeAgentChatPane(null);
-    window.reloadPart = () => { chat.wipeAgentChatPane(null); pane.sessionId = 'original-chat';
+    window.reloadPart = () => { chat.wipeAgentChatPane(null); pane.sessionId = sessionId;
         document.body.append(pane.element); show(); };
     return { chat, pane, api, bus, part };
 }
