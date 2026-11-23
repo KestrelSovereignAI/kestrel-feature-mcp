@@ -137,8 +137,9 @@ their limitations are recorded. Remote write scopes remain gated on
 The unit suite runs the actual native OAuth client against separate HTTPS
 resource and authorization servers with real certificates and PKCE checking,
 then exercises the same production MCP connection and loopback callback.
-The authenticated bootstrap GET reaches the SDK's real modern or handshake-era
-transport (405 or 406); native discovery/negotiation then proves readiness.
+The OAuth probe uses the production `server/discover` POST. A modern peer
+answers the authenticated retry with 200. A handshake-era peer answers 404,
+then negotiates its protocol when the native MCP connection opens.
 An independent streaming peer proves the bootstrap closes after headers rather
 than waiting for event-stream EOF. A native SDK server ping during tool listing
 proves that concurrent method-less JSON-RPC replies reach the server without
