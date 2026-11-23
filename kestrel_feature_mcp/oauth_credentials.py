@@ -13,9 +13,7 @@ from mcp_types import JSONRPCNotification, JSONRPCRequest
 
 from ._lifecycle import run_cleanup_steps
 from .oauth_grants import OAuthGrantChanged, OAuthRefreshPending
-from .oauth_policy import (
-    GrantRejected, GrantSelection, ResourceGrantRejected, positive_seconds, resource_envelope, resource_lane,
-)
+from .oauth_policy import GrantRejected, ResourceGrantRejected, positive_seconds, resource_envelope, resource_lane
 from .tasks_protocol import CancelTaskRequest, GetTaskRequest, UpdateTaskRequest
 from .oauth_refresh import OAuthRefresher
 
@@ -104,7 +102,6 @@ class OAuthConnectionCredential:
             self.lease.require_principal()
             admitted = False
             try:
-                GrantSelection.for_binding(self.snapshot.binding)
                 if self.snapshot.generation is None:
                     async with self.lease.credential_operation() as check:
                         snapshot = await self.store.admit_legacy(self.snapshot, check)
