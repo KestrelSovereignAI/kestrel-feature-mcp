@@ -55,9 +55,7 @@ class OAuthRefresher:
         binding, tokens = original.binding, original.tokens
         if tokens.refresh_token is None:
             raise GrantRejected('This grant requires new authorization; it has no refresh token')
-        selected = GrantSelection(binding.server_url, binding.resource, binding.issuer,
-            binding.protected_metadata, binding.authorization_metadata, binding.client_id,
-            binding.redirect_uri, tokens.scopes)
+        selected = GrantSelection.for_binding(binding, scopes=tokens.scopes)
 
         async def begin_exchange():
             check()
