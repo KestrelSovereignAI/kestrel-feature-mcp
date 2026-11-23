@@ -19,11 +19,11 @@ import httpx2
 from kestrel_sdk.security.outbound import assert_safe_url, pinned_httpx2_async_transport
 from mcp.client.auth import OAuthClientProvider
 from mcp.shared.auth import OAuthClientMetadata
-from mcp_types.version import LATEST_PROTOCOL_VERSION
 
 from kestrel_feature_mcp.connection import MCPConnection
 from kestrel_feature_mcp.http_limits import IDENTITY_ACCEPT_ENCODING
 from kestrel_feature_mcp.oauth_http import BudgetedTransport
+from kestrel_feature_mcp.oauth_policy import DISCOVERY_PROBE_BODY, DISCOVERY_PROBE_HEADERS
 from .callback import LoopbackCallback
 from .policy import (DEFAULT_RESPONSE_MAX_BYTES, GrantPolicy, GrantRejected, GrantSelection,
                      GuardedAuth, MemoryGrant, response_budget)
@@ -162,9 +162,8 @@ async def run(selection: GrantSelection, *, mode: str, browser_timeout: float,
             follow_redirects=False, trust_env=False, timeout=network_timeout,
         ) as client:
             try:
-                async with client.stream("GET", selection.server_url, headers={
-                    "Accept": "application/json", "MCP-Protocol-Version": LATEST_PROTOCOL_VERSION,
-                }) as response:
+                async with client.stream("POST", selection.server_url, content=DISCOVERY_PROBE_BODY,
+                                         headers=DISCOVERY_PROBE_HEADERS) as response:
                     # Headers complete this OAuth probe. Do not consume a
                     # long-lived resource stream before native MCP discovery.
                     if response.status_code in {401, 403}:
@@ -172,9 +171,8 @@ async def run(selection: GrantSelection, *, mode: str, browser_timeout: float,
             except AuthorizationReady:
                 return {**public, "stage": "authorization_ready", "grant_obtained": False,
                         "scope": "Native discovery and request validation only; no vendor consent"}
-            # This GET drives OAuth, not MCP version negotiation. A handshake
-            # peer can answer 406 because this request does not open SSE.
-            # The canonical connection below must prove protocol readiness.
+            # The canonical connection below performs its own protocol
+            # negotiation and tool discovery.
         tokens = await storage.get_tokens()
         if tokens is None:
             raise GrantRejected("No native OAuth token exchange completed")

@@ -105,6 +105,7 @@ async def test_actual_native_web_acquisition_commits_intent_before_one_exchange(
     probes = [scope for scope, _ in peer.resource.requests if scope["path"] == "/mcp"]
     assert [scope["method"] for scope in probes] == ["POST", "POST"]
     assert all(dict(scope["headers"])[b"mcp-method"] == b"server/discover" for scope in probes)
+    assert ("POST", "/mcp", 200) in peer.resource.settings["responses"]
     if peer.options.get('query_resource'):
         assert all(scope["query_string"] == b"login" for scope, _ in peer.resource.requests)
     assert storage.snapshot.binding.resource == peer.selection.resource

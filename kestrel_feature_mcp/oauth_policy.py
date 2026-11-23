@@ -10,6 +10,7 @@ import re
 from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 import httpx2
+from mcp.client.session import DEFAULT_CLIENT_INFO
 from mcp.client.auth.utils import (
     build_oauth_authorization_server_metadata_discovery_urls,
     build_protected_resource_metadata_discovery_urls,
@@ -22,7 +23,6 @@ from mcp_types import (
     PROTOCOL_VERSION_META_KEY,
     ClientCapabilities,
     DiscoverRequest,
-    Implementation,
     JSONRPCMessage,
     JSONRPCNotification,
     JSONRPCRequest,
@@ -30,14 +30,14 @@ from mcp_types import (
     client_notification_adapter,
     jsonrpc_message_adapter,
 )
-from mcp_types.version import LATEST_PROTOCOL_VERSION
+from mcp_types.version import LATEST_MODERN_VERSION
 from mcp.shared.auth_utils import check_resource_allowed, resource_url_from_server_url
 from pydantic import ValidationError
 
 DEFAULT_RESPONSE_MAX_BYTES = 65536
 _DISCOVERY = DiscoverRequest(params=RequestParams(_meta={
-    PROTOCOL_VERSION_META_KEY: LATEST_PROTOCOL_VERSION,
-    CLIENT_INFO_META_KEY: Implementation(name="Kestrel", version="1").model_dump(
+    PROTOCOL_VERSION_META_KEY: LATEST_MODERN_VERSION,
+    CLIENT_INFO_META_KEY: DEFAULT_CLIENT_INFO.model_dump(
         mode="json", by_alias=True, exclude_none=True,
     ),
     CLIENT_CAPABILITIES_META_KEY: ClientCapabilities().model_dump(mode="json", by_alias=True, exclude_none=True),
@@ -46,6 +46,12 @@ DISCOVERY_PROBE_BODY = JSONRPCRequest(
     jsonrpc="2.0", id=0, **_DISCOVERY.model_dump(mode="json", by_alias=True, exclude_none=True),
 ).model_dump_json(by_alias=True, exclude_none=True).encode()
 DISCOVERY_PROBE_METHOD = _DISCOVERY.method
+DISCOVERY_PROBE_HEADERS = (
+    ("Accept", "application/json, text/event-stream"),
+    ("Content-Type", "application/json"),
+    ("MCP-Method", DISCOVERY_PROBE_METHOD),
+    ("MCP-Protocol-Version", LATEST_MODERN_VERSION),
+)
 _TOKEN_ERRORS = frozenset({
     'invalid_request', 'invalid_client', 'invalid_grant', 'unauthorized_client',
     'unsupported_grant_type', 'invalid_scope',
@@ -140,7 +146,9 @@ def _origin(url: str, *, allow_query: bool = False) -> str:
         raise GrantRejected("Grant endpoints must be exact HTTPS URLs without credentials")
     if any(key.casefold() in {"access_token", "refresh_token", "client_secret"}
            for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
-        raise GrantRejected("Grant endpoints must be exact HTTPS URLs without credentials")
+        raise GrantRejected("Grant URLs cannot carry OAuth credential query parameters")
+    if allow_query and str(httpx2.URL(url)) != url:
+        raise GrantRejected("OAuth resource and metadata URLs must already be HTTP-canonical")
     return parsed.scheme + "://" + parsed.netloc
 
 
@@ -320,7 +328,7 @@ class BootstrapPolicy:
         if url == self.server_url:
             if (request.method != 'POST'
                     or request.headers.get('MCP-Method') != DISCOVERY_PROBE_METHOD
-                    or request.headers.get('MCP-Protocol-Version') != LATEST_PROTOCOL_VERSION
+                    or request.headers.get('MCP-Protocol-Version') != LATEST_MODERN_VERSION
                     or await request.aread() != DISCOVERY_PROBE_BODY
                     or bool(bearer) != self.grant_ready):
                 raise GrantRejected('OAuth acquisition permits only its original MCP discovery probe')
