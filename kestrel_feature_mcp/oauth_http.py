@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Protocol
 
 import httpx2
 
 from .http_limits import MCPResponseBudget, MCPResponseLimitError, identity_accept_encoding
 from .oauth_policy import GrantRejected, positive_seconds, response_budget
+
+
+class _DiscardCookies(DefaultCookiePolicy):
+    def set_ok(self, cookie, request):
+        return False
+
+
+def stateless_oauth_cookies():
+    """Keep browser cookies separate from MCP's public OAuth clients."""
+    return CookieJar(policy=_DiscardCookies())
 
 
 class AuthFlowPolicy(Protocol):

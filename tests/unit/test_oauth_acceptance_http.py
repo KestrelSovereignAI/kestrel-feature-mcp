@@ -68,7 +68,8 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
     options = deepcopy(getattr(request, "param", {}))
     resource_peer = mcp_http_server
     resource_port = urlsplit(resource_peer.url).port
-    resource_url = f"https://remote.example:{resource_port}/mcp"
+    resource_path = options.get("resource_path", "/mcp")
+    resource_url = f"https://remote.example:{resource_port}{resource_path}"
     if options.get("query_resource"):
         resource_url += "?login"
     resource_id = resource_url.rsplit("/mcp", 1)[0] if options.get("parent_resource") else resource_url
@@ -120,13 +121,19 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             "authorization_response_iss_parameter_supported": True,
             "client_id_metadata_document_supported": not options.get("no_cimd", False),
         }
+        if "issuer_scopes" in options:
+            document["scopes_supported"] = options["issuer_scopes"]
+        document.update(options.get("issuer_profile", {}))
         if options.get("stall_metadata"):
             return StreamingResponse(held_body(json.dumps(document).encode()),
                                      media_type="application/json")
         if options.get('compressed') == 'authorization':
             return Response(gzip.compress(json.dumps(document).encode()),
                 media_type='application/json', headers={'Content-Encoding': 'gzip'})
-        return JSONResponse(document)
+        response = JSONResponse(document, media_type=options.get('issuer_media_type', 'application/json'))
+        if options.get('metadata_cookie'):
+            response.set_cookie('metadata-session', 'owned-fixture', secure=True)
+        return response
 
     async def authorize(request):
         state.requests.append(("GET", "/authorize"))
@@ -165,6 +172,8 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         return JSONResponse(result)
 
     async def token(request):
+        if options.get('metadata_cookie'):
+            assert 'cookie' not in request.headers
         if options.get("before_token") is not None:
             await options["before_token"]()
         state.requests.append(("POST", "/token"))
@@ -232,9 +241,10 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
         if options.get("web_identity"):
             callback = state.issuer + "/oauth/callback"
         state.redirect_uri = callback
+        metadata_path = '/.well-known/oauth-protected-resource' + resource_path.removesuffix('/')
         resource_peer.settings["oauth"].update(
             resource=resource_id, issuer=state.issuer, access_token=state.access_token,
-            metadata=resource_url.replace("/mcp", "/.well-known/oauth-protected-resource/mcp"),
+            metadata=urlsplit(resource_url)._replace(path=metadata_path).geturl(),
             challenge_scope=options.get("challenge_scope", "read"),
             denied_authenticated_discover=options.get("denied_authenticated_discover"),
             get_not_supported=options.get("get_not_supported", False),
@@ -381,13 +391,15 @@ async def test_bootstrap_hands_off_without_waiting_for_event_stream_eof(oauth_pe
 
 
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
-@pytest.mark.parametrize("oauth_peers", [{"oversized": "identity"},
-                                         {"oversized": "authorization"},
-                                         {'oversized': 'identity', 'oversize_media_type': 'text/event-stream'},
-                                         {'oversized': 'authorization', 'oversize_media_type': 'text/event-stream'}], indirect=True)
-async def test_oversized_stream_is_refused_before_waiting_for_its_end(oauth_peers):
+@pytest.mark.parametrize("oauth_peers,error", [
+    ({"oversized": "identity"}, "response budget"),
+    ({"oversized": "authorization"}, "response budget"),
+    ({"oversized": "identity", "oversize_media_type": "text/event-stream"}, "response budget"),
+    ({"oversized": "authorization", "oversize_media_type": "text/event-stream"}, "application/json"),
+], indirect=["oauth_peers"])
+async def test_oversized_stream_is_refused_before_waiting_for_its_end(oauth_peers, error):
     async def attempt():
-        with pytest.raises(GrantRejected, match="response budget"):
+        with pytest.raises(GrantRejected, match=error):
             await drive(oauth_peers)
 
     task = asyncio.create_task(attempt())
