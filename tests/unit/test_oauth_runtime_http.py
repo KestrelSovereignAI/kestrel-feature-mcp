@@ -16,13 +16,14 @@ from kestrel_sovereign.features.security.permissions import PermissionLevel
 from kestrel_sovereign.mcp_oauth import MCPOAuthHostPolicy
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
 
-from kestrel_feature_mcp.oauth_grants import OAuthGrantStore
+from kestrel_feature_mcp.oauth_grants import OAuthGrantStore, OAuthGrantTokens
 from kestrel_feature_mcp.oauth_runtime import OAuthRuntime, OAuthSettings
 from kestrel_feature_mcp.official_registry import OfficialRegistryClient, RegistrySettings
 from kestrel_feature_mcp.remote import remote_owner
 from tests.http_peers import serve_http
 from tests.unit.test_oauth_acceptance_http import oauth_peers as oauth_peers
 from tests.unit.test_oauth_credentials import credential_boundary as credential_boundary
+from tests.unit.test_oauth_grants import install_grant
 from tests.unit.test_oauth_production_acquisition_http import approve
 
 
@@ -656,6 +657,34 @@ async def test_status_requires_the_current_original_grant_snapshot(oauth_runtime
     status = b.runtime._status(metadata, credential.budgets)
     assert status['state'] == 'authorized' and not status['connected']
     assert b.peer.resource.witness == []
+
+
+async def test_saved_grant_with_unsupported_query_requires_reauthorization_without_network(oauth_runtime):
+    b = oauth_runtime
+    name = await authorize(b)
+    await connect(b, name)
+    credential = b.runtime._credentials[name]
+    original = credential.snapshot.binding
+    url = original.server_url + '?tenant=synthetic-private-value'
+    saved = replace(original, server_url=url, resource=url,
+        connection_id=b.runtime._name(url, original.principal_id))
+    await install_grant(credential.store, saved, OAuthGrantTokens(
+        'fresh-synthetic-access', 'synthetic-refresh', None, saved.scopes))
+    before = list(b.peer.resource.requests), list(b.peer.requests)
+
+    listed = await b.client.get('/api/mcp/oauth/connections')
+    assert listed.status_code == 200 and 'synthetic-private-value' not in listed.text
+    status = next(item for item in listed.json()['connections']
+        if item['connection_id'] == saved.connection_id)
+    assert status['state'] == 'reauthorization_required' and not status['connected']
+    assert status['server_url'] == original.server_url
+    for refresh in (False, True):
+        result = await b.client.post('/api/mcp/oauth/connections/' + saved.connection_id + '/connect',
+            json={'refresh': refresh})
+        assert result.status_code == 503 and 'synthetic-private-value' not in result.text
+
+    assert (b.peer.resource.requests, b.peer.requests) == before
+    assert saved.connection_id not in b.runtime._credentials
 
 
 @pytest.mark.parametrize('loss', ['lease', 'expiry'])

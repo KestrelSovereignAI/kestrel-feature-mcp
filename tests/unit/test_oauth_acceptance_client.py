@@ -57,6 +57,12 @@ def test_unknown_vendor_fails_before_requests(config):
         load_selection(config, "unknown-vendor")
 
 
+def test_null_vendor_url_reports_the_endpoint_configuration_error(config):
+    config["vendors"]["notion"]["server_url"] = None
+    with pytest.raises(GrantRejected, match="Grant endpoints must be exact HTTPS URLs"):
+        load_selection(config, "notion")
+
+
 @pytest.mark.parametrize("value", [True, "20", None])
 def test_config_timeout_types_fail_before_requests(config, value):
     config["network_timeout"] = value
