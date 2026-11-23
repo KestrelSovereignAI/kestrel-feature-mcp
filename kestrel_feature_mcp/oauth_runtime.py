@@ -20,7 +20,7 @@ from .connector_catalog import ConnectorPreset
 from .oauth_acquisition import AuthorizationOperation
 from .oauth_credentials import OAuthConnectionCredential
 from .oauth_grants import OAuthGrantRejected, OAuthGrantStore, OAuthRefreshPending
-from .oauth_policy import ClientIdentity, GrantRejected, GrantSelection, TaskObservationBlocked
+from .oauth_policy import ClientIdentity, GrantRejected, TaskObservationBlocked
 from .oauth_refresh import OAuthRefresher
 from .remote import remote_name_for_url, remote_owner
 from .tool_contract import MCPToolContractSnapshot
@@ -123,11 +123,6 @@ class OAuthRuntime:
 
         snapshot = await require_current_grant()
         binding = snapshot.binding
-        try:
-            GrantSelection.for_binding(binding)
-        except GrantRejected:
-            raise TaskObservationBlocked('credential_unavailable',
-                'The original MCP Task OAuth endpoints require new authorization') from None
         if (binding.server_url != original_url or connection != locator.connection_name
                 or self._name(binding.server_url, locator.principal_digest) != connection
                 or remote_owner(connection) != locator.owner or binding.client_id != policy.client_id
@@ -255,14 +250,8 @@ class OAuthRuntime:
             state = 'connected'
         if not self._identity_matches(binding, identity):
             state, connected = 'reauthorization_required', False
-        server_url, resource = binding.server_url, binding.resource
-        try:
-            GrantSelection.for_binding(binding)
-        except GrantRejected:
-            state, connected = 'reauthorization_required', False
-            server_url, resource = server_url.partition('?')[0], resource.partition('?')[0]
-        return {'connection_id': binding.connection_id, 'server_url': server_url,
-            'issuer': binding.issuer, 'resource': resource, 'scopes': sorted(binding.scopes),
+        return {'connection_id': binding.connection_id, 'server_url': binding.server_url,
+            'issuer': binding.issuer, 'resource': binding.resource, 'scopes': sorted(binding.scopes),
             'state': state, 'connected': bool(connected)}
 
     async def list(self, context):

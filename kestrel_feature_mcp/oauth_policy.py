@@ -175,12 +175,6 @@ class GrantSelection:
     redirect_uri: str
     scopes: frozenset[str]
 
-    @classmethod
-    def for_binding(cls, binding, *, scopes=None):
-        return cls(binding.server_url, binding.resource, binding.issuer,
-                   binding.protected_metadata, binding.authorization_metadata,
-                   binding.client_id, binding.redirect_uri, binding.scopes if scopes is None else scopes)
-
     def __post_init__(self):
         server_origin = _origin(self.server_url, allow_query=True)
         issuer_origin = _origin(self.issuer)
