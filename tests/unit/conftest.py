@@ -227,17 +227,28 @@ async def mcp_http_server(request, tmp_path, app_resource_html):
                 return await Response(status_code=307, headers={
                     "Location": oauth["redirect_to"],
                 })(scope, receive, send)
-            if scope["path"] == "/.well-known/oauth-protected-resource/mcp":
+            metadata_path = "/.well-known/oauth-protected-resource/mcp"
+            if scope["path"] == oauth.get("metadata_path", metadata_path):
                 requests.append((scope, b""))
+                if "metadata_query" in oauth and scope["query_string"] != oauth["metadata_query"]:
+                    return await Response(status_code=404)(scope, receive, send)
                 document = {"resource": oauth.get("advertised_resource", oauth["resource"]),
                             "authorization_servers": [oauth.get("advertised_issuer", oauth["issuer"])],
-                            "scopes_supported": ["read", "write"]}
-                return await JSONResponse(document)(scope, receive, send)
+                            "scopes_supported": oauth.get("metadata_scopes", ["read", "write"])}
+                document.update(oauth.get("metadata_extensions", {}))
+                return await JSONResponse(document, media_type=oauth.get(
+                    "metadata_media_type", "application/json"))(scope, receive, send)
+            if scope["path"] == metadata_path and oauth.get("oversized_missing_metadata"):
+                requests.append((scope, b""))
+                return await Response(b"x" * 65537, status_code=404)(scope, receive, send)
             headers = dict(scope["headers"])
             if scope["method"] == "GET" and oauth.get("get_not_supported"):
                 requests.append((scope, b""))
                 return await Response(status_code=405)(scope, receive, send)
-            if headers.get(b"authorization") != ("Bearer " + oauth["access_token"]).encode():
+            public_discovery = (oauth.get("public_discovery")
+                and headers.get(b"mcp-method") == b"server/discover"
+                and b"authorization" not in headers)
+            if not public_discovery and headers.get(b"authorization") != ("Bearer " + oauth["access_token"]).encode():
                 requests.append((scope, b""))
                 challenge = (f'Bearer resource_metadata="{oauth["metadata"]}", '
                              f'scope="{oauth.get("challenge_scope", "read")}"')
@@ -248,6 +259,38 @@ async def mcp_http_server(request, tmp_path, app_resource_html):
                     and oauth.get("denied_authenticated_discover")):
                 requests.append((scope, b""))
                 return await Response(status_code=oauth["denied_authenticated_discover"])(scope, receive, send)
+            if public_discovery and (discovery := oauth.get("public_discovery_result")):
+                body = bytearray()
+                while True:
+                    message = await receive()
+                    body.extend(message.get("body", b""))
+                    if not message.get("more_body"):
+                        break
+                requests.append((scope, bytes(body)))
+                request_id = json.loads(body)["id"]
+                result = types.DiscoverResult(supportedVersions=discovery["versions"],
+                    capabilities=types.ServerCapabilities(), resultType=discovery.get("result_type", "complete"))
+                payload = types.JSONRPCResponse(jsonrpc="2.0", id=request_id,
+                    result=result.model_dump(mode="json", by_alias=True, exclude_none=True))
+                if "ttl" in discovery:
+                    payload.result["ttlMs"] = discovery["ttl"]
+                if discovery.get("python_field_names"):
+                    payload.result["supported_versions"] = payload.result.pop("supportedVersions")
+                challenge = discovery.get("challenge")
+                response_headers = {"WWW-Authenticate": challenge} if challenge else {}
+                if discovery.get("sse"):
+                    async def held_public_discovery():
+                        yield b": keep-alive\n\n"
+                        settings["bootstrap_body_started"].set()
+                        yield f"event: message\ndata: {payload.model_dump_json()}\n\n".encode()
+                        await settings["release_bootstrap_body"].wait()
+                    return await StreamingResponse(held_public_discovery(), media_type="text/event-stream",
+                        headers=response_headers)(scope, receive, send)
+                envelope = payload.model_dump(mode="json")
+                if discovery.get("ambiguous"):
+                    envelope["error"] = {"code": -32603, "message": "Unexpected error"}
+                return await Response(json.dumps(envelope), headers=response_headers,
+                    media_type="application/json")(scope, receive, send)
             if (settings.get("bootstrap_event_stream")
                     and headers.get(b"mcp-method") == b"server/discover"
                     and not settings["bootstrap_body_started"].is_set()):

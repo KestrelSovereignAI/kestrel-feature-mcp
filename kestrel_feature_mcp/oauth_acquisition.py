@@ -1,4 +1,4 @@
-"""Durable intent behind the official SDK's acquisition-only TokenStorage."""
+"""Durable intent for the explicit native MCP OAuth consent operation."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from dataclasses import replace
 from functools import partial
 import time
 
-from mcp.client.auth.utils import create_client_info_from_metadata_url
+from mcp.client.auth.utils import create_client_info_from_metadata_url, create_oauth_metadata_request
 
 from .oauth_grants import OAuthGrantBinding, OAuthGrantTokens
 from .oauth_policy import (
@@ -107,7 +107,7 @@ class IntentTokenStorage:
 
 
 class AuthorizationOperation:
-    """One retained native SDK task, with fresh authority per host phase."""
+    """One retained consent task, with fresh authority per host phase."""
 
     def __init__(self, handle, store, *, agent_did, principal_id, connection_id,
                  server_url, scopes, identity, budgets, check, expected,
@@ -157,12 +157,59 @@ class AuthorizationOperation:
         self._check()
         return result
 
+    async def _find_metadata(self, client, urls):
+        for url in dict.fromkeys(urls):
+            self._check()
+            response = await client.send(create_oauth_metadata_request(url), auth=None, stream=True)
+            await response.aclose()
+            self._check()
+            if response.status_code == 200:
+                return
+        raise GrantRejected('Published OAuth metadata was not found')
+
+    async def _acquire_from_metadata(self, grant_types, http_options):
+        from hmac import compare_digest
+        from authlib.common.security import generate_token
+        from authlib.integrations.httpx_client import AsyncOAuth2Client
+        from mcp.shared.auth import OAuthToken
+        from pydantic import ValidationError
+
+        # Discovery is public, so the MCP SDK has no challenge to handle.
+        # Use the same validated metadata, redirect and custody policy for
+        # this explicit OAuth request, without sending a tools/call.
+        async with AsyncOAuth2Client(client_id=self.identity.client_id,
+                redirect_uri=self.identity.redirect_uri, token_endpoint_auth_method='none',
+                code_challenge_method='S256', **http_options,
+                event_hooks={'request': [self.policy.request], 'response': [self.policy.response]}) as client:
+            await self._find_metadata(client, self.policy.resource_metadata_urls)
+            await self._find_metadata(client, self.policy.authorization_metadata_urls)
+            authorization_endpoint, token_endpoint, scope = self.policy.metadata_consent(grant_types)
+            client.scope = scope
+            verifier = generate_token(64)
+            options = {'prompt': 'consent'} if 'offline_access' in scope.split() else {}
+            url, state = client.create_authorization_url(authorization_endpoint,
+                code_verifier=verifier, resource=self.policy.selection.resource, **options)
+            await self._redirect(url)
+            callback = await self._receive_callback()
+            if (not callback.code or not callback.state or not callback.state.isascii()
+                    or not compare_digest(callback.state, state)):
+                raise GrantRejected('The OAuth callback does not match the original consent')
+            token = await client.fetch_token(token_endpoint, grant_type='authorization_code',
+                code=callback.code, code_verifier=verifier, resource=self.policy.selection.resource)
+            try:
+                receipt = OAuthToken.model_validate(token)
+            except ValidationError:
+                raise GrantRejected('The OAuth token receipt is invalid') from None
+            await self.storage.set_tokens(receipt)
+
     async def _run(self):
         import httpx2
         from mcp.client.auth import OAuthClientProvider
         from mcp.shared.auth import OAuthClientMetadata
         from .http_limits import IDENTITY_ACCEPT_ENCODING
-        from .oauth_http import BudgetedTransport, GuardedAuth, OriginPinnedTransport, fetch_client_document
+        from .oauth_http import (
+            BudgetedTransport, GuardedAuth, OriginPinnedTransport, fetch_client_document, stateless_oauth_cookies,
+        )
 
         from .oauth_policy import _origin
         self._check()
@@ -178,15 +225,18 @@ class AuthorizationOperation:
             callback_handler=self._receive_callback, client_metadata_url=self.identity.client_id)
         self._transport = BudgetedTransport(OriginPinnedTransport(lambda: self.policy.approved_origins),
             self.budgets['response_max_bytes'], self.budgets['network_seconds'])
-        async with httpx2.AsyncClient(transport=self._transport, auth=GuardedAuth(provider, self.policy),
-                headers={'Accept-Encoding': IDENTITY_ACCEPT_ENCODING}, trust_env=False,
-                follow_redirects=False, timeout=self.budgets['network_seconds']) as client:
+        http_options = {'transport': self._transport, 'headers': {'Accept-Encoding': IDENTITY_ACCEPT_ENCODING},
+            'trust_env': False, 'follow_redirects': False, 'timeout': self.budgets['network_seconds'],
+            'cookies': stateless_oauth_cookies()}
+        async with httpx2.AsyncClient(auth=GuardedAuth(provider, self.policy), **http_options) as client:
             async with client.stream('POST', self.server_url, content=DISCOVERY_PROBE_BODY,
                                      headers=DISCOVERY_PROBE_HEADERS) as response:
                 # Acquisition ends at headers. A later connection performs
                 # its own native MCP negotiation and tool discovery.
                 if response.status_code in {401, 403}:
                     raise ResourceGrantRejected('The resource rejected the completed OAuth authorization')
+            if self.policy.public_discovery:
+                await self._acquire_from_metadata(metadata.grant_types, http_options)
         self._check()
         if self.storage.snapshot is None:
             raise GrantRejected('The native OAuth exchange did not commit a grant')

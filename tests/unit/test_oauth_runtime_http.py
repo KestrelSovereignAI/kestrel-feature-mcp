@@ -8,6 +8,7 @@ import socket
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from mcp_types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION, LATEST_PROTOCOL_VERSION
 from pydantic import ValidationError
 
 from kestrel_sovereign.endpoints.auth_oauth import _create_jwt
@@ -106,6 +107,153 @@ async def test_actual_core_consent_connect_governed_call_and_opaque_enablement(o
         'url': b.peer.selection.server_url, 'grant': b.runtime._credentials[name].slot_id}
     rows = (await b.client.get('/api/mcp/oauth/connections')).json()['connections']
     assert len(rows) == 1 and rows[0]['state'] == 'connected'
+
+
+@pytest.mark.parametrize('delivery', ['native-json', 'stream', 'handshake-advertisement',
+    'advertised-metadata', 'root-metadata', 'offline-scope-optional', 'stale-discovery', 'cookie-free'])
+async def test_public_discovery_uses_published_oauth_metadata_without_calling_tools(oauth_runtime, delivery):
+    b = oauth_runtime
+    settings = b.peer.resource.settings
+    oauth = settings['oauth']
+    oauth.update(public_discovery=True, metadata_scopes=['read', 'write'])
+    if delivery == 'stream':
+        oauth['public_discovery_result'] = {'sse': True, 'versions': [LATEST_MODERN_VERSION]}
+    elif delivery == 'handshake-advertisement':
+        oauth['public_discovery_result'] = {'versions': [LATEST_HANDSHAKE_VERSION]}
+    elif delivery == 'advertised-metadata':
+        oauth['metadata_path'] = '/connector-oauth-metadata'
+        oauth['metadata_scopes'] = ['read', 'write']
+        resource_origin = b.peer.selection.server_url.removesuffix('/mcp')
+        challenge = f'Basic realm="shop, demo", bEaReR Resource_Metadata = "{resource_origin}{oauth["metadata_path"]}", Scope = "read"'
+        oauth['public_discovery_result'] = {'versions': [LATEST_MODERN_VERSION],
+            'challenge': challenge}
+    elif delivery == 'root-metadata':
+        missing = '/.well-known/oauth-protected-resource/mcp'
+        resource_origin = b.peer.selection.server_url.removesuffix('/mcp')
+        oauth['public_discovery_result'] = {'versions': [LATEST_MODERN_VERSION],
+            'challenge': f'Bearer resource_metadata="{resource_origin}{missing}"'}
+        oauth.update(metadata_path='/.well-known/oauth-protected-resource', oversized_missing_metadata=True)
+    elif delivery == 'offline-scope-optional':
+        b.peer.options['issuer_scopes'] = ['read', 'offline_access']
+    elif delivery == 'stale-discovery':
+        oauth['public_discovery_result'] = {'versions': [LATEST_MODERN_VERSION], 'ttl': -1}
+    elif delivery == 'cookie-free':
+        b.peer.options['metadata_cookie'] = True
+    before = len(b.peer.resource.requests)
+    try:
+        name = await authorize(b)
+        if delivery == 'stream':
+            assert settings['bootstrap_body_started'].is_set()
+            assert not settings['release_bootstrap_body'].is_set()
+    finally:
+        settings['release_bootstrap_body'].set()
+    discovery = [dict(scope['headers']) for scope, _ in b.peer.resource.requests[before:]
+        if scope['method'] == 'POST']
+    assert [headers[b'mcp-method'] for headers in discovery] == [b'server/discover']
+    assert b'authorization' not in discovery[0]
+    assert b.peer.resource.witness == []
+    assert b.peer.requests.count(('POST', '/token')) == 1
+    expected_metadata_path = oauth.get('metadata_path', '/.well-known/oauth-protected-resource/mcp')
+    metadata_headers = [dict(scope['headers']) for scope, _ in b.peer.resource.requests[before:]
+        if scope['path'] == expected_metadata_path and scope['method'] == 'GET']
+    assert [headers[b'mcp-protocol-version'] for headers in metadata_headers] == [LATEST_PROTOCOL_VERSION.encode()]
+    if delivery == 'root-metadata':
+        assert [scope['path'] for scope, _ in b.peer.resource.requests[before:] if scope['method'] == 'GET'] == [
+            missing, expected_metadata_path]
+    await connect(b, name, refresh=delivery == 'cookie-free')
+    assert b.peer.requests.count(('POST', '/token')) == (2 if delivery == 'cookie-free' else 1)
+    assert (await b.client.post('/api/owned-credential-call')).status_code == 200
+    assert b.peer.resource.witness == ['owned-effect']
+
+
+@pytest.mark.parametrize('hint,approved', [
+    ('"read write"', ['read']), ('"read\twrite"', ['read', 'write']), ('read write', ['read', 'write'])])
+async def test_public_discovery_refuses_out_of_scope_or_malformed_scope_hints(oauth_runtime, hint, approved):
+    b = oauth_runtime
+    b.peer.resource.settings['oauth'].update(public_discovery=True,
+        public_discovery_result={'versions': [LATEST_MODERN_VERSION], 'challenge': f'Bearer scope={hint}'})
+    result = await b.client.post('/api/mcp/oauth/authorizations', json={
+        'server_url': b.peer.selection.server_url, 'scopes': approved})
+    assert result.status_code == 400
+    assert not await b.host.database.fetch_all('SELECT * FROM mcp_oauth_credential_slots')
+    assert ('GET', '/authorize') not in b.peer.requests and ('POST', '/token') not in b.peer.requests
+    assert b.peer.resource.witness == []
+
+
+@pytest.mark.parametrize('metadata', [{'bearer_methods_supported': ['query']},
+    {'dpop_bound_access_tokens_required': True}])
+async def test_public_discovery_refuses_an_incompatible_oauth_token_method(oauth_runtime, metadata):
+    b = oauth_runtime
+    b.peer.resource.settings['oauth'].update(public_discovery=True, metadata_scopes=['read'],
+        metadata_extensions=metadata)
+    before = list(b.peer.requests)
+    result = await b.client.post('/api/mcp/oauth/authorizations', json={
+        'server_url': b.peer.selection.server_url, 'scopes': ['read']})
+    assert result.status_code == 400
+    assert b.peer.requests == before
+    assert not await b.host.database.fetch_all('SELECT * FROM mcp_oauth_credential_slots')
+
+
+async def test_public_grant_refresh_refuses_changed_token_requirements(oauth_runtime):
+    b = oauth_runtime
+    oauth = b.peer.resource.settings['oauth']
+    oauth.update(public_discovery=True, metadata_scopes=['read'])
+    name = await authorize(b)
+    await connect(b, name)
+    credential = b.runtime._credentials[name]
+    original = credential.snapshot
+    oauth['metadata_extensions'] = {'dpop_bound_access_tokens_required': True}
+    result = await b.client.post('/api/mcp/oauth/connections/' + name + '/connect', json={'refresh': True})
+    assert result.status_code == 503
+    assert result.json()['error']['code'] == 'mcp_oauth_outcome_unknown_do_not_replay'
+    assert b.peer.requests.count(('POST', '/token')) == 1
+    saved = await credential.store.read(original.binding)
+    assert saved.state == 'active' and saved.revision == original.revision
+
+
+@pytest.mark.parametrize('endpoint', ['resource', 'issuer'])
+async def test_public_discovery_refuses_mislabeled_oauth_metadata(oauth_runtime, endpoint):
+    b = oauth_runtime
+    b.peer.resource.settings['oauth'].update(public_discovery=True)
+    if endpoint == 'resource':
+        b.peer.resource.settings['oauth']['metadata_media_type'] = 'text/plain'
+    else:
+        b.peer.options['issuer_media_type'] = 'text/plain'
+    result = await b.client.post('/api/mcp/oauth/authorizations', json={
+        'server_url': b.peer.selection.server_url, 'scopes': ['read']})
+    assert result.status_code == 400
+    assert ('POST', '/token') not in b.peer.requests
+    assert not await b.host.database.fetch_all('SELECT * FROM mcp_oauth_credential_slots')
+
+
+@pytest.mark.parametrize('profile', [
+    {'grant_types_supported': ['refresh_token']}, {'response_modes_supported': ['form_post']},
+    {'require_pushed_authorization_requests': True}, {'require_signed_request_object': True}])
+async def test_public_discovery_refuses_an_issuer_without_direct_code_consent(oauth_runtime, profile):
+    b = oauth_runtime
+    b.peer.resource.settings['oauth']['public_discovery'] = True
+    b.peer.options['issuer_profile'] = profile
+    result = await b.client.post('/api/mcp/oauth/authorizations', json={
+        'server_url': b.peer.selection.server_url, 'scopes': ['read']})
+    assert result.status_code == 400
+    assert ('GET', '/authorize') not in b.peer.requests and ('POST', '/token') not in b.peer.requests
+    assert not await b.host.database.fetch_all('SELECT * FROM mcp_oauth_credential_slots')
+
+
+@pytest.mark.parametrize('malformed', [{'ambiguous': True}, {'result_type': 'input_required'},
+    {'versions': ['2099-01-01']}, {'challenge': 'Bearer scope='}, {'ttl': float('-inf')},
+    {'python_field_names': True}])
+async def test_invalid_public_discovery_stops_before_metadata_network_io(oauth_runtime, malformed):
+    b = oauth_runtime
+    b.peer.resource.settings['oauth'].update(public_discovery=True, metadata_scopes=['read'],
+        public_discovery_result={'versions': [LATEST_MODERN_VERSION], **malformed})
+    before = len(b.peer.resource.requests)
+    result = await b.client.post('/api/mcp/oauth/authorizations', json={
+        'server_url': b.peer.selection.server_url, 'scopes': ['read']})
+    assert result.status_code == 400
+    assert [(request['method'], request['path']) for request, _ in b.peer.resource.requests[before:]] == [
+        ('POST', '/mcp')]
+    assert ('POST', '/token') not in b.peer.requests
 
 
 async def test_catalog_quick_setup_is_available_without_starting_consent(oauth_runtime):

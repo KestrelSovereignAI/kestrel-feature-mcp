@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+from contextlib import aclosing
 from dataclasses import dataclass, replace
 import json
 import math
 import sys
 import re
 from urllib.parse import parse_qs, urlsplit
+from urllib.request import parse_http_list
 
 import httpx2
 from mcp.client.session import DEFAULT_CLIENT_INFO
 from mcp.client.auth.utils import (
     build_oauth_authorization_server_metadata_discovery_urls,
     build_protected_resource_metadata_discovery_urls,
-    extract_resource_metadata_from_www_auth,
+    extract_field_from_www_auth,
+    get_client_metadata_scopes,
 )
 from mcp.shared.auth import OAuthMetadata, OAuthToken, ProtectedResourceMetadata
 from mcp_types import (
@@ -23,14 +26,17 @@ from mcp_types import (
     PROTOCOL_VERSION_META_KEY,
     ClientCapabilities,
     DiscoverRequest,
+    DiscoverResult,
+    JSONRPCError,
     JSONRPCMessage,
     JSONRPCNotification,
     JSONRPCRequest,
+    JSONRPCResponse,
     RequestParams,
     client_notification_adapter,
     jsonrpc_message_adapter,
 )
-from mcp_types.version import LATEST_MODERN_VERSION
+from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, LATEST_MODERN_VERSION, MODERN_PROTOCOL_VERSIONS
 from mcp.shared.auth_utils import check_resource_allowed, resource_url_from_server_url
 from pydantic import ValidationError
 
@@ -42,9 +48,10 @@ _DISCOVERY = DiscoverRequest(params=RequestParams(_meta={
     ),
     CLIENT_CAPABILITIES_META_KEY: ClientCapabilities().model_dump(mode="json", by_alias=True, exclude_none=True),
 }))
-DISCOVERY_PROBE_BODY = JSONRPCRequest(
+_DISCOVERY_REQUEST = JSONRPCRequest(
     jsonrpc="2.0", id=0, **_DISCOVERY.model_dump(mode="json", by_alias=True, exclude_none=True),
-).model_dump_json(by_alias=True, exclude_none=True).encode()
+)
+DISCOVERY_PROBE_BODY = _DISCOVERY_REQUEST.model_dump_json(by_alias=True, exclude_none=True).encode()
 DISCOVERY_PROBE_METHOD = _DISCOVERY.method
 DISCOVERY_PROBE_HEADERS = (
     ("Accept", "application/json, text/event-stream"),
@@ -56,6 +63,49 @@ _TOKEN_ERRORS = frozenset({
     'invalid_request', 'invalid_client', 'invalid_grant', 'unauthorized_client',
     'unsupported_grant_type', 'invalid_scope',
 })
+_AUTH_PARAMETER_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+
+def _public_bearer_hints(response):
+    """Read parameters from the first Bearer challenge in a public response."""
+    hints = {}
+    bearer = False
+    for item in parse_http_list(response.headers.get('WWW-Authenticate', '')):
+        if not item:
+            continue
+        name, equals, _ = item.partition('=')
+        if not equals or not _AUTH_PARAMETER_NAME.fullmatch(name.strip()):
+            scheme, *parameters = item.split(None, 1)
+            if bearer:
+                break
+            bearer = scheme.lower() == 'bearer'
+            if not bearer or not parameters:
+                continue
+            item = parameters[0]
+        if bearer:
+            name, equals, value = item.partition('=')
+            field = name.strip().lower()
+            if equals and field in {'resource_metadata', 'scope'}:
+                if field in hints:
+                    raise GrantRejected('The public MCP resource advertised ambiguous OAuth hints')
+                value = value.strip()
+                if _AUTH_PARAMETER_NAME.fullmatch(value):
+                    hints[field] = value
+                elif len(value) > 2 and value[0] == value[-1] == '"' and '"' not in value[1:-1]:
+                    hints[field] = value[1:-1]
+                else:
+                    raise GrantRejected('The public MCP resource advertised an invalid OAuth hint')
+    return hints
+
+
+def _public_metadata_urls(server_url, advertised):
+    resource = urlsplit(server_url)
+    well_known = '/.well-known/oauth-protected-resource'
+    # RFC 9728 inserts the well-known suffix before the complete path and query.
+    resource_path = resource.path.removesuffix('/')
+    urls = [resource._replace(path=well_known + resource_path).geturl(),
+            resource._replace(path=well_known, query='').geturl()]
+    return [advertised, *urls] if advertised else urls
 
 
 class GrantRejected(ValueError):
@@ -102,6 +152,66 @@ def validate_metadata(model, document):
         return model.model_validate(document)
     except ValidationError:
         raise GrantRejected("OAuth metadata does not match its protocol schema") from None
+
+
+async def _read_metadata_response(response, limit):
+    mime = response.headers.get('Content-Type', '').partition(';')[0].strip().lower()
+    if mime != 'application/json':
+        raise GrantRejected('OAuth metadata must be application/json')
+    body = await response.aread()
+    if len(body) > limit:
+        raise GrantRejected('OAuth metadata exceeded its response budget')
+    return metadata_document(body)
+
+
+def _reject_json_constant(_value):
+    raise GrantRejected('MCP messages require finite JSON numbers')
+
+
+def _jsonrpc_envelope(payload):
+    try:
+        message = json.loads(payload, object_pairs_hook=_unique_json_fields, parse_constant=_reject_json_constant)
+        envelope = jsonrpc_message_adapter.validate_python(message)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValidationError):
+        raise GrantRejected('MCP messages require a valid JSON-RPC envelope') from None
+    if set(message) - type(envelope).model_fields.keys():
+        raise GrantRejected('MCP envelope contains fields outside its protocol shape')
+    return message, envelope
+
+
+async def _public_discovery_result(response, limit):
+    mime = response.headers.get('Content-Type', '').partition(';')[0].strip().lower()
+    if mime == 'application/json':
+        body = await response.aread()
+        if len(body) > limit:
+            raise GrantRejected('MCP discovery exceeded its response budget')
+        _, message = _jsonrpc_envelope(body)
+    elif mime == 'text/event-stream':
+        message = None
+        events = httpx2.EventSource(response, max_event_size=limit)
+        try:
+            async with aclosing(aiter(events)) as stream:
+                async for event in stream:
+                    if event.event == 'message' and event.data:
+                        _, candidate = _jsonrpc_envelope(event.data)
+                        if isinstance(candidate, (JSONRPCResponse, JSONRPCError)):
+                            message = candidate
+                            break
+        except httpx2.SSEError:
+            raise GrantRejected('The public MCP discovery event stream is invalid') from None
+    else:
+        raise GrantRejected('The public MCP discovery response must be JSON or an event stream')
+    if not isinstance(message, JSONRPCResponse) or message.id != _DISCOVERY_REQUEST.id:
+        raise GrantRejected('The public MCP discovery response does not match the request')
+    result = message.result
+    ttl = result.get('ttlMs')
+    if (type(ttl) is int or (type(ttl) is float and math.isfinite(ttl))) and ttl < 0:
+        # A negative discovery cache lifetime is equivalent to immediately stale.
+        result = result | {'ttlMs': 0}
+    try:
+        return DiscoverResult.model_validate(result, by_alias=True, by_name=False)
+    except ValidationError:
+        raise GrantRejected('The public MCP discovery result is invalid') from None
 
 
 async def validate_token_request(request, selected, *, grant_type):
@@ -206,6 +316,8 @@ class VerifiedGrantPolicy:
         self.response_max_bytes = response_budget(response_max_bytes)
         self.authorization_endpoint: str | None = None
         self.token_endpoint: str | None = None
+        self.authorization_metadata: OAuthMetadata | None = None
+        self.direct_code_consent_supported = False
         self.resource_verified = False
         self.redirected = False
         self.requested_scopes: frozenset[str] | None = None
@@ -219,16 +331,18 @@ class VerifiedGrantPolicy:
             return
         if response.status_code != 200:
             raise GrantRejected("The selected OAuth metadata endpoint did not return 200")
-        body = await response.aread()
-        if len(body) > self.response_max_bytes:
-            raise GrantRejected("OAuth metadata exceeded its response budget")
-        document = metadata_document(body)
+        document = await _read_metadata_response(response, self.response_max_bytes)
         if url == selected.protected_metadata:
-            validate_metadata(ProtectedResourceMetadata, document)
+            metadata = validate_metadata(ProtectedResourceMetadata, document)
             issuers = document.get("authorization_servers")
             if (document.get("resource") != selected.resource
                     or not issuers or issuers[0] != selected.issuer):
                 raise GrantRejected("Resource metadata changed the selected resource or issuer")
+            methods = metadata.bearer_methods_supported
+            if methods is not None and 'header' not in methods:
+                raise GrantRejected('The MCP resource does not accept bearer authorization headers')
+            if metadata.dpop_bound_access_tokens_required:
+                raise GrantRejected('The MCP resource requires sender-constrained OAuth tokens')
             self.resource_verified = True
             return
         metadata = validate_metadata(OAuthMetadata, document)
@@ -252,6 +366,13 @@ class VerifiedGrantPolicy:
                 or self.token_endpoint not in {None, token}):
             raise GrantRejected("Issuer endpoints changed during the authorization attempt")
         self.authorization_endpoint, self.token_endpoint = authorization, token
+        self.authorization_metadata = metadata
+        self.direct_code_consent_supported = (
+            not document.get('require_pushed_authorization_requests')
+            and not document.get('require_signed_request_object')
+            and (metadata.grant_types_supported is None or 'authorization_code' in metadata.grant_types_supported)
+            and (metadata.response_modes_supported is None or 'query' in metadata.response_modes_supported)
+        )
 
     def redirect(self, url: str) -> str:
         selected = self.selection
@@ -295,7 +416,7 @@ class ClientIdentity:
 
 
 class BootstrapPolicy:
-    """Native SDK discovery and one code exchange from a stateless MCP probe.
+    """Verified discovery and one code exchange for a stateless MCP resource.
 
     Standard discovery candidates come from the SDK. A 404 or 405 permits
     the next standard candidate; malformed metadata or another failure stops
@@ -308,11 +429,13 @@ class BootstrapPolicy:
         self.response_max_bytes = response_budget(response_max_bytes)
         self.approved_origins = {_origin(server_url, allow_query=True)}
         self.on_exchange, self.on_rejection = on_exchange, on_rejection
-        self._resource_urls: set[str] = set()
-        self._authorization_urls: set[str] = set()
+        self.resource_metadata_urls: tuple[str, ...] = ()
+        self.authorization_metadata_urls: tuple[str, ...] = ()
         self._verified: VerifiedGrantPolicy | None = None
         self.exchange_started = False
         self.grant_ready = False
+        self.public_discovery = False
+        self._public_scope_hint: str | None = None
         self._probe_seen = False
         self._probe_retried = False
 
@@ -325,6 +448,18 @@ class BootstrapPolicy:
     @property
     def requested_scopes(self):
         return None if self._verified is None else self._verified.requested_scopes
+
+    def metadata_consent(self, grant_types):
+        selected = self.selection
+        issuer = self._verified.authorization_metadata
+        if not self._verified.direct_code_consent_supported:
+            raise GrantRejected('The selected issuer does not support direct OAuth authorization code consent')
+        approved_grant_types = grant_types if 'offline_access' in selected.scopes else None
+        requested = self._public_scope_hint or ' '.join(sorted(selected.scopes))
+        scopes = get_client_metadata_scopes(requested, None, issuer, approved_grant_types)
+        if not scopes or not frozenset(scopes.split(' ')) <= selected.scopes:
+            raise GrantRejected('Published OAuth scopes are missing or exceed the approved grant')
+        return self._verified.authorization_endpoint, self._verified.token_endpoint, scopes
 
     async def request(self, request):
         url = str(request.url)
@@ -347,10 +482,10 @@ class BootstrapPolicy:
             return
         if bearer:
             raise GrantRejected('Credentials cannot leave the selected resource')
-        if url in self._resource_urls | self._authorization_urls:
+        if url in self.resource_metadata_urls or url in self.authorization_metadata_urls:
             if request.method != 'GET':
                 raise GrantRejected('Metadata discovery must be an unauthenticated GET')
-            if url in self._authorization_urls:
+            if url in self.authorization_metadata_urls:
                 self._verified.selection = replace(self._verified.selection, authorization_metadata=url)
             return
         if self._verified is not None and url == self._verified.token_endpoint:
@@ -372,29 +507,39 @@ class BootstrapPolicy:
         if url == self.server_url:
             if self.grant_ready:
                 return
-            if response.status_code != 401:
+            if response.status_code == 200:
+                result = await _public_discovery_result(response, self.response_max_bytes)
+                if result.result_type != 'complete':
+                    raise GrantRejected('The public MCP discovery result is incomplete')
+                if not set(result.supported_versions).intersection(
+                        MODERN_PROTOCOL_VERSIONS + HANDSHAKE_PROTOCOL_VERSIONS):
+                    raise GrantRejected('The public MCP resource does not advertise a supported protocol')
+                hints = _public_bearer_hints(response)
+                self._public_scope_hint = hints.get('scope')
+                advertised = hints.get('resource_metadata')
+                self.public_discovery = True
+            elif response.status_code == 401:
+                advertised = extract_field_from_www_auth(response, 'resource_metadata')
+            else:
                 raise GrantRejected('The selected resource did not request OAuth authorization')
-            advertised = extract_resource_metadata_from_www_auth(response)
-            urls = build_protected_resource_metadata_discovery_urls(advertised, self.server_url)
+            urls = (_public_metadata_urls(self.server_url, advertised) if self.public_discovery
+                else build_protected_resource_metadata_discovery_urls(advertised, self.server_url))
             server_origin = _origin(self.server_url, allow_query=True)
             if any(_origin(candidate, allow_query=True) != server_origin for candidate in urls):
                 raise GrantRejected('Resource metadata must belong to the selected resource origin')
-            self._resource_urls = set(urls)
+            self.resource_metadata_urls = tuple(urls)
             return
         if self._verified is not None and url == self._verified.token_endpoint:
             await reject_token_response(response, self.on_rejection)
             return
-        if url not in self._resource_urls | self._authorization_urls:
+        if url not in self.resource_metadata_urls and url not in self.authorization_metadata_urls:
             return
         if response.status_code in {404, 405}:
             return
         if response.status_code != 200:
             raise GrantRejected('OAuth metadata discovery did not return 200')
-        body = await response.aread()
-        if len(body) > self.response_max_bytes:
-            raise GrantRejected('OAuth metadata exceeded its response budget')
-        if url in self._resource_urls:
-            document = metadata_document(body)
+        if url in self.resource_metadata_urls:
+            document = await _read_metadata_response(response, self.response_max_bytes)
             metadata = validate_metadata(ProtectedResourceMetadata, document)
             issuers = document.get('authorization_servers')
             if not metadata.authorization_servers or not issuers:
@@ -409,7 +554,7 @@ class BootstrapPolicy:
             self._verified = VerifiedGrantPolicy(selected, response_max_bytes=self.response_max_bytes)
             await self._verified.response(response)
             self.approved_origins.add(_origin(issuer))
-            self._authorization_urls = set(urls)
+            self.authorization_metadata_urls = tuple(urls)
             return
         await self._verified.response(response)
 
@@ -433,13 +578,7 @@ async def resource_envelope(request: httpx2.Request, server_url: str) -> JSONRPC
         return None
     if request.method != 'POST':
         raise GrantRejected('Unsupported MCP resource HTTP method')
-    try:
-        message = json.loads(await request.aread(), object_pairs_hook=_unique_json_fields)
-        envelope = jsonrpc_message_adapter.validate_python(message)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError):
-        raise GrantRejected('MCP requests require a valid JSON-RPC envelope') from None
-    if set(message) - type(envelope).model_fields.keys():
-        raise GrantRejected('MCP envelope contains fields outside its protocol shape')
+    message, envelope = _jsonrpc_envelope(await request.aread())
     if isinstance(envelope, JSONRPCNotification):
         try:
             client_notification_adapter.validate_python(message)

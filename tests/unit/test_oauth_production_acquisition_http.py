@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx2
 import pytest
 from mcp.client.auth import OAuthFlowError
+from mcp_types.version import LATEST_MODERN_VERSION
 from kestrel_sdk.security.outbound import assert_safe_url, pinned_httpx2_async_transport
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
@@ -132,6 +133,56 @@ async def test_native_sdk_callback_refusal_sends_no_token_post(acquisition, oaut
     assert oauth_peers.requests.count(('POST', '/token')) == 0
     assert (await slot(a)).state == 'authorizing'
     assert oauth_peers.resource.witness == []
+
+
+@pytest.mark.parametrize('oauth_peers', [{'web_identity': True}], indirect=True)
+async def test_public_discovery_callback_refuses_wrong_state_before_exchange(acquisition, oauth_peers):
+    a, peer = acquisition, oauth_peers
+    peer.resource.settings['oauth'].update(public_discovery=True, metadata_scopes=['read'])
+    started = await a.operation.start()
+    callback = await approve(peer, started)
+    with pytest.raises(GrantRejected, match='does not match the original consent'):
+        await a.operation.complete(callback | {'state': 'different-owned-attempt'}, lambda: None)
+    assert ('POST', '/token') not in peer.requests
+    assert (await slot(a)).state == 'authorizing'
+    assert not a.operation.policy.exchange_started
+
+
+@pytest.mark.parametrize('oauth_peers', [
+    {'web_identity': True, 'query_resource': True},
+    {'web_identity': True, 'query_resource': True, 'resource_path': '/mcp;tenant=west'},
+    {'web_identity': True, 'query_resource': True, 'resource_path': '/mcp/'},
+], indirect=True)
+async def test_public_discovery_preserves_the_query_in_well_known_metadata(acquisition, oauth_peers):
+    a, peer = acquisition, oauth_peers
+    peer.resource.settings['oauth'].update(public_discovery=True, metadata_scopes=['read'],
+        public_discovery_result={'versions': [LATEST_MODERN_VERSION]},
+        metadata_path=urlsplit(peer.selection.protected_metadata).path,
+        metadata_query=b'login')
+    started = await a.operation.start()
+    await a.operation.complete(await approve(peer, started), lambda: None)
+    saved = await slot(a)
+    assert saved.state == 'active' and saved.binding.resource == peer.selection.resource
+    assert saved.binding.protected_metadata == peer.selection.protected_metadata
+    assert peer.requests.count(('POST', '/token')) == 1
+    assert [(scope['method'], scope['query_string']) for scope, _ in peer.resource.requests] == [
+        ('POST', b'login'), ('GET', b'login')]
+
+
+@pytest.mark.parametrize('oauth_peers',
+    [{'web_identity': True, 'query_resource': True, 'resource_path': '/'}], indirect=True)
+async def test_query_scoped_public_discovery_also_tries_the_generic_root_metadata(acquisition, oauth_peers):
+    a, peer = acquisition, oauth_peers
+    peer.resource.settings['oauth'].update(public_discovery=True, metadata_scopes=['read'],
+        public_discovery_result={'versions': [LATEST_MODERN_VERSION]},
+        metadata_path='/.well-known/oauth-protected-resource', metadata_query=b'')
+    started = await a.operation.start()
+    await a.operation.complete(await approve(peer, started), lambda: None)
+    saved = await slot(a)
+    assert saved.state == 'active' and saved.binding.resource == peer.selection.resource
+    assert saved.binding.protected_metadata == peer.selection.protected_metadata.removesuffix('?login')
+    assert [(scope['method'], scope['query_string']) for scope, _ in peer.resource.requests] == [
+        ('POST', b'login'), ('GET', b'login'), ('GET', b'')]
 
 
 @pytest.mark.parametrize('oauth_peers', [{'web_identity': True, 'overgrant': True}], indirect=True)

@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from ._lifecycle import join_maintenance, run_cleanup_steps
 from .http_limits import IDENTITY_ACCEPT_ENCODING
 from .oauth_grants import OAuthGrantRejected, OAuthGrantTokens
-from .oauth_http import BudgetedTransport, OriginPinnedTransport
+from .oauth_http import BudgetedTransport, OriginPinnedTransport, stateless_oauth_cookies
 from .oauth_policy import GrantRejected, GrantSelection, RefreshPolicy, _origin, positive_seconds
 
 
@@ -107,6 +107,7 @@ class OAuthRefresher:
         # the fully formed native request, after public-client authentication.
         async with AsyncOAuth2Client(client_id=binding.client_id, token_endpoint_auth_method='none',
                 token=saved, transport=self._transport, follow_redirects=False, trust_env=False,
+                cookies=stateless_oauth_cookies(),
                 timeout=self.budgets['network_seconds'], headers={'Accept-Encoding': IDENTITY_ACCEPT_ENCODING},
                 event_hooks={'request': [policy.request], 'response': [policy.response]}) as client:
             for url in (binding.protected_metadata, binding.authorization_metadata):

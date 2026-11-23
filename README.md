@@ -252,6 +252,11 @@ the scopes from the provider's documentation. Choose **Authorize connector** to
 start consent, then **Connect** to make the tools available to the selected
 agent. The panel also accepts a custom server URL.
 
+When an MCP server allows public discovery, **Authorize connector** uses the
+server's published OAuth metadata to start consent. Without a scope hint from
+the server, consent requests the scopes you selected.
+The connector can be authorized before agent tools are mounted or called.
+
 Registry HTTPS requests use the SDK's canonical URL policy and pinned transport,
 with native TLS verification, no redirects and no proxy-environment routing.
 Private registry addresses, malformed page envelopes, failed pagination and
