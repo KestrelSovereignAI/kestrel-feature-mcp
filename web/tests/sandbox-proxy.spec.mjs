@@ -212,6 +212,54 @@ test('native App and AppBridge initialize through the mandatory proxy and opaque
     expect(await proxy.evaluate(() => window.proxyErrors)).toEqual([]);
 });
 
+test('an omitted named tool argument crosses the opaque View as JSON', async ({ page }) => {
+    const proxy = await mount(page);
+    await expect.poll(() => proxy.childFrames().length).toBe(1);
+    const view = proxy.childFrames()[0];
+    await expect.poll(() => view.evaluate(() => window.nativeConnected)).toBe(true);
+    await page.evaluate(() => {
+        window.originalCalls = [];
+        bridge.oncalltool = ({ name, arguments: args }) => {
+            originalCalls.push({ name, arguments: args });
+            return { content: [{ type: 'text', text: 'Received original tool call' }] };
+        };
+    });
+    const result = await view.evaluate(() => callNativeTool('platforms', {
+        cartId: undefined, platform: 'festool-18v', count: 0, active: false, explicit: null,
+    }));
+    expect(result.content[0].text).toBe('Received original tool call');
+    expect(await page.evaluate(() => originalCalls)).toStrictEqual([{
+        name: 'platforms', arguments: { platform: 'festool-18v', count: 0, active: false, explicit: null },
+    }]);
+    expect(await proxy.evaluate(() => proxyErrors)).toEqual([]);
+});
+
+test('omitting named tool arguments preserves strict JSON validation elsewhere', async ({ page }) => {
+    await page.goto(hostOrigin);
+    expect(await page.evaluate(async () => {
+        const { OriginBoundTransport } = await import('/host.js');
+        const base = { jsonrpc: '2.0', id: 1, method: 'tools/call' };
+        const invalid = [
+            { ...base, extra: undefined, params: { arguments: { cartId: undefined } } },
+            { ...base, params: { arguments: { cartId: undefined, nested: { field: undefined } } } },
+            { ...base, params: { arguments: { cartId: undefined, list: [undefined] } } },
+            { ...base, method: 'other/method', params: { arguments: { cartId: undefined } } },
+            { ...base, params: { arguments: { ['x'.repeat(4096)]: undefined } } },
+            { ...base, params: { arguments: { ['雪'.repeat(1800)]: undefined } } },
+            { ...base, params: { arguments: Object.fromEntries(
+                Array.from({ length: 30 }, (_, index) => [index + 'x'.repeat(200), undefined])) } },
+        ];
+        return invalid.map(message => {
+            try {
+                OriginBoundTransport.validateMessage(message, 4096);
+                return false;
+            } catch (error) {
+                return error instanceof TypeError;
+            }
+        });
+    })).toEqual([true, true, true, true, true, true, true]);
+});
+
 test('a native App tool call receives only its final Task result through the original View', async ({ page }) => {
     const reference = 'a'.repeat(43), viewId = 'b'.repeat(43);
     const task = { handle: '00000000-0000-4000-8000-000000000001', reference: 'c'.repeat(64) };

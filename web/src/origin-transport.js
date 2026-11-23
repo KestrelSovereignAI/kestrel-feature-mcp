@@ -44,9 +44,39 @@ export class OriginBoundTransport {
         // Stringification rejects cycles/BigInts; JSONValueSchema also refuses
         // non-JSON structured-clone values rather than coercing them on wire.
         const encoded = JSON.stringify(value);
-        if (typeof encoded !== 'string' || encoded.length > maxMessageBytes
-            || new TextEncoder().encode(encoded).byteLength > maxMessageBytes) {
+        const encoder = new TextEncoder();
+        let bytes = typeof encoded === 'string' && encoded.length <= maxMessageBytes
+            ? encoder.encode(encoded).byteLength : Infinity;
+        if (bytes > maxMessageBytes) {
             throw new TypeError('Sandbox message exceeds its byte limit or is not JSON');
+        }
+        // postMessage preserves undefined object members. A named tool
+        // argument with no value has the same JSON representation as an
+        // omitted argument. Keep the rest of the envelope strictly JSON.
+        const args = value?.params?.arguments;
+        if (value?.method === 'tools/call' && Object.hasOwn(value, 'id')
+            && Object.getPrototypeOf(value) === Object.prototype
+            && value.params && Object.getPrototypeOf(value.params) === Object.prototype
+            && args && Object.getPrototypeOf(args) === Object.prototype) {
+            const omitted = [];
+            for (const name in args) {
+                if (!Object.hasOwn(args, name) || args[name] !== undefined) continue;
+                // Count the omitted name and the space a minimal JSON member
+                // would use before allocating a copy of the arguments.
+                if (bytes + name.length + 8 > maxMessageBytes) {
+                    throw new TypeError('Sandbox message exceeds its byte limit');
+                }
+                bytes += encoder.encode(JSON.stringify(name)).byteLength + 6;
+                if (bytes > maxMessageBytes) throw new TypeError('Sandbox message exceeds its byte limit');
+                omitted.push(name);
+            }
+            if (omitted.length) {
+                const argumentsCopy = { ...args };
+                for (const name of omitted) delete argumentsCopy[name];
+                value = { ...value, params: { ...value.params,
+                    arguments: argumentsCopy,
+                } };
+            }
         }
         const json = JSONValueSchema.safeParse(value);
         const message = json.success && JSONRPCMessageSchema.safeParse(json.data);
