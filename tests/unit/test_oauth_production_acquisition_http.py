@@ -120,13 +120,14 @@ async def test_actual_native_web_acquisition_commits_intent_before_one_exchange(
 
 @pytest.mark.parametrize('oauth_peers', [{'web_identity': True}], indirect=True)
 @pytest.mark.parametrize('changed', [{'state': 'different-owned-attempt'},
-    {'iss': 'https://other-issuer.example'}, {'iss': None}])
+    {'iss': 'https://other-issuer.example'}, {'iss': None},
+    {'iss': 'https://other-issuer.example', 'code': None, 'error': 'access_denied'}])
 async def test_native_sdk_callback_refusal_sends_no_token_post(acquisition, oauth_peers, changed):
     a = acquisition
     started = await a.operation.start()
     callback = await approve(oauth_peers, started)
     callback.update(changed)
-    with pytest.raises(OAuthFlowError):
+    with pytest.raises(OAuthFlowError if 'state' in changed else GrantRejected):
         await a.operation.complete(callback, lambda: None)
     assert oauth_peers.requests.count(('POST', '/token')) == 0
     assert (await slot(a)).state == 'authorizing'
@@ -367,7 +368,8 @@ async def test_denied_callback_abandons_before_returning_a_safe_failure(acquisit
     a = acquisition
     started = await a.operation.start()
     with pytest.raises(GrantRejected, match='denied'):
-        await a.operation.complete({'state': started['state'], 'error': 'access_denied'}, lambda: None)
+        await a.operation.complete({'state': started['state'], 'error': 'access_denied',
+            'iss': started['issuer']}, lambda: None)
     assert (await slot(a)).reason == 'abandoned'
     assert a.operation._withdrawn
 

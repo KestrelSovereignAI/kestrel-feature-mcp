@@ -215,6 +215,8 @@ class AuthorizationOperation:
         check()
         if self._task is None or self._callback.done() or self._withdrawn:
             raise GrantRejected('The original OAuth operation cannot accept another callback')
+        if callback.get('iss') != self.policy.selection.issuer:
+            raise GrantRejected('The OAuth response did not identify the selected issuer')
         if callback.get('error') is not None:
             await self.cancel(check)
             raise GrantRejected('The authorization server denied this OAuth request')
