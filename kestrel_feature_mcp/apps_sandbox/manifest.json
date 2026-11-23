@@ -21,7 +21,7 @@
     "src/input-entry.js": "56b172f32c659b4421aab1c7cb7edcbd8a52c1d15f9ed0af1e00cba189f64055",
     "src/oauth-panel.css": "166da4e3bb8005b65685f4639caa80bcce5858e91d785e360376b57e5c94d268",
     "src/oauth-panel.js": "8845d5d00b9421fb241ec4148ce14eba331abb7bc371487b9ac52eb567398db4",
-    "src/origin-transport.js": "7df4d94e870edd9a73ba34f5ce0773e07709aa6809a4111c6534eccb7f459689",
+    "src/origin-transport.js": "5ee60a0c34a36431a852c8b7ed0689a6a16acc746329aa5a0c4244d15624bcae",
     "src/parent-entry.js": "99baa8d1679c944d345915893db6993da9186265d6a4841c7cde73fa4a89bee6",
     "src/parent-view.js": "8d4162705cc980266ee0fd5ff4621a76919446dd4bba6bce698748fa5d7549ae",
     "src/sandbox-assets.js": "1fdcbb42c664d237302ac1db36ec260c0163ee88a17e8affa94f99a86d87d380",
@@ -200,7 +200,7 @@
     "src/input-card.js": "19621900c4a435aee7feb9898f3bf06d2b39d42a6edbdfeb6a8182be4d7b16fc",
     "src/input-entry.js": "56b172f32c659b4421aab1c7cb7edcbd8a52c1d15f9ed0af1e00cba189f64055",
     "src/oauth-panel.js": "8845d5d00b9421fb241ec4148ce14eba331abb7bc371487b9ac52eb567398db4",
-    "src/origin-transport.js": "7df4d94e870edd9a73ba34f5ce0773e07709aa6809a4111c6534eccb7f459689",
+    "src/origin-transport.js": "5ee60a0c34a36431a852c8b7ed0689a6a16acc746329aa5a0c4244d15624bcae",
     "src/parent-entry.js": "99baa8d1679c944d345915893db6993da9186265d6a4841c7cde73fa4a89bee6",
     "src/parent-view.js": "8d4162705cc980266ee0fd5ff4621a76919446dd4bba6bce698748fa5d7549ae",
     "src/sandbox-assets.js": "1fdcbb42c664d237302ac1db36ec260c0163ee88a17e8affa94f99a86d87d380",
@@ -365,8 +365,8 @@
     "input-entry.js": "2abadd92a5cb736b959f0b44ed1c02d4e0afed50bdc1f7e3f45894cf09275f25",
     "oauth-panel.css": "166da4e3bb8005b65685f4639caa80bcce5858e91d785e360376b57e5c94d268",
     "oauth-panel.js": "f055b2ebe49b0acf3515c79b728439f8abd0cafad5ecc9da09c79eead2e567bb",
-    "parent-entry.js": "c132fbea72b93abea012dff04b33d2a42916e5568c3eb5273bf8631c46cc65a4",
-    "sandbox-entry.js": "9d10d2cc095a19b63e907f5e73871fb9d18e12809bc23e1742842778ec40fcf1",
+    "parent-entry.js": "2c0b9bacee191ca47c4b5b3dc83ecf8fc7e8d7829525a2d79fb15f9009e4893d",
+    "sandbox-entry.js": "a4bc9d135cc5c2ff17fcc3bfa7b12aed10742158b89d32b28193a76ee2632a61",
     "sandbox-service.mjs": "bc2c6476a280daa45e857d101f434d0dc14ee5fc96dcd2fd92f0445409e12d19",
     "THIRD_PARTY_NOTICES.txt": "5176f1d103deea45d829e91f31e0d683425bd7eee067c37c135130f20829863f"
   }
