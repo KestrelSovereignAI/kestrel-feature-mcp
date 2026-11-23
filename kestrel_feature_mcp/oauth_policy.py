@@ -7,7 +7,7 @@ import json
 import math
 import sys
 import re
-from urllib.parse import parse_qs, parse_qsl, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import httpx2
 from mcp.client.session import DEFAULT_CLIENT_INFO
@@ -138,16 +138,18 @@ async def validate_token_request(request, selected, *, grant_type):
 def _origin(url: str, *, allow_query: bool = False) -> str:
     try:
         parsed = urlsplit(url)
+        canonical = httpx2.URL(url) if allow_query else None
         _ = parsed.port
-    except ValueError:
+    except (ValueError, httpx2.InvalidURL):
         raise GrantRejected("Malformed OAuth endpoint") from None
     if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
-            or parsed.password is not None or "#" in url or (not allow_query and parsed.query)):
+            or parsed.password is not None or "#" in url):
         raise GrantRejected("Grant endpoints must be exact HTTPS URLs without credentials")
-    if any(key.casefold() in {"access_token", "refresh_token", "client_secret"}
-           for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
-        raise GrantRejected("Grant URLs cannot carry OAuth credential query parameters")
-    if allow_query and str(httpx2.URL(url)) != url:
+    # The resource identifier appears in the browser redirect and grant
+    # metadata. Accept the supported value-free authentication selector.
+    if "?" in url and (not allow_query or url.partition("?")[2] != "login"):
+        raise GrantRejected("OAuth endpoint uses an unsupported query selector")
+    if canonical is not None and str(canonical) != url:
         raise GrantRejected("OAuth resource and metadata URLs must already be HTTP-canonical")
     return parsed.scheme + "://" + parsed.netloc
 

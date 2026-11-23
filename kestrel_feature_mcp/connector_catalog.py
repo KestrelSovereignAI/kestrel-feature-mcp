@@ -24,15 +24,15 @@ NO_STORE = {"Cache-Control": "private, no-store"}
 
 
 def _selectable_url(url):
-    if len(url) > MAX_CONNECTOR_URL or any(char.isspace() or char in r"{}\?#" for char in url):
+    if len(url) > MAX_CONNECTOR_URL or any(char.isspace() or char in r"{}\#" for char in url):
         return False
     try:
-        _origin(url)
+        _origin(url, allow_query=True)
         parsed = httpx2.URL(url)
         host = parsed.host
     except (GrantRejected, httpx2.InvalidURL, UnicodeError):
         return False
-    if str(parsed) != url or parsed.port == 0 or host.rstrip('.').split('.')[-1] == 'localhost':
+    if parsed.port == 0 or host.rstrip('.').split('.')[-1] == 'localhost':
         return False
     try:
         ip_address(host)
