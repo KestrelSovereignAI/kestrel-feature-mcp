@@ -150,9 +150,9 @@ explicit release gate, not a claim established by synthetic integration tests.
 
 The SDK discovers the protected resource and authorization server and performs
 the single authorization-code exchange. Kestrel starts discovery with the native
-`server/discover` request over Streamable HTTP. When the connector uses a query
-to select a protected resource, the grant retains the exact resource URL and
-the metadata URL advertised by the challenge, including their queries.
+`server/discover` request over Streamable HTTP. For connectors using the
+value-free `?login` selector, Kestrel preserves the exact resource identifier
+and the metadata URL advertised by the challenge.
 Authlib performs explicit, single-attempt
 refresh. Tokens are encrypted with the SDK's agent key; provision the normal
 Kestrel data key before authorization and preserve it across restarts. Tokens

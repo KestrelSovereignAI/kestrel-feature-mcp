@@ -65,7 +65,7 @@ async def test_acquisition_never_dispatches_an_mcp_operation(selection, method):
 
 
 @pytest.mark.parametrize('endpoint_query,reported_query', [
-    ('?login', ''), ('?login', '?other=true'), ('', '?other=true'),
+    ('?login', ''), ('', '?login'),
 ])
 def test_query_scoped_resource_cannot_change_its_binding(selection, endpoint_query, reported_query):
     with pytest.raises(GrantRejected, match='exact resource identifier'):
@@ -73,16 +73,26 @@ def test_query_scoped_resource_cannot_change_its_binding(selection, endpoint_que
                 resource=selection.resource + reported_query)
 
 
-@pytest.mark.parametrize('field', ['server_url', 'resource', 'protected_metadata'])
-def test_query_cannot_embed_oauth_credentials(selection, field):
-    with pytest.raises(GrantRejected, match='credential query parameters'):
-        replace(selection, **{field: getattr(selection, field) + '?access%5Ftoken=test'})
+@pytest.mark.parametrize('field,query', [
+    ('server_url', '?api_key=test'), ('resource', '?token=test'),
+    ('protected_metadata', '?access%5Ftoken=test'),
+    ('server_url', '?login=test'), ('server_url', '?'), ('resource', '?'),
+    ('server_url', '?login&token=test'), ('server_url', '?login;token=test'),
+])
+def test_oauth_url_accepts_only_the_value_free_query_selector(selection, field, query):
+    with pytest.raises(GrantRejected, match='unsupported query selector'):
+        replace(selection, **{field: getattr(selection, field) + query})
 
 
 @pytest.mark.parametrize('field', ['server_url', 'protected_metadata'])
 def test_query_scoped_urls_must_use_the_exact_http_wire_spelling(selection, field):
     with pytest.raises(GrantRejected, match='HTTP-canonical'):
-        replace(selection, **{field: getattr(selection, field) + '?query=a b'})
+        replace(selection, **{field: getattr(selection, field) + ' space?login'})
+
+
+def test_invalid_http_authority_is_a_grant_rejection(selection):
+    with pytest.raises(GrantRejected, match='Malformed OAuth endpoint'):
+        replace(selection, server_url='https://999.0.0.1/mcp?login')
 
 
 @pytest.mark.parametrize('header,value', [

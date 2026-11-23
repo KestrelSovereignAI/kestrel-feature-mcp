@@ -48,9 +48,11 @@ def test_connector_presets_have_resolvable_refs_in_the_host_config_schema():
     validator = Draft202012Validator(schema)
     configuration = {'oauth': {'connector_presets': [{
         'name': 'example.com/owned', 'title': 'Owned connector',
-        'url': 'https://resource.example/mcp', 'scopes': ['read'],
+        'url': 'https://resource.example/mcp?login', 'scopes': ['read'],
     }]}}
     validator.validate(configuration)
+    preset = configuration['oauth']['connector_presets'][0]
+    assert OAuthSettings.model_validate({'connector_presets': [preset]}).connector_presets[0].url == preset['url']
     del configuration['oauth']['connector_presets'][0]['scopes']
     assert not validator.is_valid(configuration)
 
@@ -68,6 +70,8 @@ def test_connector_search_projects_only_selectable_schema_validated_remotes():
     ]}
     server['remotes'] = [
         bearer_endpoint, bearer_endpoint,
+        {'type': 'streamable-http', 'url': url + '?login'},
+        {'type': 'streamable-http', 'url': url + '?api_key=private'},
         {'type': 'sse', 'url': url + '/sse'},
         {'type': 'streamable-http', 'url': 'http://resource.example/mcp'},
         {'type': 'streamable-http', 'url': url + '/{region}'},
@@ -110,6 +114,8 @@ def test_connector_search_projects_only_selectable_schema_validated_remotes():
     assert not truncated
     assert choices == [
         preset,
+        {'name': server['name'], 'title': server.get('title') or server['name'],
+         'description': server['description'], 'url': url + '?login', 'scopes': []},
         {'name': 'com.example/other', 'title': server.get('title') or 'com.example/other',
          'description': server['description'], 'url': url, 'scopes': []},
         {'name': 'com.example/older', 'title': 'Older?',
