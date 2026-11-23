@@ -112,7 +112,7 @@ class OriginPinnedTransport(httpx2.AsyncBaseTransport):
         from .oauth_policy import _origin
 
         url = str(request.url)
-        origin = _origin(url)
+        origin = _origin(url, allow_query=True)
         async with self._lock:
             if self._closed or origin not in self._approved_origins():
                 raise GrantRejected('OAuth origin is not currently approved for network I/O')

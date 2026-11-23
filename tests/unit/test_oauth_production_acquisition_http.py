@@ -69,7 +69,9 @@ async def slot(attempt):
 
 @pytest.mark.parametrize('oauth_peers', [{'web_identity': True},
     {'web_identity': True, 'omit_token_scope': True},
-    {'web_identity': True, 'parent_resource': True}], indirect=True)
+    {'web_identity': True, 'parent_resource': True},
+    {'web_identity': True, 'get_not_supported': True},
+    {'web_identity': True, 'query_resource': True, 'get_not_supported': True}], indirect=True)
 async def test_actual_native_web_acquisition_commits_intent_before_one_exchange(acquisition, oauth_peers):
     a, peer = acquisition, oauth_peers
     operation = a.operation
@@ -100,6 +102,13 @@ async def test_actual_native_web_acquisition_commits_intent_before_one_exchange(
     assert payload.tokens.access_token == 'native-fixture-access'
     assert payload.tokens.scopes == frozenset({'read'})
     assert payload.tokens.expires_at > 1_700_000_000
+    probes = [scope for scope, _ in peer.resource.requests if scope["path"] == "/mcp"]
+    assert [scope["method"] for scope in probes] == ["POST", "POST"]
+    assert all(dict(scope["headers"])[b"mcp-method"] == b"server/discover" for scope in probes)
+    if peer.options.get('query_resource'):
+        assert all(scope["query_string"] == b"login" for scope, _ in peer.resource.requests)
+    assert storage.snapshot.binding.resource == peer.selection.resource
+    assert storage.snapshot.binding.protected_metadata == peer.selection.protected_metadata
     assert await storage.get_tokens() is None
     assert 'begin-current' in a.checks and 'callback-current' in a.checks
     assert peer.resource.witness == []
@@ -275,7 +284,7 @@ async def test_explicit_cancel_abandons_its_original_unexchanged_slot(acquisitio
     assert snapshot.state == 'revoked' and snapshot.reason == 'abandoned'
 
 
-@pytest.mark.parametrize('oauth_peers', [{'web_identity': True, 'denied_authenticated_get': 403}], indirect=True)
+@pytest.mark.parametrize('oauth_peers', [{'web_identity': True, 'denied_authenticated_discover': 403}], indirect=True)
 async def test_post_commit_resource_refusal_preserves_metadata_and_names_its_disposition(acquisition, oauth_peers):
     a = acquisition
     started = await a.operation.start()
