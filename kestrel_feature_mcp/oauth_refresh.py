@@ -96,7 +96,7 @@ class OAuthRefresher:
 
         policy = RefreshPolicy(selected, on_exchange=begin_exchange, on_rejection=rejected,
             response_max_bytes=self.budgets['response_max_bytes'])
-        origins = {_origin(binding.server_url), _origin(binding.issuer)}
+        origins = {_origin(binding.server_url, allow_query=True), _origin(binding.issuer)}
         self._transport = BudgetedTransport(OriginPinnedTransport(lambda: origins),
             self.budgets['response_max_bytes'], self.budgets['network_seconds'])
         saved = {'access_token': tokens.access_token, 'refresh_token': tokens.refresh_token,

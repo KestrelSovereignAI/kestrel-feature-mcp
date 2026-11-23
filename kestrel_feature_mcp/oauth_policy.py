@@ -7,7 +7,7 @@ import json
 import math
 import sys
 import re
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 import httpx2
 from mcp.client.auth.utils import (
@@ -17,12 +17,35 @@ from mcp.client.auth.utils import (
 )
 from mcp.shared.auth import OAuthMetadata, OAuthToken, ProtectedResourceMetadata
 from mcp_types import (
-    JSONRPCMessage, JSONRPCNotification, JSONRPCRequest, client_notification_adapter, jsonrpc_message_adapter,
+    CLIENT_CAPABILITIES_META_KEY,
+    CLIENT_INFO_META_KEY,
+    PROTOCOL_VERSION_META_KEY,
+    ClientCapabilities,
+    DiscoverRequest,
+    Implementation,
+    JSONRPCMessage,
+    JSONRPCNotification,
+    JSONRPCRequest,
+    RequestParams,
+    client_notification_adapter,
+    jsonrpc_message_adapter,
 )
+from mcp_types.version import LATEST_PROTOCOL_VERSION
 from mcp.shared.auth_utils import check_resource_allowed, resource_url_from_server_url
 from pydantic import ValidationError
 
 DEFAULT_RESPONSE_MAX_BYTES = 65536
+_DISCOVERY = DiscoverRequest(params=RequestParams(_meta={
+    PROTOCOL_VERSION_META_KEY: LATEST_PROTOCOL_VERSION,
+    CLIENT_INFO_META_KEY: Implementation(name="Kestrel", version="1").model_dump(
+        mode="json", by_alias=True, exclude_none=True,
+    ),
+    CLIENT_CAPABILITIES_META_KEY: ClientCapabilities().model_dump(mode="json", by_alias=True, exclude_none=True),
+}))
+DISCOVERY_PROBE_BODY = JSONRPCRequest(
+    jsonrpc="2.0", id=0, **_DISCOVERY.model_dump(mode="json", by_alias=True, exclude_none=True),
+).model_dump_json(by_alias=True, exclude_none=True).encode()
+DISCOVERY_PROBE_METHOD = _DISCOVERY.method
 _TOKEN_ERRORS = frozenset({
     'invalid_request', 'invalid_client', 'invalid_grant', 'unauthorized_client',
     'unsupported_grant_type', 'invalid_scope',
@@ -106,14 +129,17 @@ async def validate_token_request(request, selected, *, grant_type):
         raise GrantRejected("Native token request exceeded the approved scopes")
 
 
-def _origin(url: str) -> str:
+def _origin(url: str, *, allow_query: bool = False) -> str:
     try:
         parsed = urlsplit(url)
         _ = parsed.port
     except ValueError:
         raise GrantRejected("Malformed OAuth endpoint") from None
     if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
-            or parsed.password is not None or parsed.fragment or parsed.query):
+            or parsed.password is not None or "#" in url or (not allow_query and parsed.query)):
+        raise GrantRejected("Grant endpoints must be exact HTTPS URLs without credentials")
+    if any(key.casefold() in {"access_token", "refresh_token", "client_secret"}
+           for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
         raise GrantRejected("Grant endpoints must be exact HTTPS URLs without credentials")
     return parsed.scheme + "://" + parsed.netloc
 
@@ -138,11 +164,15 @@ class GrantSelection:
     scopes: frozenset[str]
 
     def __post_init__(self):
-        server_origin, issuer_origin = _origin(self.server_url), _origin(self.issuer)
-        _origin(self.resource)
-        if not check_resource_allowed(resource_url_from_server_url(self.server_url), self.resource):
+        server_origin = _origin(self.server_url, allow_query=True)
+        issuer_origin = _origin(self.issuer)
+        _origin(self.resource, allow_query=True)
+        server_resource = resource_url_from_server_url(self.server_url)
+        if not check_resource_allowed(server_resource, self.resource):
             raise GrantRejected("The selected resource must be a valid parent of the MCP endpoint")
-        if _origin(self.protected_metadata) != server_origin:
+        if (urlsplit(server_resource).query or urlsplit(self.resource).query) and self.resource != server_resource:
+            raise GrantRejected("A query-scoped MCP endpoint requires an exact resource identifier")
+        if _origin(self.protected_metadata, allow_query=True) != server_origin:
             raise GrantRejected("Resource metadata must belong to the selected resource origin")
         if _origin(self.authorization_metadata) != issuer_origin:
             raise GrantRejected("Authorization metadata must belong to the selected issuer origin")
@@ -253,7 +283,7 @@ class ClientIdentity:
 
 
 class BootstrapPolicy:
-    """Native SDK discovery and one code exchange, using only a harmless GET.
+    """Native SDK discovery and one code exchange from a stateless MCP probe.
 
     Standard discovery candidates come from the SDK. A 404 or 405 permits
     the next standard candidate; malformed metadata or another failure stops
@@ -264,7 +294,7 @@ class BootstrapPolicy:
                  *, on_exchange, on_rejection=None, response_max_bytes=DEFAULT_RESPONSE_MAX_BYTES):
         self.server_url, self.identity, self.scopes = server_url, identity, scopes
         self.response_max_bytes = response_budget(response_max_bytes)
-        self.approved_origins = {_origin(server_url)}
+        self.approved_origins = {_origin(server_url, allow_query=True)}
         self.on_exchange, self.on_rejection = on_exchange, on_rejection
         self._resource_urls: set[str] = set()
         self._authorization_urls: set[str] = set()
@@ -272,6 +302,7 @@ class BootstrapPolicy:
         self.exchange_started = False
         self.grant_ready = False
         self._probe_seen = False
+        self._probe_retried = False
 
     @property
     def selection(self):
@@ -287,11 +318,20 @@ class BootstrapPolicy:
         url = str(request.url)
         bearer = request.headers.get('Authorization')
         if url == self.server_url:
-            if request.method != 'GET' or (bearer and not self.grant_ready):
-                raise GrantRejected('OAuth acquisition permits only its original GET probe')
-            if self._probe_seen and not self.grant_ready:
-                raise GrantRejected('OAuth acquisition cannot replay an unauthenticated probe')
-            self._probe_seen = True
+            if (request.method != 'POST'
+                    or request.headers.get('MCP-Method') != DISCOVERY_PROBE_METHOD
+                    or request.headers.get('MCP-Protocol-Version') != LATEST_PROTOCOL_VERSION
+                    or await request.aread() != DISCOVERY_PROBE_BODY
+                    or bool(bearer) != self.grant_ready):
+                raise GrantRejected('OAuth acquisition permits only its original MCP discovery probe')
+            if self.grant_ready:
+                if not self._probe_seen or self._probe_retried:
+                    raise GrantRejected('OAuth acquisition cannot replay the completed probe')
+                self._probe_retried = True
+            else:
+                if self._probe_seen:
+                    raise GrantRejected('OAuth acquisition cannot replay an unauthenticated probe')
+                self._probe_seen = True
             return
         if bearer:
             raise GrantRejected('Credentials cannot leave the selected resource')
@@ -324,7 +364,8 @@ class BootstrapPolicy:
                 raise GrantRejected('The selected resource did not request OAuth authorization')
             advertised = extract_resource_metadata_from_www_auth(response)
             urls = build_protected_resource_metadata_discovery_urls(advertised, self.server_url)
-            if any(_origin(candidate) != _origin(self.server_url) for candidate in urls):
+            server_origin = _origin(self.server_url, allow_query=True)
+            if any(_origin(candidate, allow_query=True) != server_origin for candidate in urls):
                 raise GrantRejected('Resource metadata must belong to the selected resource origin')
             self._resource_urls = set(urls)
             return

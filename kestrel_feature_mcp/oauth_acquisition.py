@@ -9,7 +9,9 @@ import time
 from mcp.client.auth.utils import create_client_info_from_metadata_url
 
 from .oauth_grants import OAuthGrantBinding, OAuthGrantTokens
-from .oauth_policy import GrantRejected, ResourceGrantRejected, positive_seconds
+from .oauth_policy import (
+    DISCOVERY_PROBE_BODY, DISCOVERY_PROBE_METHOD, GrantRejected, ResourceGrantRejected, positive_seconds,
+)
 from ._lifecycle import run_cleanup_steps
 
 
@@ -180,8 +182,10 @@ class AuthorizationOperation:
         async with httpx2.AsyncClient(transport=self._transport, auth=GuardedAuth(provider, self.policy),
                 headers={'Accept-Encoding': IDENTITY_ACCEPT_ENCODING}, trust_env=False,
                 follow_redirects=False, timeout=self.budgets['network_seconds']) as client:
-            async with client.stream('GET', self.server_url, headers={
-                    'Accept': 'application/json', 'MCP-Protocol-Version': LATEST_PROTOCOL_VERSION}) as response:
+            async with client.stream('POST', self.server_url, content=DISCOVERY_PROBE_BODY, headers={
+                    'Accept': 'application/json, text/event-stream', 'Content-Type': 'application/json',
+                    'MCP-Method': DISCOVERY_PROBE_METHOD,
+                    'MCP-Protocol-Version': LATEST_PROTOCOL_VERSION}) as response:
                 # Acquisition ends at headers, never waiting on a resource SSE
                 # stream and never using this provider for an MCP operation.
                 if response.status_code in {401, 403}:

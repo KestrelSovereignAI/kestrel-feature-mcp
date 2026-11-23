@@ -234,6 +234,9 @@ async def mcp_http_server(request, tmp_path, app_resource_html):
                             "scopes_supported": ["read", "write"]}
                 return await JSONResponse(document)(scope, receive, send)
             headers = dict(scope["headers"])
+            if scope["method"] == "GET" and oauth.get("get_not_supported"):
+                requests.append((scope, b""))
+                return await Response(status_code=405)(scope, receive, send)
             if headers.get(b"authorization") != ("Bearer " + oauth["access_token"]).encode():
                 requests.append((scope, b""))
                 challenge = (f'Bearer resource_metadata="{oauth["metadata"]}", '
@@ -244,6 +247,10 @@ async def mcp_http_server(request, tmp_path, app_resource_html):
             if scope["method"] == "GET" and oauth.get("denied_authenticated_get"):
                 requests.append((scope, b""))
                 return await Response(status_code=oauth["denied_authenticated_get"])(scope, receive, send)
+            if (headers.get(b"mcp-method") == b"server/discover"
+                    and oauth.get("denied_authenticated_discover")):
+                requests.append((scope, b""))
+                return await Response(status_code=oauth["denied_authenticated_discover"])(scope, receive, send)
             if (settings.get("bootstrap_event_stream") and scope["method"] == "GET"
                     and headers.get(b"accept") == b"application/json"):
                 async def held_event_stream():

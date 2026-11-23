@@ -19,6 +19,8 @@ from tests.unit.test_oauth_grants import install_grant
 @pytest.mark.parametrize('oauth_peers', [
     {'refresh': True, 'refresh_rotate': True, 'web_identity': True},
     {'refresh': True, 'refresh_rotate': False, 'web_identity': True},
+    {'refresh': True, 'refresh_rotate': True, 'web_identity': True,
+     'query_resource': True, 'get_not_supported': True},
 ], indirect=True)
 async def test_public_authlib_refresh_survives_two_fresh_processes(oauth_peers, tmp_path, owned_oauth_key):
     peers = oauth_peers
@@ -74,6 +76,8 @@ async def test_public_authlib_refresh_survives_two_fresh_processes(oauth_peers, 
     assert peers.requests.count(('POST', '/token')) == 1
     assert ('GET', '/authorize') not in peers.requests and not peers.browser_requests
     assert peers.resource.witness == []
+    if peers.options.get('query_resource'):
+        assert all(scope['query_string'] == b'login' for scope, _ in peers.resource.requests)
     assert {name for name in peers.issuer.server_names} == {'issuer.example'}
     assert {name for name in peers.resource.server_names} == {'remote.example'}
     messages = [json.loads(body) for _, body in peers.resource.requests if body]

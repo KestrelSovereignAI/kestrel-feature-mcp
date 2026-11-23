@@ -69,6 +69,8 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
     resource_peer = mcp_http_server
     resource_port = urlsplit(resource_peer.url).port
     resource_url = f"https://remote.example:{resource_port}/mcp"
+    if options.get("query_resource"):
+        resource_url += "?login"
     resource_id = resource_url.rsplit("/mcp", 1)[0] if options.get("parent_resource") else resource_url
     reservation = socket.socket()
     request.addfinalizer(reservation.close)
@@ -235,6 +237,8 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             metadata=resource_url.replace("/mcp", "/.well-known/oauth-protected-resource/mcp"),
             challenge_scope=options.get("challenge_scope", "read"),
             denied_authenticated_get=options.get("denied_authenticated_get"),
+            denied_authenticated_discover=options.get("denied_authenticated_discover"),
+            get_not_supported=options.get("get_not_supported", False),
         )
         if options.get("redirect_resource"):
             resource_peer.settings["oauth"]["redirect_to"] = resource_url
