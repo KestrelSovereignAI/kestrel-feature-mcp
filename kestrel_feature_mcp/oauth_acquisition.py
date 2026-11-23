@@ -10,7 +10,7 @@ from mcp.client.auth.utils import create_client_info_from_metadata_url
 
 from .oauth_grants import OAuthGrantBinding, OAuthGrantTokens
 from .oauth_policy import (
-    DISCOVERY_PROBE_BODY, DISCOVERY_PROBE_METHOD, GrantRejected, ResourceGrantRejected, positive_seconds,
+    DISCOVERY_PROBE_BODY, DISCOVERY_PROBE_HEADERS, GrantRejected, ResourceGrantRejected, positive_seconds,
 )
 from ._lifecycle import run_cleanup_steps
 
@@ -161,7 +161,6 @@ class AuthorizationOperation:
         import httpx2
         from mcp.client.auth import OAuthClientProvider
         from mcp.shared.auth import OAuthClientMetadata
-        from mcp_types.version import LATEST_PROTOCOL_VERSION
         from .http_limits import IDENTITY_ACCEPT_ENCODING
         from .oauth_http import BudgetedTransport, GuardedAuth, OriginPinnedTransport, fetch_client_document
 
@@ -182,12 +181,10 @@ class AuthorizationOperation:
         async with httpx2.AsyncClient(transport=self._transport, auth=GuardedAuth(provider, self.policy),
                 headers={'Accept-Encoding': IDENTITY_ACCEPT_ENCODING}, trust_env=False,
                 follow_redirects=False, timeout=self.budgets['network_seconds']) as client:
-            async with client.stream('POST', self.server_url, content=DISCOVERY_PROBE_BODY, headers={
-                    'Accept': 'application/json, text/event-stream', 'Content-Type': 'application/json',
-                    'MCP-Method': DISCOVERY_PROBE_METHOD,
-                    'MCP-Protocol-Version': LATEST_PROTOCOL_VERSION}) as response:
-                # Acquisition ends at headers, never waiting on a resource SSE
-                # stream and never using this provider for an MCP operation.
+            async with client.stream('POST', self.server_url, content=DISCOVERY_PROBE_BODY,
+                                     headers=DISCOVERY_PROBE_HEADERS) as response:
+                # Acquisition ends at headers. A later connection performs
+                # its own native MCP negotiation and tool discovery.
                 if response.status_code in {401, 403}:
                     raise ResourceGrantRejected('The resource rejected the completed OAuth authorization')
         self._check()

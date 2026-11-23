@@ -236,7 +236,6 @@ async def oauth_peers(mcp_http_server, request, tmp_path, monkeypatch):
             resource=resource_id, issuer=state.issuer, access_token=state.access_token,
             metadata=resource_url.replace("/mcp", "/.well-known/oauth-protected-resource/mcp"),
             challenge_scope=options.get("challenge_scope", "read"),
-            denied_authenticated_get=options.get("denied_authenticated_get"),
             denied_authenticated_discover=options.get("denied_authenticated_discover"),
             get_not_supported=options.get("get_not_supported", False),
         )
@@ -333,15 +332,16 @@ async def test_actual_native_initial_grant_and_canonical_mcp_discovery(oauth_pee
     assert set(oauth_peers.resource.server_names) == {"remote.example"}
     assert oauth_peers.resource.witness == []
     methods = [json.loads(body)["method"] for _, body in oauth_peers.resource.requests if body]
-    assert methods == ["server/discover", "tools/list"]
+    assert methods == ["server/discover", "server/discover", "tools/list"]
     assert "native-fixture-access" not in json.dumps(result)
 
 
-@pytest.mark.parametrize("mcp_http_server,protocol,get_status", [
-    ({"tls": True, "oauth": {}}, "2026-07-28", 405),
-    ({"tls": True, "oauth": {}, "legacy": True}, "2025-11-25", 406),
+@pytest.mark.parametrize("mcp_http_server,protocol,probe_status", [
+    ({"tls": True, "oauth": {}}, "2026-07-28", 200),
+    ({"tls": True, "oauth": {}, "legacy": True}, "2025-11-25", 404),
 ], indirect=["mcp_http_server"])
-async def test_native_get_status_does_not_replace_mcp_negotiation(oauth_peers, protocol, get_status):
+@pytest.mark.parametrize("oauth_peers", [{"get_not_supported": True}], indirect=True)
+async def test_native_oauth_probe_does_not_substitute_for_mcp_negotiation(oauth_peers, protocol, probe_status):
     result = error = None
     try:
         result = await drive(oauth_peers)
@@ -349,7 +349,8 @@ async def test_native_get_status_does_not_replace_mcp_negotiation(oauth_peers, p
         error = caught
     # Observe the actual SDK transport's response and real token exchange
     # before inspecting the acceptance result.
-    assert ("GET", "/mcp", get_status) in oauth_peers.resource.settings["responses"]
+    assert ("POST", "/mcp", probe_status) in oauth_peers.resource.settings["responses"]
+    assert oauth_peers.resource.requests[0][0]["method"] == "POST"
     assert oauth_peers.requests.count(("POST", "/token")) == 1
     assert error is None
     assert result["stage"] == "authorized_and_discovered"
@@ -429,8 +430,8 @@ async def test_human_consent_wait_is_separate_from_each_network_exchange(oauth_p
 
 
 @pytest.mark.parametrize("mcp_http_server", [{"tls": True, "oauth": {}}], indirect=True)
-@pytest.mark.parametrize("oauth_peers", [{"denied_authenticated_get": 401},
-                                         {"denied_authenticated_get": 403}], indirect=True)
+@pytest.mark.parametrize("oauth_peers", [{"denied_authenticated_discover": 401},
+                                         {"denied_authenticated_discover": 403}], indirect=True)
 async def test_completed_exchange_does_not_hide_resource_authorization_denial(oauth_peers):
     with pytest.raises(GrantRejected, match="resource rejected the completed initial authorization"):
         await drive(oauth_peers)

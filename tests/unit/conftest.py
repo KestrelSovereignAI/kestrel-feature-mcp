@@ -244,15 +244,13 @@ async def mcp_http_server(request, tmp_path, app_resource_html):
                 return await Response(status_code=401, headers={
                     "WWW-Authenticate": challenge,
                 })(scope, receive, send)
-            if scope["method"] == "GET" and oauth.get("denied_authenticated_get"):
-                requests.append((scope, b""))
-                return await Response(status_code=oauth["denied_authenticated_get"])(scope, receive, send)
             if (headers.get(b"mcp-method") == b"server/discover"
                     and oauth.get("denied_authenticated_discover")):
                 requests.append((scope, b""))
                 return await Response(status_code=oauth["denied_authenticated_discover"])(scope, receive, send)
-            if (settings.get("bootstrap_event_stream") and scope["method"] == "GET"
-                    and headers.get(b"accept") == b"application/json"):
+            if (settings.get("bootstrap_event_stream")
+                    and headers.get(b"mcp-method") == b"server/discover"
+                    and not settings["bootstrap_body_started"].is_set()):
                 async def held_event_stream():
                     settings["bootstrap_body_started"].set()
                     yield b": keep-alive\n\n"

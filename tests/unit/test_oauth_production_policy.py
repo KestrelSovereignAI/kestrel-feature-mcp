@@ -5,7 +5,7 @@ from urllib.parse import urlencode
 
 import httpx2
 import pytest
-from mcp_types.version import LATEST_PROTOCOL_VERSION
+from mcp_types.version import LATEST_MODERN_VERSION
 
 from kestrel_feature_mcp.oauth_policy import (
     BootstrapPolicy, ClientIdentity, DISCOVERY_PROBE_BODY, DISCOVERY_PROBE_METHOD, GrantRejected,
@@ -23,7 +23,7 @@ def bootstrap(selected, hook):
 def discovery_probe(server_url):
     return httpx2.Request('POST', server_url, content=DISCOVERY_PROBE_BODY,
                           headers={'MCP-Method': DISCOVERY_PROBE_METHOD,
-                                   'MCP-Protocol-Version': LATEST_PROTOCOL_VERSION})
+                                   'MCP-Protocol-Version': LATEST_MODERN_VERSION})
 
 
 async def acquire_metadata(policy, selected):
@@ -60,21 +60,42 @@ async def test_acquisition_never_dispatches_an_mcp_operation(selection, method):
     with pytest.raises(GrantRejected, match='MCP discovery probe'):
         await policy.request(httpx2.Request(method, selection.server_url,
             headers={'MCP-Method': DISCOVERY_PROBE_METHOD,
-                     'MCP-Protocol-Version': LATEST_PROTOCOL_VERSION},
+                     'MCP-Protocol-Version': LATEST_MODERN_VERSION},
             json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call'}))
 
 
-@pytest.mark.parametrize('reported_query', ['', '?other=true'])
-def test_query_scoped_resource_cannot_change_its_binding(selection, reported_query):
+@pytest.mark.parametrize('endpoint_query,reported_query', [
+    ('?login', ''), ('?login', '?other=true'), ('', '?other=true'),
+])
+def test_query_scoped_resource_cannot_change_its_binding(selection, endpoint_query, reported_query):
     with pytest.raises(GrantRejected, match='exact resource identifier'):
-        replace(selection, server_url=selection.server_url + '?login',
+        replace(selection, server_url=selection.server_url + endpoint_query,
                 resource=selection.resource + reported_query)
 
 
 @pytest.mark.parametrize('field', ['server_url', 'resource', 'protected_metadata'])
 def test_query_cannot_embed_oauth_credentials(selection, field):
-    with pytest.raises(GrantRejected, match='without credentials'):
+    with pytest.raises(GrantRejected, match='credential query parameters'):
         replace(selection, **{field: getattr(selection, field) + '?access%5Ftoken=test'})
+
+
+@pytest.mark.parametrize('field', ['server_url', 'protected_metadata'])
+def test_query_scoped_urls_must_use_the_exact_http_wire_spelling(selection, field):
+    with pytest.raises(GrantRejected, match='HTTP-canonical'):
+        replace(selection, **{field: getattr(selection, field) + '?query=a b'})
+
+
+@pytest.mark.parametrize('header,value', [
+    ('MCP-Method', 'tools/call'), ('MCP-Protocol-Version', '2025-11-25'),
+])
+async def test_discovery_probe_rejects_wrong_routing_headers(selection, header, value):
+    async def hook():
+        raise AssertionError('no exchange during discovery')
+    policy = bootstrap(selection, hook)
+    request = discovery_probe(selection.server_url)
+    request.headers[header] = value
+    with pytest.raises(GrantRejected, match='original MCP discovery probe'):
+        await policy.request(request)
 
 
 async def test_discovery_allows_only_one_probe_in_each_phase(selection):
