@@ -148,13 +148,14 @@ the provider to accept that client identity. Providers requiring a registered
 client or a different profile are refused. Three-vendor acceptance remains an
 explicit release gate, not a claim established by synthetic integration tests.
 
-The SDK discovers the protected resource and authorization server and performs
-the single authorization-code exchange. Kestrel starts discovery with the native
-`server/discover` request over Streamable HTTP. For connectors using the
-value-free `?login` selector, Kestrel preserves the exact resource identifier
-and the metadata URL advertised by the challenge.
-Authlib performs explicit, single-attempt
-refresh. Tokens are encrypted with the SDK's agent key; provision the normal
+Kestrel starts discovery with the native `server/discover` request over
+Streamable HTTP. When discovery returns an OAuth challenge, the MCP SDK
+discovers the provider metadata and exchanges the authorization code. When
+discovery is public, Kestrel reads the published OAuth metadata and Authlib
+exchanges the code. For connectors using the value-free `?login` selector,
+Kestrel preserves the exact resource identifier and the advertised metadata URL.
+Authlib also performs explicit, single-attempt refresh.
+Tokens are encrypted with the SDK's agent key. Provision the normal
 Kestrel data key before authorization and preserve it across restarts. Tokens
 never enter browser storage or enablement records. Status reads do not load the
 key or decrypt credentials. A saved connection restarts dormant: the same
