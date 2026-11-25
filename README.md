@@ -558,6 +558,18 @@ View ends its local interaction and preserves the remote Task.
 Public Task configuration stays disabled. Activation requires the published
 SDK fix for the
 [TTL normalization defect](https://github.com/modelcontextprotocol/python-sdk/issues/3866).
+Run the retention check with the candidate published SDK installed before
+enabling Tasks.
+
+```sh
+python -m pytest tests/unit/test_tasks_native_peer.py -k preserves_task_retention --runxfail
+```
+
+All cases must pass. The check exercises the initial claim and subsequent
+`tasks/get` over native HTTP. Affected SDKs change negative TTLs to zero,
+including values the Task schema should reject. Ordinary CI records that exact
+outcome as an expected failure. `--runxfail` makes it fail the activation check.
+
 Tests cover encrypted fixture grants with native SDK HTTPS peers, result
 recovery in a fresh process, and browser delivery through the official
 AppBridge. The conformance workflow exercises native Tasks against the

@@ -547,6 +547,50 @@ def native_task_messages(server):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mcp_http_server", [{"extensions": [NativeTasksPeer()]}], indirect=True)
+@pytest.mark.parametrize("method", ["tools/call", "tasks/get"])
+@pytest.mark.parametrize("wire_ttl,expected", [
+    pytest.param(None, None, id="unlimited"),
+    pytest.param(0, 0, id="zero"),
+    pytest.param(60_000, 60_000, id="finite"),
+    pytest.param(-1, -1, id="negative-integer"),
+    pytest.param(-1.5, "rejected", id="negative-fraction"),
+    pytest.param(-(2**53), "rejected", id="outside-safe-integer-range"),
+])
+async def test_sdk_preserves_task_retention_on_the_wire(mcp_http_server, method, wire_ttl, expected):
+    peer = mcp_http_server.settings["extensions"][0]
+    arguments = {"text": "accepted once"}
+    async with httpx2.AsyncClient(trust_env=False, follow_redirects=False) as http_client, Client(
+        streamable_http_client(mcp_http_server.url, http_client=http_client),
+        extensions=[TasksExtension(no_implicit_resolution)], input_required_max_rounds=0,
+    ) as client:
+        session = client.session
+        if method == "tasks/get":
+            created = await session.call_tool("echo", arguments, allow_claimed=True)
+            assert isinstance(created, CreateTaskResult) and created.ttl_ms == 60_000
+        peer.ttl_ms = wire_ttl
+        try:
+            if method == "tools/call":
+                result = await session.call_tool("echo", arguments, allow_claimed=True)
+                assert isinstance(result, CreateTaskResult)
+            else:
+                result = await session.send_request(
+                    native_task_request("get", created.task_id), TypeAdapter(DetailedTaskResult),
+                )
+        except ValidationError as error:
+            assert {entry["loc"][-1] for entry in error.errors()} == {"ttlMs"}
+            observed = "rejected"
+        else:
+            assert result.task_id == peer.task_id and result.status == "working"
+            observed = result.ttl_ms
+    assert peer.calls == (["started", "get"] if method == "tasks/get" else ["started"])
+    assert not mcp_http_server.witness
+    if wire_ttl is not None and wire_ttl < 0 and observed == 0:
+        pytest.xfail("MCP Python SDK #3866 changed the Task ttlMs to zero before validation")
+    assert observed == expected, f"{method} decoded ttlMs {wire_ttl!r} as {observed!r}"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('mcp_http_server', [{'extensions': [NativeTasksPeer()]}], indirect=True)
 @pytest.mark.parametrize('task_id', ['', 'opaque/task:1', 'opaque/Δ:1', 'opaque\r\nInjected:1'])
 @pytest.mark.parametrize('ttl_ms', [60000, None])
